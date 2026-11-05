@@ -49,6 +49,20 @@ def backend_env(value):
             os.environ["PAI_BACKEND"] = saved
 
 
+@contextlib.contextmanager
+def reset_gfx():
+    """Clear the memoised GPU detection/selection caches for a test."""
+    saved_cache = setup_env._gfx_cache
+    saved_result = setup_env._gfx_result
+    setup_env._gfx_cache = None
+    setup_env._gfx_result = None
+    try:
+        yield
+    finally:
+        setup_env._gfx_cache = saved_cache
+        setup_env._gfx_result = saved_result
+
+
 def test_vendors_in_text():
     check("nvidia", setup_env._vendors_in_text("NVIDIA GeForce RTX 4090"),
           {"nvidia"})
@@ -109,14 +123,18 @@ def test_backend_precedence():
             check("detect nvidia", setup_env._backend(False), "cuda")
         with patched(_detected_vendors=lambda: set()):
             check("fallback cuda", setup_env._backend(False), "cuda")
-        with patched(_detected_vendors=lambda: {"nvidia"}):
-            check("--rocm wins", setup_env._backend(True), "rocm")
+        with patched(_detected_vendors=lambda: {"nvidia"},
+                     _gfx_candidates=lambda: iter([])):
+            with reset_gfx():
+                check("--rocm wins", setup_env._backend(True), "rocm")
     with backend_env("cpu"):
         with patched(_detected_vendors=lambda: {"nvidia"}):
             check("PAI_BACKEND=cpu wins", setup_env._backend(False), "cpu")
     with backend_env("rocm"):
-        with patched(_detected_vendors=lambda: {"nvidia"}):
-            check("PAI_BACKEND=rocm wins", setup_env._backend(False), "rocm")
+        with patched(_detected_vendors=lambda: {"nvidia"},
+                     _gfx_candidates=lambda: iter([])):
+            with reset_gfx():
+                check("PAI_BACKEND=rocm wins", setup_env._backend(False), "rocm")
     with backend_env("cuda"):
         with patched(_detected_vendors=lambda: {"amd"}):
             check("PAI_BACKEND=cuda wins", setup_env._backend(False), "cuda")
@@ -282,27 +300,56 @@ def test_install_skips_uninstall_when_unchanged():
 
 
 def test_rocm_gfx_selection():
-    saved = setup_env._gfx_cache
-    try:
-        setup_env._gfx_cache = None
-        with backend_env(None):
-            with patched(_gfx_candidates=lambda: iter(["gfx9999", "gfx1100"])):
-                check("skips unsupported, picks known",
-                      setup_env._rocm_gfx(), "gfx1100")
-        setup_env._gfx_cache = None
+    with reset_gfx(), backend_env(None):
+        with patched(_gfx_candidates=lambda: iter(["gfx9999", "gfx1100"])):
+            check("skips unsupported, picks known",
+                  setup_env._rocm_gfx(), "gfx1100")
+    with reset_gfx():
         with patched(_gfx_candidates=lambda: iter(["gfx900"])):
             check("unknown target -> all", setup_env._rocm_gfx(), "all")
-        setup_env._gfx_cache = None
-        with backend_env(None):
-            os.environ["PAI_ROCM_GFX"] = "gfx1234"
-            try:
-                with patched(_gfx_candidates=lambda: iter(["gfx1100"])):
-                    check("PAI_ROCM_GFX override", setup_env._rocm_gfx(),
-                          "gfx1234")
-            finally:
-                os.environ.pop("PAI_ROCM_GFX", None)
-    finally:
-        setup_env._gfx_cache = saved
+    with reset_gfx(), backend_env(None):
+        os.environ["PAI_ROCM_GFX"] = "gfx1234"
+        try:
+            with patched(_gfx_candidates=lambda: iter(["gfx1100"])):
+                check("PAI_ROCM_GFX override", setup_env._rocm_gfx(),
+                      "gfx1234")
+        finally:
+            os.environ.pop("PAI_ROCM_GFX", None)
+
+
+def test_gfx_detection_classifies_targets():
+    with reset_gfx():
+        with patched(_gfx_candidates=lambda: iter(["gfx803", "gfx1100", "gfx803"])):
+            check("supported target separated from unsupported",
+                  setup_env._gfx_detection(), ("gfx1100", ["gfx803"]))
+    with reset_gfx():
+        with patched(_gfx_candidates=lambda: iter([])):
+            check("nothing detected",
+                  setup_env._gfx_detection(), (None, []))
+
+
+def test_backend_falls_back_to_cpu_for_unsupported_amd():
+    # An RX 570 (Polaris) reports gfx803, which the ROCm wheels dropped.
+    with backend_env(None), reset_gfx():
+        with patched(_detected_vendors=lambda: {"amd"},
+                     _gfx_candidates=lambda: iter(["gfx803"])):
+            check("unsupported amd -> cpu", setup_env._backend(False), "cpu")
+    with backend_env(None), reset_gfx():
+        with patched(_gfx_candidates=lambda: iter(["gfx803", "gfx1100"])):
+            check("supported target wins over unsupported",
+                  setup_env._backend(True), "rocm")
+    with backend_env(None), reset_gfx():
+        with patched(_gfx_candidates=lambda: iter([])):
+            check("undetected amd still uses rocm",
+                  setup_env._backend(True), "rocm")
+    with backend_env("rocm"), reset_gfx():
+        os.environ["PAI_ROCM_GFX"] = "gfx803"
+        try:
+            with patched(_gfx_candidates=lambda: iter(["gfx803"])):
+                check("explicit PAI_ROCM_GFX is honoured",
+                      setup_env._backend(False), "rocm")
+        finally:
+            os.environ.pop("PAI_ROCM_GFX", None)
 
 
 def main():

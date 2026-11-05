@@ -177,14 +177,25 @@ def _backend(rocm_flag):
 
     ``--rocm`` and an explicit ``PAI_BACKEND`` win; otherwise the backend is
     auto-detected from the GPU (see :func:`_auto_backend`), falling back to
-    CUDA -- whose wheels still run on a CPU -- when no GPU is recognised.
+    CUDA -- whose wheels still run on a CPU -- when no GPU is recognised. A
+    ROCm request for an AMD GPU whose target the current ROCm wheels do not
+    support (see :func:`_rocm_supported`) falls back to CPU instead of the
+    ``all`` kernels, which could not run on it.
     """
     value = os.environ.get("PAI_BACKEND", "").strip().lower()
-    if rocm_flag or value == "rocm":
-        return "rocm"
     if value in ("cuda", "cpu"):
         return value
-    return _auto_backend() or "cuda"
+    explicit_rocm = rocm_flag or value == "rocm"
+    detected = None if explicit_rocm else _auto_backend()
+    if explicit_rocm or detected == "rocm":
+        if _rocm_supported():
+            return "rocm"
+        _, unsupported = _gfx_detection()
+        print("AMD GPU target(s) {0} are not supported by the current ROCm "
+              "wheels; falling back to the CPU backend. Set PAI_ROCM_GFX to "
+              "force a target.".format(", ".join(unsupported)))
+        return "cpu"
+    return detected or "cuda"
 
 
 def _vendors_in_text(text):
@@ -421,14 +432,57 @@ def _gfx_candidates():
     yield from _gfx_from_clinfo()
 
 
+# Classified GPU targets: ``(supported, unsupported)`` as returned by
+# :func:`_gfx_detection`. Cached because the probes shell out to driver tools.
+_gfx_result = None
+
+
+def _gfx_detection():
+    """Classify the AMD GFX targets the driver reports.
+
+    Returns ``(supported, unsupported)``: ``supported`` is the first detected
+    target present in :data:`SUPPORTED_GFX` (or ``None``), and ``unsupported``
+    is the ordered list of detected targets the current ROCm wheels carry no
+    kernels for. Both derive once from :func:`_gfx_candidates` and are cached.
+    """
+    global _gfx_result
+    if _gfx_result is not None:
+        return _gfx_result
+    supported = None
+    unsupported = []
+    for token in _gfx_candidates():
+        if token in SUPPORTED_GFX:
+            if supported is None:
+                supported = token
+        elif token not in unsupported:
+            unsupported.append(token)
+    _gfx_result = (supported, unsupported)
+    return _gfx_result
+
+
+def _rocm_supported():
+    """True when the ROCm backend can target this machine's AMD GPU.
+
+    A ``PAI_ROCM_GFX`` override always counts, since the user has named the
+    target. Otherwise the detected targets decide: a supported target means yes,
+    a card whose targets are all unsupported means no, and a machine where the
+    driver reports nothing (no ROCm tools installed yet) proceeds.
+    """
+    if os.environ.get("PAI_ROCM_GFX", "").strip():
+        return True
+    supported, unsupported = _gfx_detection()
+    return supported is not None or not unsupported
+
+
 def _rocm_gfx():
     """The GPU target for the ROCm wheel extra, e.g. ``gfx1100``.
 
     ``PAI_ROCM_GFX`` wins; otherwise the target is detected from the installed
     driver via rocminfo, the Linux KFD topology, ``rocm-bootstrap-detect`` or
-    ``clinfo`` (see :func:`_gfx_candidates`). When nothing usable is found the
-    ``all`` extra is chosen, which installs kernels for every supported GPU at
-    the cost of a larger download.
+    ``clinfo`` (see :func:`_gfx_candidates`). When the driver reports only
+    targets the current ROCm wheels do not support, or reports nothing usable,
+    the ``all`` extra is chosen -- installing kernels for every supported GPU
+    at the cost of a larger download.
     """
     global _gfx_cache
     if _gfx_cache is not None:
@@ -439,14 +493,19 @@ def _rocm_gfx():
         _gfx_cache = override
         return override
 
-    for token in _gfx_candidates():
-        if token in SUPPORTED_GFX:
-            _gfx_cache = token
-            return token
+    supported, unsupported = _gfx_detection()
+    if supported:
+        _gfx_cache = supported
+        return supported
 
-    print("Could not detect the AMD GPU target; installing kernels for all "
-          "supported GPUs. Set PAI_ROCM_GFX (e.g. PAI_ROCM_GFX=gfx1100) to "
-          "narrow this.")
+    if unsupported:
+        print("Detected AMD GPU target(s) {0}, which the current ROCm wheels "
+              "do not support; installing kernels for all supported GPUs. Set "
+              "PAI_ROCM_GFX to override.".format(", ".join(unsupported)))
+    else:
+        print("Could not detect the AMD GPU target; installing kernels for all "
+              "supported GPUs. Set PAI_ROCM_GFX (e.g. PAI_ROCM_GFX=gfx1100) to "
+              "narrow this.")
     _gfx_cache = "all"
     return "all"
 
@@ -587,15 +646,22 @@ def main(argv):
 
     core_only, reinstall, setup_only, rocm, passthrough = _parse(argv)
     backend = _backend(rocm)
-    if rocm or os.environ.get("PAI_BACKEND", "").strip():
-        if backend == "rocm":
+    explicit = rocm or bool(os.environ.get("PAI_BACKEND", "").strip())
+    if backend == "rocm":
+        if explicit:
             print("Backend: AMD ROCm")
+        else:
+            print("Detected an AMD GPU; using the ROCm backend.")
+    elif explicit:
+        # An explicit request; ``_backend`` already printed the reason for any
+        # ROCm -> CPU fallback.
+        print("Backend: " + ("CPU" if backend == "cpu" else "CUDA"))
     else:
         detected = _auto_backend()
-        if detected == "rocm":
-            print("Detected an AMD GPU; using the ROCm backend.")
-        elif detected == "cuda":
+        if detected == "cuda":
             print("Detected an NVIDIA GPU; using the CUDA backend.")
+        elif backend == "cpu":
+            print("The AMD GPU is unsupported; using the CPU backend.")
         elif detected == "cpu":
             print("Using the CPU backend.")
         else:
