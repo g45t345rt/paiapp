@@ -68,14 +68,27 @@ Filename: "{app}\run.bat"; Parameters: "--setup-only"; Description: "Download Pa
 Filename: "{app}\run.bat"; Description: "Launch Pai"; Flags: postinstall nowait skipifsilent
 
 [Code]
-function HasPython(): Boolean;
+function ProbePython(const Launcher, Tag: String): Boolean;
 var
   Code: Integer;
+  Params: String;
 begin
+  Params := '-c "import sys; raise SystemExit(0 if (3, 12) <= sys.version_info[:2] < (3, 15) else 1)"';
+  if Tag <> '' then
+    Params := Tag + ' ' + Params;
+  Result := Exec(Launcher, Params, '', SW_HIDE, ewWaitUntilTerminated, Code) and (Code = 0);
+end;
+
+function HasPython(): Boolean;
+begin
+  // Probe the same interpreters as run.bat: a 3.13/3.14 install is supported
+  // even when no 3.12 and no supported `python` on PATH exists.
   Result :=
-    (Exec('py', '-3.12 -c "import sys; raise SystemExit(0 if (3, 12) <= sys.version_info[:2] < (3, 15) else 1)"', '', SW_HIDE, ewWaitUntilTerminated, Code) and (Code = 0))
-    or
-    (Exec('python', '-c "import sys; raise SystemExit(0 if (3, 12) <= sys.version_info[:2] < (3, 15) else 1)"', '', SW_HIDE, ewWaitUntilTerminated, Code) and (Code = 0));
+    ProbePython('py', '-3.12') or
+    ProbePython('py', '-3.13') or
+    ProbePython('py', '-3.14') or
+    ProbePython('py', '-3') or
+    ProbePython('python', '');
 end;
 
 function InitializeSetup(): Boolean;
