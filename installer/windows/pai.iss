@@ -64,7 +64,7 @@ Name: "{autodesktop}\{#AppName}"; Filename: "{app}\run.bat"; WorkingDir: "{app}"
 #endif
 
 [Run]
-Filename: "{app}\run.bat"; Parameters: "--setup-only"; Description: "Download Pai's dependencies now (needs internet)"; Flags: postinstall skipifsilent unchecked
+Filename: "{app}\run.bat"; Parameters: "--setup-only"; Description: "Download Pai's dependencies now (needs internet)"; Flags: postinstall skipifsilent
 Filename: "{app}\run.bat"; Description: "Launch Pai"; Flags: postinstall nowait skipifsilent
 
 [Code]
