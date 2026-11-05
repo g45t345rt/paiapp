@@ -24,14 +24,18 @@ Environment:
                       stable multi-arch index (Windows and Linux wheels).
     PAI_ROCM_GFX      the AMD GPU target for the ROCm wheel extra, e.g.
                       ``gfx1100``; auto-detected when unset from rocminfo, the
-                      Linux KFD topology, ``rocm-bootstrap-detect`` or
-                      ``clinfo``, falling back to the ``all`` kernels.
+                      Linux KFD topology, the OpenCL runtime (which exists with
+                      just the graphics driver), ``rocm-bootstrap-detect`` or
+                      ``clinfo``. When the target cannot be detected, an
+                      auto-detected AMD GPU falls back to CPU; set this (or pass
+                      ``--rocm``) to install the ``all`` kernels instead.
     PAI_VENV          where the private environment lives. Defaults to ``.venv``
                       beside the app; a system package sets it to a user-writable
                       folder because its install tree (e.g. ``/usr/lib/pai``) is
                       read-only.
 """
 
+import ctypes
 import hashlib
 import json
 import os
@@ -177,10 +181,10 @@ def _backend(rocm_flag):
 
     ``--rocm`` and an explicit ``PAI_BACKEND`` win; otherwise the backend is
     auto-detected from the GPU (see :func:`_auto_backend`), falling back to
-    CUDA -- whose wheels still run on a CPU -- when no GPU is recognised. A
-    ROCm request for an AMD GPU whose target the current ROCm wheels do not
-    support (see :func:`_rocm_supported`) falls back to CPU instead of the
-    ``all`` kernels, which could not run on it.
+    CUDA -- whose wheels still run on a CPU -- when no GPU is recognised. An
+    auto-detected AMD GPU falls back to CPU when its target is unsupported or
+    cannot be detected (see :func:`_rocm_supported`); only an explicit ROCm
+    request installs the ``all`` kernels for an undetected target.
     """
     value = os.environ.get("PAI_BACKEND", "").strip().lower()
     if value in ("cuda", "cpu"):
@@ -191,9 +195,19 @@ def _backend(rocm_flag):
         if _rocm_supported():
             return "rocm"
         _, unsupported = _gfx_detection()
-        print("AMD GPU target(s) {0} are not supported by the current ROCm "
-              "wheels; falling back to the CPU backend. Set PAI_ROCM_GFX to "
-              "force a target.".format(", ".join(unsupported)))
+        if unsupported:
+            print("AMD GPU target(s) {0} are not supported by the current ROCm "
+                  "wheels; falling back to the CPU backend. Set PAI_ROCM_GFX to "
+                  "force a target.".format(", ".join(unsupported)))
+            return "cpu"
+        if explicit_rocm:
+            print("Could not detect the AMD GPU target; installing kernels for "
+                  "all supported GPUs. Set PAI_ROCM_GFX (e.g. "
+                  "PAI_ROCM_GFX=gfx1100) to narrow this.")
+            return "rocm"
+        print("Could not detect the AMD GPU target; falling back to the CPU "
+              "backend. Set PAI_ROCM_GFX (e.g. PAI_ROCM_GFX=gfx1100) to use "
+              "ROCm.")
         return "cpu"
     return detected or "cuda"
 
@@ -393,6 +407,93 @@ def _gfx_from_command(exe, args):
         yield token
 
 
+def _opencl_library():
+    """Load the platform's OpenCL runtime, or return ``None``.
+
+    The AMD graphics driver installs an OpenCL runtime and, on Windows, reports
+    the GPU target as the device name (e.g. ``gfx1036``). That lets us detect
+    the target without ROCm or ``clinfo`` being installed first.
+    """
+    if os.name == "nt":
+        loader, names = ctypes.WinDLL, ("OpenCL.dll",)
+    elif sys.platform == "darwin":
+        loader, names = ctypes.CDLL, (
+            "/System/Library/Frameworks/OpenCL.framework/OpenCL",)
+    else:
+        loader, names = ctypes.CDLL, (
+            "libOpenCL.so.1", "libOpenCL.so", "OpenCL")
+    for name in names:
+        try:
+            return loader(name)
+        except OSError:
+            continue
+    return None
+
+
+def _opencl_info(cl, device, param):
+    """A string-valued OpenCL device attribute, or ``""`` on failure."""
+    size = ctypes.c_size_t()
+    if cl.clGetDeviceInfo(device, param, 0, None, ctypes.byref(size)) != 0 \
+            or not size.value:
+        return ""
+    buffer = ctypes.create_string_buffer(size.value)
+    if cl.clGetDeviceInfo(device, param, size.value, buffer,
+                          ctypes.byref(size)) != 0:
+        return ""
+    return buffer.raw[:size.value].rstrip(b"\0").decode("utf-8", "replace")
+
+
+def _opencl_device_names():
+    """Yield ``(name, vendor)`` for every OpenCL device, or nothing.
+
+    Loading the runtime or enumerating devices is best-effort: a missing or
+    broken OpenCL install must not stop the bootstrapper.
+    """
+    cl = _opencl_library()
+    if cl is None:
+        return
+    cl.clGetPlatformIDs.argtypes = [
+        ctypes.c_uint, ctypes.POINTER(ctypes.c_void_p),
+        ctypes.POINTER(ctypes.c_uint)]
+    cl.clGetDeviceIDs.argtypes = [
+        ctypes.c_void_p, ctypes.c_ulonglong, ctypes.c_uint,
+        ctypes.POINTER(ctypes.c_void_p), ctypes.POINTER(ctypes.c_uint)]
+    cl.clGetDeviceInfo.argtypes = [
+        ctypes.c_void_p, ctypes.c_uint, ctypes.c_size_t, ctypes.c_void_p,
+        ctypes.POINTER(ctypes.c_size_t)]
+
+    count = ctypes.c_uint()
+    if cl.clGetPlatformIDs(0, None, ctypes.byref(count)) != 0 or not count.value:
+        return
+    platforms = (ctypes.c_void_p * count.value)()
+    if cl.clGetPlatformIDs(count.value, platforms, None) != 0:
+        return
+    for platform in platforms:
+        devices = ctypes.c_uint()
+        if cl.clGetDeviceIDs(platform, 0xFFFFFFFF, 0, None,
+                             ctypes.byref(devices)) != 0 or not devices.value:
+            continue
+        handles = (ctypes.c_void_p * devices.value)()
+        if cl.clGetDeviceIDs(platform, 0xFFFFFFFF, devices.value, handles,
+                             None) != 0:
+            continue
+        for handle in handles:
+            # CL_DEVICE_NAME and CL_DEVICE_VENDOR.
+            yield (_opencl_info(cl, handle, 0x102B),
+                   _opencl_info(cl, handle, 0x102C))
+
+
+def _gfx_from_opencl():
+    """Yield GFX targets from the driver-installed OpenCL runtime."""
+    try:
+        for name, _ in _opencl_device_names():
+            for token in _gfx_tokens(name):
+                yield token
+    except Exception:
+        # A broken or partial OpenCL install is not fatal.
+        return
+
+
 def _gfx_from_clinfo():
     """Yield GFX targets from ``clinfo`` (AMD's own Windows fallback).
 
@@ -427,7 +528,10 @@ def _gfx_candidates():
     yield from _gfx_from_command("rocminfo", [])
     # The KFD topology works on Linux with only the amdgpu kernel driver.
     yield from _gfx_from_kfd()
-    # AMD's own helper and its Windows fallback.
+    # AMD's graphics driver ships an OpenCL runtime that names the target on
+    # Windows, so this works before ROCm is installed.
+    yield from _gfx_from_opencl()
+    # AMD's own helper and the optional clinfo CLI.
     yield from _gfx_from_command("rocm-bootstrap-detect", [])
     yield from _gfx_from_clinfo()
 
@@ -464,25 +568,27 @@ def _rocm_supported():
     """True when the ROCm backend can target this machine's AMD GPU.
 
     A ``PAI_ROCM_GFX`` override always counts, since the user has named the
-    target. Otherwise the detected targets decide: a supported target means yes,
-    a card whose targets are all unsupported means no, and a machine where the
-    driver reports nothing (no ROCm tools installed yet) proceeds.
+    target. Otherwise a detected supported target means yes; a card whose
+    targets are all unsupported, or a machine where the driver reports nothing
+    (so the target is unknown), means no.
     """
     if os.environ.get("PAI_ROCM_GFX", "").strip():
         return True
-    supported, unsupported = _gfx_detection()
-    return supported is not None or not unsupported
+    supported, _ = _gfx_detection()
+    return supported is not None
 
 
 def _rocm_gfx():
     """The GPU target for the ROCm wheel extra, e.g. ``gfx1100``.
 
     ``PAI_ROCM_GFX`` wins; otherwise the target is detected from the installed
-    driver via rocminfo, the Linux KFD topology, ``rocm-bootstrap-detect`` or
-    ``clinfo`` (see :func:`_gfx_candidates`). When the driver reports only
-    targets the current ROCm wheels do not support, or reports nothing usable,
-    the ``all`` extra is chosen -- installing kernels for every supported GPU
-    at the cost of a larger download.
+    driver via rocminfo, the Linux KFD topology, the OpenCL runtime,
+    ``rocm-bootstrap-detect`` or ``clinfo`` (see :func:`_gfx_candidates`). When
+    the driver reports only targets the current ROCm wheels do not support, or
+    reports nothing usable, the ``all`` extra is chosen -- installing kernels
+    for every supported GPU at the cost of a larger download. Only an explicit
+    ROCm request reaches that fallback; auto-detection falls back to CPU
+    instead.
     """
     global _gfx_cache
     if _gfx_cache is not None:
@@ -493,19 +599,11 @@ def _rocm_gfx():
         _gfx_cache = override
         return override
 
-    supported, unsupported = _gfx_detection()
+    supported, _ = _gfx_detection()
     if supported:
         _gfx_cache = supported
         return supported
 
-    if unsupported:
-        print("Detected AMD GPU target(s) {0}, which the current ROCm wheels "
-              "do not support; installing kernels for all supported GPUs. Set "
-              "PAI_ROCM_GFX to override.".format(", ".join(unsupported)))
-    else:
-        print("Could not detect the AMD GPU target; installing kernels for all "
-              "supported GPUs. Set PAI_ROCM_GFX (e.g. PAI_ROCM_GFX=gfx1100) to "
-              "narrow this.")
     _gfx_cache = "all"
     return "all"
 
@@ -661,8 +759,6 @@ def main(argv):
         if detected == "cuda":
             print("Detected an NVIDIA GPU; using the CUDA backend.")
         elif backend == "cpu":
-            print("The AMD GPU is unsupported; using the CPU backend.")
-        elif detected == "cpu":
             print("Using the CPU backend.")
         else:
             print("No supported GPU detected; using the CUDA backend "

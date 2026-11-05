@@ -44,9 +44,9 @@ run.bat [--core-only] [--reinstall] [--setup-only] [--rocm] [--] [app args]
 - `--setup-only` – set up the environment, then exit
 - `--rocm` – force the AMD ROCm build instead of auto-detecting
 
-The compute backend is auto-detected on first run: an NVIDIA GPU installs the CUDA build, an AMD GPU installs the ROCm build, macOS uses the CPU build, and an unrecognised GPU falls back to CUDA (which also runs on CPU). Set `PAI_BACKEND` to `cuda`, `cpu` or `rocm` to override the detection.
+The compute backend is auto-detected on first run: an NVIDIA GPU installs the CUDA build, an AMD GPU installs the ROCm build, macOS uses the CPU build, and an unrecognised GPU falls back to CUDA (which also runs on CPU). An AMD GPU whose target is unsupported or cannot be detected uses the CPU build instead; set `PAI_BACKEND` to `cuda`, `cpu` or `rocm` to override the detection.
 
-On AMD, the specific GPU target for the ROCm wheel is also detected (from `rocminfo`, the Linux KFD topology, `rocm-bootstrap-detect` or `clinfo`); set `PAI_ROCM_GFX` (e.g. `PAI_ROCM_GFX=gfx1100`) to override it or narrow an `all`-kernels install.
+On AMD, the specific GPU target for the ROCm wheel is also detected (from `rocminfo`, the Linux KFD topology, the graphics driver's OpenCL runtime, `rocm-bootstrap-detect` or `clinfo`); set `PAI_ROCM_GFX` (e.g. `PAI_ROCM_GFX=gfx1100`) to override it. If the target cannot be detected, `--rocm` (or `PAI_BACKEND=rocm`) installs the `all` kernels instead of falling back to CPU.
 
 Swapping GPU hardware (e.g. AMD to NVIDIA) is handled on the next launch: the changed backend is detected and the old torch build is uninstalled and replaced. `--reinstall` removes the whole `.venv` and rebuilds it from scratch.
 

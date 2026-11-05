@@ -117,8 +117,10 @@ def test_auto_backend():
 
 def test_backend_precedence():
     with backend_env(None):
-        with patched(_detected_vendors=lambda: {"amd"}):
-            check("detect amd", setup_env._backend(False), "rocm")
+        with reset_gfx():
+            with patched(_detected_vendors=lambda: {"amd"},
+                         _gfx_candidates=lambda: iter(["gfx1100"])):
+                check("detect amd", setup_env._backend(False), "rocm")
         with patched(_detected_vendors=lambda: {"nvidia"}):
             check("detect nvidia", setup_env._backend(False), "cuda")
         with patched(_detected_vendors=lambda: set()):
@@ -219,6 +221,23 @@ def test_gfx_from_clinfo():
               ["gfx1100", "gfx90a"])
     with fake_run(lambda name: None, lambda cmd, **kw: _Done(output)):
         check("clinfo absent", list(setup_env._gfx_from_clinfo()), [])
+
+
+def test_gfx_from_opencl():
+    names = [("gfx1036", "Advanced Micro Devices, Inc."),
+             ("NVIDIA GeForce RTX 4070", "NVIDIA Corporation")]
+    with patched(_opencl_device_names=lambda: iter(names)):
+        check("opencl gpu names", list(setup_env._gfx_from_opencl()),
+              ["gfx1036"])
+    with patched(_opencl_device_names=lambda: iter([])):
+        check("opencl absent", list(setup_env._gfx_from_opencl()), [])
+    with patched(_gfx_from_command=lambda *args: iter([]),
+                 _gfx_from_kfd=lambda: iter([]),
+                 _gfx_from_clinfo=lambda: iter([]),
+                 _opencl_device_names=lambda: iter(names)):
+        with reset_gfx():
+            check("opencl feeds detection",
+                  setup_env._gfx_detection(), ("gfx1036", []))
 
 
 def test_torch_source():
@@ -342,6 +361,11 @@ def test_backend_falls_back_to_cpu_for_unsupported_amd():
         with patched(_gfx_candidates=lambda: iter([])):
             check("undetected amd still uses rocm",
                   setup_env._backend(True), "rocm")
+    with backend_env(None), reset_gfx():
+        with patched(_detected_vendors=lambda: {"amd"},
+                     _gfx_candidates=lambda: iter([])):
+            check("undetected amd auto -> cpu",
+                  setup_env._backend(False), "cpu")
     with backend_env("rocm"), reset_gfx():
         os.environ["PAI_ROCM_GFX"] = "gfx803"
         try:
