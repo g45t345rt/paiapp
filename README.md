@@ -1,4 +1,4 @@
-# Pai
+# <img src="pai_icon.png" alt="Pai" width="48" height="48"> Pai
 
 [![Release](https://github.com/g45t345rt/paiapp/actions/workflows/release.yml/badge.svg)](https://github.com/g45t345rt/paiapp/actions/workflows/release.yml)
 [![Version](https://img.shields.io/github/v/release/g45t345rt/paiapp)](https://github.com/g45t345rt/paiapp/releases)
