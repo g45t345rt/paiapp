@@ -1,9 +1,9 @@
 ; Inno Setup script for Pai on Windows.
 ;
 ; Build:
-;   ISCC.exe /DAppVersion=1.0.3 installer\windows\pai.iss
+;   ISCC.exe /DAppVersion=1.0.4 installer\windows\pai.iss
 ; Override the source tree for a staged copy:
-;   ISCC.exe /DAppSrc=C:\path\to\pai /DAppVersion=1.0.3 installer\windows\pai.iss
+;   ISCC.exe /DAppSrc=C:\path\to\pai /DAppVersion=1.0.4 installer\windows\pai.iss
 ;
 ; Pai installs per-user under %LOCALAPPDATA%\Programs\Pai because the first-run
 ; bootstrap (setup_env.py) creates its private .venv inside the install
@@ -15,7 +15,7 @@
 
 #define AppName "Pai"
 #ifndef AppVersion
-  #define AppVersion "1.0.3"
+  #define AppVersion "1.0.4"
 #endif
 #ifndef AppSrc
   #define AppSrc "..\.."
