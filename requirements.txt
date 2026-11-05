@@ -1,0 +1,17 @@
+# Core runtime: the paint UI and every non-ML feature.
+# Installed on every setup; Pai starts with just these.
+Pillow==11.3.0
+numpy==2.4.6
+scipy==1.18.1
+
+# Layer-list status badges render vendored Tabler outline SVGs
+# (paintapp/assets/icons/tabler, see paintapp/icons.py) through resvg. Optional
+# at runtime: if this wheel is unavailable the badges fall back to plain text
+# glyphs, so the rest of the UI is unaffected.
+resvg-py==0.5.0
+
+# GPU rendering for the Poses tool (paintapp/mesh_gpu.py): a real 3D character is
+# rasterised by an OpenGL 3.3 shader instead of the numpy fallback, which is the
+# difference between ~3 ms and ~340 ms a frame. Optional at runtime — if this
+# wheel or a GL context is unavailable the CPU renderer is used automatically.
+moderngl==5.13.0

@@ -1,0 +1,24 @@
+# AI engine dependencies for the AMD ROCm backend (Windows and Linux).
+#
+# Installed by setup_env.py when the ROCm backend is selected (--rocm or
+# PAI_BACKEND=rocm) instead of requirements-ai.txt. This mirrors
+# requirements-ai.txt's non-torch dependencies; torch and torchvision are
+# deliberately omitted here because they are installed separately from AMD's
+# ROCm wheel index using the [device-gfxNNNN] extra for the target GPU (see
+# _install_rocm in setup_env.py).
+-r requirements.txt
+
+# diffusers>=0.38 and transformers>=5.3 are required for the MOSS Image family
+# (the FLUX.2 AutoencoderKLFlux2 VAE and the Qwen3.5-9B text encoder). Older
+# versions still load every other family; only MOSS Image needs the newer APIs.
+# diffusers>=0.38 pulls safetensors>=0.8.0, so that pin moved up with it.
+diffusers>=0.38
+transformers>=5.3
+safetensors>=0.8.0
+gguf==0.17.1
+accelerate==1.11.0
+sentencepiece==0.2.1
+# The ONNX models (background removal and upscaling) run through onnxruntime.
+# The ROCm backend still uses the CPU execution provider here; the AMD GPU is
+# only used for the torch generation/upscale paths.
+onnxruntime==1.31.1

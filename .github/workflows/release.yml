@@ -1,0 +1,148 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      tag: ${{ steps.version.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: version
+        name: Resolve version
+        shell: bash
+        run: |
+          set -euo pipefail
+          version=$(sed -n 's/^APP_VERSION *= *"\([^"]*\)".*/\1/p' paintapp/constants.py | head -n 1)
+          if [ -z "$version" ]; then
+            echo "Could not read APP_VERSION from paintapp/constants.py" >&2
+            exit 1
+          fi
+          if [ "${{ github.ref_type }}" = "tag" ]; then
+            tag="${{ github.ref_name }}"
+            if [ "${tag#v}" != "$version" ]; then
+              echo "Tag $tag does not match APP_VERSION $version" >&2
+              exit 1
+            fi
+          else
+            tag="v$version"
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+
+  source:
+    needs: prepare
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install build dependencies
+        run: python -m pip install --upgrade pip Pillow
+      - name: Build source archives
+        run: python installer/build_release.py
+      - uses: actions/upload-artifact@v4
+        with:
+          name: source-archives
+          path: |
+            dist/pai-*-windows.zip
+            dist/pai-*-linux.tar.gz
+            dist/pai-*-macos.tar.gz
+            dist/SHA256SUMS
+          if-no-files-found: error
+
+  windows:
+    needs: prepare
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install build dependencies
+        run: python -m pip install --upgrade pip Pillow
+      - name: Generate icon and release tree
+        run: python installer/build_release.py
+      - name: Install Inno Setup
+        run: choco install innosetup --no-progress -y
+      - name: Compile installer
+        shell: pwsh
+        run: |
+          $iscc = Join-Path ${env:ProgramFiles(x86)} "Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path $iscc)) { throw "ISCC.exe not found at $iscc" }
+          & $iscc "/DAppVersion=${{ needs.prepare.outputs.version }}" "installer\windows\pai.iss"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-installer
+          path: dist/pai-*-setup.exe
+          if-no-files-found: error
+
+  macos:
+    needs: prepare
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build app and disk image
+        run: sh installer/macos/build_app.sh --dmg
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos-app
+          path: dist/pai-*-macos.dmg
+          if-no-files-found: error
+
+  linux-deb:
+    needs: prepare
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build Debian package
+        run: sh installer/linux/build_deb.sh --version "${{ needs.prepare.outputs.version }}"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-deb
+          path: dist/pai_*.deb
+          if-no-files-found: error
+
+  release:
+    needs: [prepare, source, windows, macos, linux-deb]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Regenerate checksums
+        run: |
+          set -euo pipefail
+          cd dist
+          rm -f SHA256SUMS
+          for file in pai-* pai_*; do
+            [ -f "$file" ] && sha256sum "$file"
+          done > SHA256SUMS
+          cat SHA256SUMS
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.prepare.outputs.tag }}
+          name: Pai ${{ needs.prepare.outputs.version }}
+          target_commitish: ${{ github.sha }}
+          generate_release_notes: true
+          make_latest: true
+          files: dist/*

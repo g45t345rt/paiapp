@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=Pai
+GenericName=AI Paint Studio
+Comment=Paint and generate images with local AI models
+Exec=@EXEC@
+Icon=@ICON@
+Terminal=false
+Categories=Graphics;2DGraphics;RasterGraphics;
+Keywords=paint;draw;ai;image;generate;
+StartupWMClass=Pai
+StartupNotify=true

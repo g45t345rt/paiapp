@@ -1,0 +1,96 @@
+# Model Download Guide
+
+## Quick start
+
+1. Open **Model Settings** and set the models root folder.
+2. Download the files for your chosen family into the matching subfolders listed below.
+3. Optional: In Model Settings, use **Scan folder...** to point the models root at your ComfyUI `models` folder
+4. In Generate, select the model row and run.
+
+No model is required for the paint tools. AI generation, upscaling, and background removal are optional.
+
+## Download suggestions
+
+### Anima
+
+| Component | File | Folder |
+| --- | --- | --- |
+| Diffusion model | `anima-base-v1.0.safetensors` | `diffusion_models/` |
+| Text encoder | `qwen_3_06b_base.safetensors` | `text_encoders/` |
+| VAE | `qwen_image_vae.safetensors` | `vae/` |
+
+### Qwen-Image 2.1
+
+| Component | File | Folder |
+| --- | --- | --- |
+| Diffusion model | `qwen-image-2.1-UC-Q4_K_M.gguf` | `unet/` |
+| Text encoder | `Qwen3VL-8B-Instruct-Q4_K_M.gguf` | `text_encoders/` |
+| VAE | `qwen_image_2.1_vae_bf16.safetensors` | `vae/` |
+
+### Flux.1 dev
+
+| Component | File | Folder |
+| --- | --- | --- |
+| Diffusion model | `flux1-dev-Q4_K_S.gguf` | `unet/` |
+| Text encoder | `clip_l.safetensors` + `t5-v1_1-xxl-encoder-Q5_K_S.gguf` | `text_encoders/` |
+| VAE | `flux_vae.safetensors` | `vae/` |
+
+### Z-Image Turbo
+
+| Component | File | Folder |
+| --- | --- | --- |
+| Diffusion model | `z_image_turbo_bf16.safetensors` | `diffusion_models/` |
+| Text encoder | `qwen_3_4b.safetensors` | `text_encoders/` |
+| VAE | `ae.safetensors` | `vae/` |
+
+### Krea 2
+
+| Component | File | Folder |
+| --- | --- | --- |
+| Diffusion model | `krea2_turbo_bf16.safetensors` | `diffusion_models/` |
+| Text encoder | `qwen3vl_4b_bf16.safetensors` | `text_encoders/` |
+| VAE | `qwen_image_vae.safetensors` | `vae/` |
+
+### MOSS Image
+
+| Component | File | Folder |
+| --- | --- | --- |
+| Diffusion model | `moss_image_sft_bf16.safetensors` | `diffusion_models/` |
+| Text encoder | `qwen3.5_9b_bf16.safetensors` | `text_encoders/` |
+| VAE | `flux2-vae_small.safetensors` | `vae/` |
+
+### MiniMax H3
+
+| Component | File | Folder |
+| --- | --- | --- |
+| Diffusion model | `minimax_h3_fl2va_pruned_int8_convrot.safetensors` | `diffusion_models/` |
+| Text encoder | `qwen3vl_32b_minimax_h3_int8_convrot.safetensors` | `text_encoders/` |
+| VAE | `minimax_h3_video_vae_int8_convrot.safetensors` | `vae/` |
+
+### Fibo 2.0
+
+| Component | File | Folder |
+| --- | --- | --- |
+| Diffusion model | Whole `Fibo-2.0-dev` diffusers folder (or Hub repo id) | `diffusion_models/` |
+| Text encoder | Included in the folder | — |
+| VAE | Included in the folder | — |
+
+### Stable Diffusion
+
+| Component | File | Folder |
+| --- | --- | --- |
+| Checkpoint | Any single-file `.safetensors` or `.ckpt` (SD 1.5 or SDXL) | `checkpoints/` |
+| Text encoder | Included in the checkpoint | — |
+| VAE | Included in the checkpoint | — |
+
+### Upscale
+
+| Component | File | Folder |
+| --- | --- | --- |
+| Upscale model | Any Real-ESRGAN `.safetensors`, `.pth`, or `.onnx` | `upscale_models/` |
+
+### Background removal
+
+| Component | File | Folder |
+| --- | --- | --- |
+| Background removal model | `birefnet-general.onnx`, `u2net.onnx`, or `modnet_photographic_portrait_matting.onnx` | `background/` |

@@ -1,0 +1,76 @@
+Tabler Icons (outline)
+======================
+
+Vendored from the Tabler Icons project: https://tabler.io/icons
+Source repo:  https://github.com/tabler/tabler-icons
+License:      MIT (see the LICENSE file in this folder)
+
+These are the outline SVGs used by paintapp/icons.py for the layer-list
+status badges. Each file is named after its Tabler icon and is referenced
+by that name (the file stem) from paintapp/layers.py.
+
+Currently vendored (Tabler 3.50.0)
+----------------------------------
+Layer-list status badges (paintapp/layers.py):
+    arrow-bar-to-down.svg   layer is clipped to the layer below
+    blend-mode.svg          non-normal blend mode
+    crown.svg               master layer
+    link.svg                linked layer
+    lock.svg                locked layer
+    mask.svg                layer has a mask
+    vector.svg              vector layer
+
+Layer-panel action buttons (paintapp/layers.py):
+    eye.svg, eye-off.svg    show / hide
+    plus.svg                add layer
+    folder-plus.svg         add group
+    copy.svg                duplicate
+    trash.svg               delete
+    arrow-up.svg            move up
+    arrow-down.svg          move down
+    dots.svg                more actions
+
+Job-queue status marks and action buttons (paintapp/jobqueue.py):
+    clock.svg               queued
+    player-play.svg         running
+    check.svg               done
+    x.svg                   error / dismiss
+    ban.svg                 cancelled
+    player-stop.svg         stop a cancellable job
+
+Tool buttons (paintapp/drawing.py, see ToolsPanel.TOOL_ICONS):
+    pointer.svg             arrow / pointer
+    brush.svg               brush
+    eraser.svg              eraser
+    bucket.svg              fill
+    color-picker.svg        pick
+    marquee.svg             select
+    arrows-move.svg         move
+    typography.svg          text
+    color-filter.svg        gradient
+    shape.svg               shape
+    copy.svg                clone (shared with the layers duplicate)
+    crop.svg                crop
+    transform.svg           transform
+    blur.svg                smudge
+    sun-high.svg            dodge
+    flame.svg               burn
+    ripple.svg              liquify
+    wave-sine.svg           warp
+    bone.svg                puppet warp
+    vector-bezier.svg       path
+    vector.svg              vector (shared with the layers badge)
+    cube.svg                poses (3D)
+    mask.svg                mask (shared with the layers badge)
+    clipboard.svg           paste
+    drag-drop.svg           drag
+
+To add another icon, drop its outline SVG here from
+
+    https://cdn.jsdelivr.net/npm/@tabler/icons@<version>/icons/outline/<name>.svg
+
+(keeping the format tag "outline" unless you deliberately want the "filled"
+version) and reference "<name>" as the icon name where the badge is built.
+Nothing else needs changing: paintapp/icons.py renders whatever is in this
+folder. Bump the Tabler version above when you add or refresh icons so the
+set stays pinned to one release.

@@ -1,0 +1,40 @@
+# AI engine: image generation, upscaling and background removal.
+# Installed by setup_env.py on top of requirements.txt for the CUDA/CPU
+# backends. The AMD ROCm backend installs requirements-rocm.txt instead (see
+# PAI_BACKEND / --rocm in setup_env.py), because its torch wheels come from
+# AMD's index as [device-gfxNNNN] extras and are not pinned here.
+#
+# torch/torchvision wheels are resolved from PAI_TORCH_INDEX (see setup_env.py).
+# The CUDA 13.0 build is the default; set PAI_TORCH_INDEX=cpu for a CPU-only
+# install, or a full index URL for another CUDA build.
+-r requirements.txt
+torch==2.13.0
+torchvision==0.28.0
+# diffusers>=0.38 and transformers>=5.3 are required for the MOSS Image family
+# (the FLUX.2 AutoencoderKLFlux2 VAE and the Qwen3.5-9B text encoder). Older
+# versions still load every other family; only MOSS Image needs the newer APIs.
+# diffusers>=0.38 pulls safetensors>=0.8.0, so that pin moved up with it.
+diffusers>=0.38
+transformers>=5.3
+safetensors>=0.8.0
+gguf==0.17.1
+accelerate==1.11.0
+sentencepiece==0.2.1
+# Exported ONNX models run through onnxruntime, for both background removal
+# (BiRefNet/U2Net/MODNet/RMBG-2.0) and upscaling. Required: several models in
+# the curated pools are ONNX graphs, so without it those fail at load time.
+# 1.31.1 is the current release; note Python 3.14 wheels start at 1.24.1, so the
+# older 1.23.2 pin is not installable there.
+onnxruntime==1.31.1
+# The "TAESD" live denoising preview (see engine/preview.py) needs no extra pip
+# package: its tiny distilled decoder is built in-repo and its weights are
+# fetched from Hugging Face on first use. Everything falls back to the built-in
+# Latent2RGB decoder when the weights are unavailable, so nothing here is
+# required to run.
+
+# Optional speed-up: SageAttention replaces the diffusion model's SDPA calls with
+# an int8-QK CUDA kernel (see engine/attention.py). NVIDIA-only, so it is NOT a
+# hard requirement -- install it by hand (`pip install sageattention`) on a
+# supported GPU/SM combo, then enable "Use SageAttention" in the Settings
+# Generation tab. Without the package, or on CPU/ROCm/older cards, attention
+# transparently stays on PyTorch SDPA.

@@ -1,0 +1,15 @@
+# Downloaded asset archives (large; the tool only needs the extracted models).
+*.zip
+
+# Release output and generated Windows icon (see installer/build_release.py).
+/dist/
+/pai_icon.ico
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+
+# Local editor / OS noise
+.DS_Store
+Thumbs.db
