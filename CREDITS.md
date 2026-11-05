@@ -1,12 +1,11 @@
 # Credits and Third-Party Licenses
 
-Copyright (C) 2026  <YOUR NAME HERE>
+Copyright (C) 2026  g45t345rt
 
-Replace `<YOUR NAME HERE>` with the copyright holder of this application. This
-app is free software: you can redistribute it and/or modify it under the terms
-of the GNU General Public License as published by the Free Software Foundation,
-either version 3 of the License, or (at your option) any later version. See the
-`LICENSE` file for the full text.
+This app is free software: you can redistribute it and/or modify it under the
+terms of the GNU General Public License as published by the Free Software
+Foundation, either version 3 of the License, or (at your option) any later
+version. See the `LICENSE` file for the full text.
 
 This program is distributed in the hope that it will be useful, but WITHOUT ANY
 WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS FOR A
