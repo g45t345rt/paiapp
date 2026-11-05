@@ -68,6 +68,12 @@ Pai is free and open source. If you find it useful, you can support development 
 
 <a href='https://ko-fi.com/O5I829R7BD' target='_blank'><img height='100' style='border:0px;height:100px;' src='https://storage.ko-fi.com/cdn/brandasset/v2/support_me_on_kofi_badge_dark.png' border='0' alt='Support me on Ko-fi' /></a>
 
+## Disclaimer
+
+This project was built primarily with AI coding tools. It is provided, without warranty of any kind.
+
 ## License
 
 GPL-3.0. See [LICENSE](LICENSE) and [CREDITS.md](CREDITS.md).
+
+Copyright (C) 2026 g45t345rt
