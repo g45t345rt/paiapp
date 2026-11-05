@@ -47,7 +47,7 @@ if [ ! -f "$APP_ROOT/setup_env.py" ] || [ ! -f "$APP_ROOT/run.sh" ]; then
 fi
 
 version=$(sed -n 's/^APP_VERSION *= *"\([^"]*\)".*/\1/p' "$APP_ROOT/paintapp/constants.py" | head -n 1)
-version=${version:-1.0.2}
+version=${version:-1.0.3}
 mkdir -p "$OUT_DIR"
 OUT_DIR=$(CDPATH= cd -- "$OUT_DIR" && pwd)
 APP="$OUT_DIR/Pai.app"
