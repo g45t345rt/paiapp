@@ -73,9 +73,9 @@ var
   Code: Integer;
 begin
   Result :=
-    (Exec('py', '-3.12 -c "import sys; raise SystemExit(0 if sys.version_info >= (3, 12) else 1)"', '', SW_HIDE, ewWaitUntilTerminated, Code) and (Code = 0))
+    (Exec('py', '-3.12 -c "import sys; raise SystemExit(0 if (3, 12) <= sys.version_info[:2] < (3, 15) else 1)"', '', SW_HIDE, ewWaitUntilTerminated, Code) and (Code = 0))
     or
-    (Exec('python', '-c "import sys; raise SystemExit(0 if sys.version_info >= (3, 12) else 1)"', '', SW_HIDE, ewWaitUntilTerminated, Code) and (Code = 0));
+    (Exec('python', '-c "import sys; raise SystemExit(0 if (3, 12) <= sys.version_info[:2] < (3, 15) else 1)"', '', SW_HIDE, ewWaitUntilTerminated, Code) and (Code = 0));
 end;
 
 function InitializeSetup(): Boolean;
@@ -83,7 +83,7 @@ begin
   Result := True;
   if not HasPython() then
   begin
-    if MsgBox('Pai needs Python 3.12 or newer, but it was not found on PATH.' + #13#10 + #13#10 +
+    if MsgBox('Pai needs Python 3.12-3.14, but a supported version was not found on PATH.' + #13#10 + #13#10 +
               'Install it from https://www.python.org/downloads/ (or run "winget install Python.Python.3.12") and run Pai again.' + #13#10 + #13#10 +
               'Continue the installation anyway?', mbConfirmation, MB_YESNO) = IDNO then
       Result := False;

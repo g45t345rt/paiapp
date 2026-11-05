@@ -122,6 +122,16 @@ def test_backend_precedence():
             check("PAI_BACKEND=cuda wins", setup_env._backend(False), "cuda")
 
 
+def test_supported_python():
+    check("3.11 rejected", setup_env._supported_python((3, 11)), False)
+    check("3.12 accepted", setup_env._supported_python((3, 12)), True)
+    check("3.13 accepted", setup_env._supported_python((3, 13)), True)
+    check("3.14 accepted", setup_env._supported_python((3, 14)), True)
+    check("3.15 rejected", setup_env._supported_python((3, 15)), False)
+    check("3.16 rejected", setup_env._supported_python((3, 16)), False)
+    check("micro ignored", setup_env._supported_python((3, 14, 2)), True)
+
+
 class _Done:
     def __init__(self, stdout):
         self.stdout = stdout

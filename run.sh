@@ -9,18 +9,18 @@ set -eu
 HERE=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 BASEPY=""
 
-# Prefer a 3.12 interpreter, then 3.13/3.14 or any Python 3.12+ on PATH.
+# Prefer a 3.12 interpreter, then 3.13/3.14 or any supported Python on PATH.
 for candidate in python3.12 python3.13 python3.14 python3 python; do
     if command -v "$candidate" >/dev/null 2>&1 && \
-       "$candidate" -c 'import sys; raise SystemExit(0 if sys.version_info >= (3, 12) else 1)' >/dev/null 2>&1; then
+       "$candidate" -c 'import sys; raise SystemExit(0 if (3, 12) <= sys.version_info[:2] < (3, 15) else 1)' >/dev/null 2>&1; then
         BASEPY="$candidate"
         break
     fi
 done
 
 if [ -z "$BASEPY" ]; then
-    echo "Pai needs Python 3.12 or newer on PATH." >&2
-    echo "Install it from https://www.python.org/downloads/ and run this again." >&2
+    echo "Pai needs Python 3.12-3.14 on PATH." >&2
+    echo "Install one from https://www.python.org/downloads/ and run this again." >&2
     exit 1
 fi
 

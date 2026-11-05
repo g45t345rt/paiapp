@@ -80,9 +80,24 @@ SUPPORTED_GFX = frozenset({
 # and AMD installs.
 TORCH_VERSION = "2.13.0"
 TORCHVISION_VERSION = "0.28.0"
+# The interpreter range Pai is tested against. The lower bound is inclusive and
+# the upper bound is exclusive: torch/torchvision publish wheels for 3.12-3.14
+# only, so a newer interpreter (e.g. 3.15) must be rejected up front with a
+# clear message instead of failing later inside pip. Keep in sync with README.md
+# and the version gate in the launchers (run.bat, run.sh, installer/*).
 MIN_PYTHON = (3, 12)
+MAX_PYTHON = (3, 15)
 
 KNOWN_FLAGS = ("--core-only", "--reinstall", "--setup-only", "--rocm")
+
+
+def _supported_python(info):
+    """True when a version tuple is in the tested ``[MIN_PYTHON, MAX_PYTHON)``.
+
+    Only the major/minor pair matters, so ``info`` may be a ``sys.version_info``
+    or a plain ``(major, minor)`` tuple.
+    """
+    return MIN_PYTHON <= (info[0], info[1]) < MAX_PYTHON
 
 
 def venv_python():
@@ -555,11 +570,19 @@ def main(argv):
         sys.stdout.reconfigure(line_buffering=True)
     except (AttributeError, ValueError):
         pass
-    if sys.version_info < MIN_PYTHON:
+    if not _supported_python(sys.version_info):
+        if sys.version_info < MIN_PYTHON:
+            sys.exit(
+                "Pai needs Python {0}.{1} or newer, but this interpreter is "
+                "{2}.{3}.".format(MIN_PYTHON[0], MIN_PYTHON[1],
+                                  sys.version_info[0], sys.version_info[1])
+            )
         sys.exit(
-            "Pai needs Python {0}.{1} or newer, but this interpreter is "
-            "{2}.{3}.".format(MIN_PYTHON[0], MIN_PYTHON[1],
-                              sys.version_info[0], sys.version_info[1])
+            "Pai supports Python up to {0}.{1}, but this interpreter is "
+            "{2}.{3}. Torch wheels for it are not published yet; install "
+            "Python {0}.{1} and run this again.".format(
+                MAX_PYTHON[0], MAX_PYTHON[1] - 1,
+                sys.version_info[0], sys.version_info[1])
         )
 
     core_only, reinstall, setup_only, rocm, passthrough = _parse(argv)

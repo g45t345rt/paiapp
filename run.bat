@@ -6,7 +6,7 @@ setlocal
 set "HERE=%~dp0"
 set "BASEPY="
 
-rem Prefer a 3.12 interpreter, then 3.13/3.14 or any Python 3.12+ on PATH.
+rem Prefer a 3.12 interpreter, then 3.13/3.14 or any supported Python on PATH.
 call :probe py -3.12
 if not defined BASEPY call :probe py -3.13
 if not defined BASEPY call :probe py -3.14
@@ -14,8 +14,8 @@ if not defined BASEPY call :probe py -3
 if not defined BASEPY call :probe python
 
 if not defined BASEPY (
-    echo Pai needs Python 3.12 or newer on PATH.
-    echo Install it from https://www.python.org/downloads/ and run this again.
+    echo Pai needs Python 3.12-3.14 on PATH.
+    echo Install one from https://www.python.org/downloads/ and run this again.
     exit /b 1
 )
 
@@ -23,8 +23,8 @@ if not defined BASEPY (
 exit /b %ERRORLEVEL%
 
 :probe
-rem Use %~1 %~2 only when it exists and reports Python 3.12+.
+rem Use %~1 %~2 only when it exists and reports a supported Python (3.12-3.14).
 where %~1 >nul 2>nul || exit /b 0
-%~1 %~2 -c "import sys; raise SystemExit(0 if sys.version_info >= (3, 12) else 1)" >nul 2>nul || exit /b 0
+%~1 %~2 -c "import sys; raise SystemExit(0 if (3, 12) <= sys.version_info[:2] < (3, 15) else 1)" >nul 2>nul || exit /b 0
 set "BASEPY=%~1 %~2"
 exit /b 0

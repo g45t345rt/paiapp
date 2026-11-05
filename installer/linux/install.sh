@@ -54,7 +54,7 @@ fi
 find_python() {
     for candidate in python3.12 python3.13 python3.14 python3 python; do
         if command -v "$candidate" >/dev/null 2>&1 && \
-           "$candidate" -c 'import sys; raise SystemExit(0 if sys.version_info >= (3, 12) else 1)' >/dev/null 2>&1; then
+           "$candidate" -c 'import sys; raise SystemExit(0 if (3, 12) <= sys.version_info[:2] < (3, 15) else 1)' >/dev/null 2>&1; then
             printf '%s\n' "$candidate"
             return 0
         fi
@@ -68,7 +68,7 @@ app_version() {
 
 PY=$(find_python || true)
 if [ -z "$PY" ]; then
-    echo "Warning: Python 3.12+ was not found on PATH." >&2
+    echo "Warning: Python 3.12-3.14 was not found on PATH." >&2
     echo "Install it (e.g. sudo apt install python3.12 python3.12-venv python3-tk) and run Pai again." >&2
 elif ! "$PY" -c 'import tkinter' >/dev/null 2>&1; then
     echo "Warning: this Python has no tkinter. Install the Tk package (e.g. python3-tk)." >&2
