@@ -1767,7 +1767,7 @@ def build_menus(app, parent):
 
     help_menu = PopupMenu(parent)
     help_menu.add_command(label="About", command=app.show_about)
-    help_menu.add_command(label="Website", command=app.open_website)
+    help_menu.add_command(label="Discord", command=app.open_discord)
     help_menu.add_command(label="Contribute", command=app.show_contribute)
     help_menu.add_command(label="Donate", command=app.show_donate)
     menus.append(("Help", help_menu))

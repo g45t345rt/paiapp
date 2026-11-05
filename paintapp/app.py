@@ -33,7 +33,7 @@ from .canvasarea import (
 from .assets import AssetsPanel
 from .brushes import BrushLibraryPanel
 from .colorpicker import ColorPicker
-from .constants import (    APP_NAME, APP_VERSION, DONATE_URL, CONTRIBUTE_URL, WEBSITE_URL, CANVAS_W,
+from .constants import (    APP_NAME, APP_VERSION, DONATE_URL, CONTRIBUTE_URL, DISCORD_URL, CANVAS_W,
     CANVAS_H, MAX_CANVAS_SIZE, SIDEBAR_MIN_W, PANELS, PANEL_SIDES,
     DEFAULT_PANEL_SIDES, DEFAULT_COLLAPSED_PANELS, DEFAULT_PANEL_GROUPS, rgba,
 )
@@ -7326,8 +7326,8 @@ class PaintApp:
             "involved.",
         )
 
-    def open_website(self):
-        dialogs.open_url(WEBSITE_URL)
+    def open_discord(self):
+        dialogs.open_url(DISCORD_URL)
 
     # ------------------------------------------------------------------ theme
     def open_settings(self):

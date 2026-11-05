@@ -18,8 +18,8 @@ DONATE_URL = "https://ko-fi.com/paiapp"
 # Opened by the Help > Contribute dialog: repo, issues, or a contributing guide.
 CONTRIBUTE_URL = "https://github.com/g45t345rt/paiapp/blob/main/CONTRIBUTING.md"
 
-# Opened by Help > Website: the project's home page.
-WEBSITE_URL = "https://pai.app"
+# Opened by Help > Discord: the community server invite.
+DISCORD_URL = "https://discord.gg/bU6RzjwxFX"
 
 CANVAS_W = 800
 CANVAS_H = 640
