@@ -84,7 +84,7 @@ begin
   if not HasPython() then
   begin
     if MsgBox('Pai needs Python 3.12-3.14, but a supported version was not found on PATH.' + #13#10 + #13#10 +
-              'Install it from https://www.python.org/downloads/ (or run "winget install Python.Python.3.12") and run Pai again.' + #13#10 + #13#10 +
+              'Pai can download and install it for you on first launch. You can also install it now from https://www.python.org/downloads/ (or run "winget install Python.Python.3.12").' + #13#10 + #13#10 +
               'Continue the installation anyway?', mbConfirmation, MB_YESNO) = IDNO then
       Result := False;
   end;

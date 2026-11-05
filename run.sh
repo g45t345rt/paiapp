@@ -5,6 +5,10 @@
 #
 # POSIX counterpart of run.bat for Linux and macOS (also works under Git Bash
 # or WSL on Windows). Run with:  sh run.sh [--core-only] [--reinstall] [--] [app args]
+#
+# When no supported Python (3.12-3.14) is on PATH the launcher offers to
+# download and install one (Homebrew/apt/dnf/zypper/pacman, then the official
+# python.org installer on macOS).
 set -eu
 HERE=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 BASEPY=""
@@ -17,6 +21,24 @@ for candidate in python3.12 python3.13 python3.14 python3 python; do
         break
     fi
 done
+
+if [ -z "$BASEPY" ]; then
+    echo "Pai needs Python 3.12-3.14, which was not found on PATH." >&2
+    installer="$HERE/installer/unix/install_python.sh"
+    # Only offer when the helper ships with the app and we have a terminal to
+    # answer the prompt on (a desktop double-click or a pipeline must not hang).
+    if [ -f "$installer" ] && [ -t 0 ]; then
+        printf 'Download and install Python now? [y/N] ' >&2
+        read -r answer || answer=""
+        case "$answer" in
+            [yY]|[yY][eE][sS])
+                if ! BASEPY=$(sh "$installer"); then
+                    BASEPY=""
+                fi
+                ;;
+        esac
+    fi
+fi
 
 if [ -z "$BASEPY" ]; then
     echo "Pai needs Python 3.12-3.14 on PATH." >&2

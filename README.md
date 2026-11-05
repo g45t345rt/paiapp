@@ -15,6 +15,8 @@ Built with Python and Tkinter.
 - Python 3.12–3.14 on your PATH
 - Optional NVIDIA or AMD GPU for the AI features (CPU works too)
 
+If Python 3.12–3.14 is not found, the launcher offers to download and install it for you.
+
 ## Run
 
 On Windows:
