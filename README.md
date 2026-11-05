@@ -54,9 +54,7 @@ Projects are saved as `.pai` files: a zip archive with a small JSON manifest and
 
 ## Contributing
 
-Issues and pull requests are welcome at [github.com/g45t345rt/paiapp](https://github.com/g45t345rt/paiapp). See [CONTRIBUTING.md](CONTRIBUTING.md) for how to set up a development environment and run the tests.
-
-Note: the app's Help menu already links to `CONTRIBUTING.md`, which previously did not exist; a starter guide is now included.
+See [CONTRIBUTING.md](CONTRIBUTING.md) for how to set up a development environment and run the tests.
 
 ## Community
 
