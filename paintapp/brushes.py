@@ -394,6 +394,9 @@ class BrushLibraryPanel(tk.Frame):
             return
         self._tool = tool
         self.reload()
+        # Start the newly shown tool's list at its first row instead of
+        # inheriting the previous tool's scroll offset.
+        self._canvas.yview_moveto(0.0)
 
     def reload(self):
         """Reload presets from disk, apply the search box, and rebuild."""
@@ -497,6 +500,13 @@ class BrushLibraryPanel(tk.Frame):
         for preset in self._presets:
             self._make_row(preset)
         self._update_selection()
+        # Recompute the scroll region now: rebuilding the rows changes the
+        # list height, but the canvas does not see the list's <Configure>
+        # until later. Without this a shorter list (say the erasers after a
+        # long brush list) stays scrolled past its end and looks empty.
+        bounds = self._canvas.bbox("all")
+        if bounds is not None:
+            self._canvas.configure(scrollregion=bounds)
         theme.restyle(self)
 
     def _make_row(self, preset):
