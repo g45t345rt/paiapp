@@ -9,7 +9,7 @@ import sys
 ALT_STATE_MASK = 0x20000 if sys.platform == "win32" else 0x8
 
 APP_NAME = "Pai"
-APP_VERSION = "1.0.4"
+APP_VERSION = "1.1.0"
 
 # Opened by the Help > Donate dialog. Point this at whatever tip jar you use
 # (GitHub Sponsors, Ko-fi, PayPal, ...).
