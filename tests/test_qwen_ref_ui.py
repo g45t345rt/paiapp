@@ -147,6 +147,48 @@ def test_family_gate():
         root.destroy()
 
 
+def test_collapsible_sections():
+    try:
+        root, panel = _build_panel(family="anima")
+    except Exception as exc:  # no display, or Tk missing
+        SKIPPED.append(f"section test skipped: {exc}")
+        return
+    try:
+        # The active family's section opens; the other two fold to headers.
+        check("anima open", panel._anima_section.open, True)
+        check("qwen folded", panel._qwen_section.open, False)
+        check("anypaint folded", panel._anypaint_section.open, False)
+
+        # The header rides the reference count, so a folded section still says
+        # what it holds.
+        panel._add_anima_reference({"source": "canvas", "label": "Canvas"})
+        check("count in header", "(1)" in panel._anima_section.title_var.get(), True)
+
+        # A manual collapse hides the body but keeps the header first in its
+        # frame, so expanding later restores the order.
+        panel._anima_section.toggle_open()
+        check("manual collapse", panel._anima_section.open, False)
+        check("body hidden", panel._anima_section.body.winfo_manager(), "")
+        check("header stays first",
+              panel._anima_section.frame.pack_slaves()[0] is
+              panel._anima_section.header, True)
+        panel._anima_section.toggle_open()
+        check("manual expand", panel._anima_section.open, True)
+        check("body shown", panel._anima_section.body.winfo_manager(), "pack")
+
+        # Switching to another family moves the open section.
+        panel.set_family("qwen_image")
+        check("qwen open", panel._qwen_section.open, True)
+        check("anima folded", panel._anima_section.open, False)
+
+        # A repeated set_family for the same family keeps a manual choice.
+        panel._qwen_section.toggle_open()
+        panel.set_family("qwen_image")
+        check("manual choice kept", panel._qwen_section.open, False)
+    finally:
+        root.destroy()
+
+
 def test_stitch_side_by_side():
     from PIL import Image
 
@@ -165,7 +207,7 @@ def test_stitch_side_by_side():
 
 def main():
     for test in (test_reference_rows, test_assign_selected, test_family_gate,
-                 test_stitch_side_by_side):
+                 test_collapsible_sections, test_stitch_side_by_side):
         try:
             test()
         except Exception as exc:  # keep going so one failure is not fatal

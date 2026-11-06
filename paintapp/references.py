@@ -1,6 +1,7 @@
 """The References panel: reference images for a generation run.
 
-Two independent reference features live here, each in its own section:
+Three independent reference features live here, each in its own collapsible
+section:
 
 * The Anima reference adapter: reference images drive character/style transfer
   through clean offset-RoPE reference frames plus a gated LoRA. Several images
@@ -59,13 +60,70 @@ REF_CORRECTIONS = ("apg", "rescale", "none")
 # A row's kind label <-> the canonical token stored in its binding.
 _KIND_TOKENS = {SOURCE_ASSET: "asset", SOURCE_LAYER: "layer", SOURCE_CANVAS: "canvas"}
 _TOKEN_KINDS = {token: label for label, token in _KIND_TOKENS.items()}
+# Disclosure glyphs shared with the sidebar's panel headers.
+_SECTION_OPEN = "\u25be"
+_SECTION_CLOSED = "\u25b8"
+
+
+class _Section:
+    """A collapsible block: a clickable glyph header over a hideable body.
+
+    The header carries an optional right-side control (Add / checkbox); the
+    body holds the section's rows. A short summary (e.g. the reference count)
+    rides the header so a collapsed section still says what it holds.
+    """
+
+    def __init__(self, parent, title, open_by_default=True):
+        self.title = title
+        self._summary = ""
+        self.frame = tk.Frame(parent)
+        self.header = tk.Frame(self.frame)
+        self.header.pack(fill=tk.X)
+        self.header.columnconfigure(0, weight=1)
+        self.title_var = tk.StringVar()
+        self.toggle = tk.Button(
+            self.header, textvariable=self.title_var, anchor="w",
+            relief=tk.FLAT, bd=0, padx=0, pady=0, cursor="hand2",
+            command=self.toggle_open,
+        )
+        self.toggle.grid(row=0, column=0, sticky="we")
+        self.body = tk.Frame(self.frame)
+        self.open = bool(open_by_default)
+        self._apply()
+
+    def set_open(self, open_):
+        open_ = bool(open_)
+        if open_ != self.open:
+            self.open = open_
+            self._apply()
+
+    def toggle_open(self):
+        self.open = not self.open
+        self._apply()
+
+    def set_summary(self, summary):
+        summary = summary or ""
+        if summary != self._summary:
+            self._summary = summary
+            self._apply()
+
+    def _apply(self):
+        glyph = _SECTION_OPEN if self.open else _SECTION_CLOSED
+        suffix = f" ({self._summary})" if self._summary else ""
+        self.title_var.set(f"{glyph}  {self.title}{suffix}")
+        if self.open:
+            if not self.body.winfo_manager():
+                self.body.pack(fill=tk.X)
+        elif self.body.winfo_manager():
+            self.body.pack_forget()
 
 
 class ReferencesPanel(tk.Frame):
     """The Anima reference adapter and the Qwen multi-reference list.
 
-    Both features sit in this one sidebar container as two sections; each greys
-    itself out for the families that do not support it.
+    Each feature is a collapsible section; the panel folds the sections for
+    other families down to their headers, and a header shows the section's
+    reference count (or ``on`` for AnyPaint) so a folded section still reads.
     """
 
     def __init__(self, parent, on_settings=None, on_capture=None):
@@ -85,17 +143,21 @@ class ReferencesPanel(tk.Frame):
 
     def _build(self):
         # ------------------------------------------------ anima reference adapter
-        ref_header = tk.Frame(self)
-        ref_header.pack(fill=tk.X, pady=(4, 0))
-        tk.Label(ref_header, text="Anima references:", anchor="w").pack(side=tk.LEFT)
-        self.ref_add_btn = tk.Button(
-            ref_header, text="Add", command=lambda: self._add_anima_reference(),
+        self._anima_section = _Section(
+            self, "Anima references", open_by_default=True,
         )
-        self.ref_add_btn.pack(side=tk.RIGHT)
-        self.ref_rows = tk.Frame(self)
+        self.ref_header = self._anima_section.header
+        self.ref_add_btn = tk.Button(
+            self.ref_header, text="Add", command=lambda: self._add_anima_reference(),
+        )
+        self.ref_add_btn.grid(row=0, column=1, sticky="e", padx=(4, 0))
+        self._anima_section.frame.pack(fill=tk.X, pady=(4, 0))
+
+        body = self._anima_section.body
+        self.ref_rows = tk.Frame(body)
         self.ref_rows.pack(fill=tk.X)
 
-        ref_lora_row = tk.Frame(self)
+        ref_lora_row = tk.Frame(body)
         ref_lora_row.pack(fill=tk.X, pady=(2, 0))
         tk.Label(ref_lora_row, text="Ref adapter:").pack(side=tk.LEFT)
         self.ref_lora_var = tk.StringVar(value="(none)")
@@ -112,7 +174,7 @@ class ReferencesPanel(tk.Frame):
         )
         self._refresh_reference_loras()
 
-        ref_params_row = tk.Frame(self)
+        ref_params_row = tk.Frame(body)
         ref_params_row.pack(fill=tk.X, pady=(2, 0))
         tk.Label(ref_params_row, text="Ref strength:").pack(side=tk.LEFT)
         self.ref_strength_var = tk.DoubleVar(value=1.0)
@@ -129,7 +191,7 @@ class ReferencesPanel(tk.Frame):
         )
         self.ref_guidance_spin.pack(side=tk.LEFT, padx=(4, 0))
 
-        ref_correction_row = tk.Frame(self)
+        ref_correction_row = tk.Frame(body)
         ref_correction_row.pack(fill=tk.X, pady=(2, 0))
         tk.Label(ref_correction_row, text="Ref correction:").pack(side=tk.LEFT)
         self.ref_correction_var = tk.StringVar(value="apg")
@@ -148,7 +210,7 @@ class ReferencesPanel(tk.Frame):
 
         # Ref MP gets its own row: sharing the correction row pushed its spinbox
         # past the sidebar's right edge, where it could not be clicked.
-        ref_mp_row = tk.Frame(self)
+        ref_mp_row = tk.Frame(body)
         ref_mp_row.pack(fill=tk.X, pady=(2, 0))
         tk.Label(ref_mp_row, text="Ref MP:").pack(side=tk.LEFT)
         self.ref_megapixels_var = tk.DoubleVar(value=1.0)
@@ -165,14 +227,16 @@ class ReferencesPanel(tk.Frame):
         theme.register(qref_divider, bg="border")
 
         # -------------------------------------------------- qwen reference images
-        qref_header = tk.Frame(self)
-        qref_header.pack(fill=tk.X, pady=(2, 0))
-        tk.Label(qref_header, text="Qwen references:", anchor="w").pack(side=tk.LEFT)
-        self.qref_add_btn = tk.Button(
-            qref_header, text="Add", command=lambda: self._add_qwen_reference(),
+        self._qwen_section = _Section(
+            self, "Qwen references", open_by_default=True,
         )
-        self.qref_add_btn.pack(side=tk.RIGHT)
-        self.qref_rows = tk.Frame(self)
+        self.qref_header = self._qwen_section.header
+        self.qref_add_btn = tk.Button(
+            self.qref_header, text="Add", command=lambda: self._add_qwen_reference(),
+        )
+        self.qref_add_btn.grid(row=0, column=1, sticky="e", padx=(4, 0))
+        self._qwen_section.frame.pack(fill=tk.X, pady=(2, 0))
+        self.qref_rows = tk.Frame(self._qwen_section.body)
         self.qref_rows.pack(fill=tk.X)
         self._refresh_qwen_reference_state()
 
@@ -181,17 +245,20 @@ class ReferencesPanel(tk.Frame):
         theme.register(anypaint_divider, bg="border")
 
         # --------------------------------------------- krea 2 anypaint (mask edit)
-        ap_header = tk.Frame(self)
-        ap_header.pack(fill=tk.X, pady=(2, 0))
-        tk.Label(ap_header, text="AnyPaint (Krea 2):", anchor="w").pack(side=tk.LEFT)
+        self._anypaint_section = _Section(
+            self, "AnyPaint (Krea 2)", open_by_default=True,
+        )
+        self.ap_header = self._anypaint_section.header
         self.anypaint_var = tk.BooleanVar(value=False)
         self.anypaint_check = tk.Checkbutton(
-            ap_header, variable=self.anypaint_var,
+            self.ap_header, variable=self.anypaint_var,
             command=self._on_anypaint_toggle,
         )
-        self.anypaint_check.pack(side=tk.RIGHT)
+        self.anypaint_check.grid(row=0, column=1, sticky="e", padx=(4, 0))
+        self._anypaint_section.frame.pack(fill=tk.X, pady=(2, 0))
 
-        ap_lora_row = tk.Frame(self)
+        body = self._anypaint_section.body
+        ap_lora_row = tk.Frame(body)
         ap_lora_row.pack(fill=tk.X, pady=(2, 0))
         tk.Label(ap_lora_row, text="Adapter:").pack(side=tk.LEFT)
         self.anypaint_lora_var = tk.StringVar(value="(none)")
@@ -205,7 +272,7 @@ class ReferencesPanel(tk.Frame):
         )
         self._refresh_anypaint_loras()
 
-        ap_strength_row = tk.Frame(self)
+        ap_strength_row = tk.Frame(body)
         ap_strength_row.pack(fill=tk.X, pady=(2, 0))
         tk.Label(ap_strength_row, text="Adapter strength:").pack(side=tk.LEFT)
         self.anypaint_strength_var = tk.DoubleVar(value=1.0)
@@ -215,7 +282,7 @@ class ReferencesPanel(tk.Frame):
         )
         self.anypaint_strength_spin.pack(side=tk.LEFT, padx=(4, 0))
         tk.Label(
-            self, text="Uses the Source and Region (mask) below.", anchor="w",
+            body, text="Uses the Source and Region (mask) below.", anchor="w",
         ).pack(fill=tk.X, pady=(2, 0))
         self._refresh_anypaint_state()
 
@@ -233,10 +300,47 @@ class ReferencesPanel(tk.Frame):
 
     def set_family(self, family):
         """Point the panel at the selected model's family and refresh its gates."""
+        changed = family != self._family
         self._family = family
         self._refresh_reference_state()
         self._refresh_qwen_reference_state()
         self._refresh_anypaint_state()
+        if changed:
+            self._sync_section_expansion()
+
+    def _sync_section_expansion(self):
+        """Open the active family's section; fold the other two away.
+
+        Only run when the family actually changes, so a section the user
+        collapsed by hand stays collapsed across ordinary canvas switches.
+        """
+        active = {
+            "anima": getattr(self, "_anima_section", None),
+            "qwen_image": getattr(self, "_qwen_section", None),
+            "krea2": getattr(self, "_anypaint_section", None),
+        }.get(self._family)
+        for section in (
+            getattr(self, "_anima_section", None),
+            getattr(self, "_qwen_section", None),
+            getattr(self, "_anypaint_section", None),
+        ):
+            if section is not None:
+                section.set_open(section is active)
+
+    def _refresh_section_titles(self):
+        """Show each section's contents on its header (useful when collapsed)."""
+        if hasattr(self, "_anima_section"):
+            self._anima_section.set_summary(
+                str(len(self._anima_refs)) if self._anima_refs else ""
+            )
+        if hasattr(self, "_qwen_section"):
+            self._qwen_section.set_summary(
+                str(len(self._qwen_refs)) if self._qwen_refs else ""
+            )
+        if hasattr(self, "_anypaint_section"):
+            self._anypaint_section.set_summary(
+                "on" if self.anypaint_var.get() else ""
+            )
 
     # ------------------------------------------------------------ reference rows
     def _add_ref_row(self, container, store, binding=None):
@@ -393,6 +497,7 @@ class ReferencesPanel(tk.Frame):
         for widget in (self.ref_strength_spin, self.ref_guidance_spin,
                        self.ref_offset_spin, self.ref_megapixels_spin):
             widget.configure(state=tk.NORMAL if active else tk.DISABLED)
+        self._refresh_section_titles()
 
     # -------------------------------------------------------- qwen references
     def _add_qwen_reference(self, binding=None):
@@ -414,6 +519,7 @@ class ReferencesPanel(tk.Frame):
             row["combo"].configure(state="readonly" if supported else "disabled")
             row["assign"].configure(state=tk.NORMAL if assignable else tk.DISABLED)
             row["remove"].configure(state=tk.NORMAL if supported else tk.DISABLED)
+        self._refresh_section_titles()
 
     # ----------------------------------------------------- krea 2 anypaint
     def _refresh_anypaint_loras(self):
@@ -457,6 +563,7 @@ class ReferencesPanel(tk.Frame):
         active = supported and bool(self.anypaint_var.get())
         self.anypaint_lora_menu.configure(state="readonly" if active else "disabled")
         self.anypaint_strength_spin.configure(state=tk.NORMAL if active else tk.DISABLED)
+        self._refresh_section_titles()
 
     def _on_anypaint_toggle(self):
         self._refresh_anypaint_state()
