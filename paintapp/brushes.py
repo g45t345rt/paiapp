@@ -383,6 +383,7 @@ class BrushLibraryPanel(tk.Frame):
         self._selected_id = None
         self._modified = False
         self._drag_id = None
+        self._ghost = None
         self._build()
         self.reload()
 
@@ -486,6 +487,7 @@ class BrushLibraryPanel(tk.Frame):
         self._render()
 
     def _render(self):
+        self._end_ghost()
         for child in self._list.winfo_children():
             child.destroy()
         self._rows.clear()
@@ -515,7 +517,7 @@ class BrushLibraryPanel(tk.Frame):
         handle = tk.Label(row, text="\u22ee\u22ee", cursor="fleur", width=2)
         handle.pack(side=tk.LEFT)
         handle.bind("<ButtonPress-1>",
-                    lambda _e, p=preset: self._on_drag_press(p))
+                    lambda e, p=preset: self._on_drag_press(p, e))
         handle.bind("<B1-Motion>", self._on_drag_motion)
         handle.bind("<ButtonRelease-1>", self._on_drag_release)
         thumb = tk.Label(row, bd=0)
@@ -585,49 +587,139 @@ class BrushLibraryPanel(tk.Frame):
         self._apply(self._presets[index])
 
     # ------------------------------------------------------------- reordering
-    def _on_drag_press(self, preset):
+    def _on_drag_press(self, preset, event):
         self._drag_id = preset.id
+        self._begin_ghost(self._rows.get(preset.id), event.x_root, event.y_root)
         return "break"
 
     def _row_at(self, x_root, y_root):
-        """The preset row under the pointer, or ``None``."""
-        widget = self.winfo_containing(x_root, y_root)
-        rows = {id(row): preset_id for preset_id, row in self._rows.items()}
-        while widget is not None:
-            if id(widget) in rows:
-                return widget, rows[id(widget)]
-            widget = widget.master
+        """The preset row whose box contains ``(x_root, y_root)``, or ``None``.
+
+        Hit-tests by geometry rather than ``winfo_containing``: the floating
+        drag ghost is topmost and would otherwise be the widget under the
+        pointer, hiding the row we are dragging over.
+        """
+        left = self._list.winfo_rootx()
+        right = left + self._list.winfo_width()
+        if not (left <= x_root <= right):
+            return None, None
+        for preset_id, row in self._rows.items():
+            try:
+                top = row.winfo_rooty()
+                height = row.winfo_height()
+            except tk.TclError:
+                continue
+            if top <= y_root < top + height:
+                return row, preset_id
         return None, None
 
     def _on_drag_motion(self, event):
         if self._drag_id is None:
             return "break"
-        row = self._rows.get(self._drag_id)
-        target, _preset_id = self._row_at(event.x_root, event.y_root)
-        if row is None or target is None or target is row:
+        self._move_ghost(event.x_root, event.y_root)
+        target, target_id = self._row_at(event.x_root, event.y_root)
+        if target is None or target_id is None or target_id == self._drag_id:
+            return "break"
+        ids = [p.id for p in self._presets]
+        if self._drag_id not in ids or target_id not in ids:
             return "break"
         midpoint = target.winfo_rooty() + target.winfo_height() // 2
-        if event.y_root < midpoint:
-            row.pack(before=target, fill=tk.X, padx=2, pady=1)
-        else:
-            row.pack(after=target, fill=tk.X, padx=2, pady=1)
+        # Move the dragged preset to just before (above) or after (below) the
+        # row under the pointer, then repack in that order. Reordering the
+        # model and repacking keeps the committed order in sync with what is
+        # drawn; reading the widget tree back on release would not, since
+        # ``winfo_children`` reports stacking order, not pack order.
+        ids.remove(self._drag_id)
+        index = ids.index(target_id) + (1 if event.y_root >= midpoint else 0)
+        ids.insert(index, self._drag_id)
+        by_id = {p.id: p for p in self._presets}
+        reordered = [by_id[pid] for pid in ids]
+        if reordered != self._presets:
+            self._presets = reordered
+            self._repack()
         return "break"
 
+    def _repack(self):
+        """Repack the preset rows to match the current ``self._presets`` order."""
+        for preset_id in [p.id for p in self._presets]:
+            row = self._rows.get(preset_id)
+            if row is not None:
+                row.pack_forget()
+        for preset_id in [p.id for p in self._presets]:
+            row = self._rows.get(preset_id)
+            if row is not None:
+                row.pack(fill=tk.X, padx=2, pady=1)
+
     def _on_drag_release(self, _event):
+        self._end_ghost()
         if self._drag_id is None:
             return "break"
         self._drag_id = None
-        ordered = []
-        for widget in self._list.winfo_children():
-            for preset_id, row in self._rows.items():
-                if row is widget:
-                    ordered.append(preset_id)
-                    break
-        if len(ordered) == len(self._presets):
-            rank = {pid: index for index, pid in enumerate(ordered)}
-            self._presets.sort(key=lambda p: rank.get(p.id, 0))
-            self._persist_order()
+        self._persist_order()
         return "break"
+
+    # ------------------------------------------------------------- drag ghost
+    def _begin_ghost(self, row, x_root, y_root):
+        """Float a washed snapshot of ``row`` under the pointer while dragging."""
+        self._end_ghost()
+        if row is None:
+            return
+        try:
+            from PIL import ImageGrab
+        except Exception:
+            return
+        width, height = row.winfo_width(), row.winfo_height()
+        if width <= 1 or height <= 1:
+            return
+        sx, sy = row.winfo_rootx(), row.winfo_rooty()
+        box = (sx, sy, sx + width, sy + height)
+        try:
+            shot = ImageGrab.grab(bbox=box, all_screens=True)
+        except TypeError:
+            try:
+                shot = ImageGrab.grab(bbox=box)
+            except Exception:
+                return
+        except Exception:
+            return
+        if shot is None:
+            return
+        shot = shot.convert("RGB")
+        washed = Image.blend(
+            Image.new("RGB", shot.size, theme.color("ghost_blend")), shot, 0.6
+        )
+        photo = ImageTk.PhotoImage(washed)
+        window = tk.Toplevel(self)
+        window.overrideredirect(True)
+        try:
+            window.attributes("-topmost", True)
+        except tk.TclError:
+            pass
+        overlay = tk.Label(
+            window, image=photo, bd=0,
+            highlightthickness=1, highlightbackground=theme.color("float_border"),
+        )
+        overlay.pack()
+        window.geometry(f"{width}x{height}+{sx}+{sy}")
+        self._ghost = {
+            "widget": window, "photo": photo,
+            "x": sx, "y": sy,
+            "x_root": x_root, "y_root": y_root,
+        }
+
+    def _move_ghost(self, x_root, y_root):
+        ghost = self._ghost
+        if ghost is None:
+            return
+        x = ghost["x"] + (x_root - ghost["x_root"])
+        y = ghost["y"] + (y_root - ghost["y_root"])
+        ghost["widget"].geometry(f"+{int(x)}+{int(y)}")
+
+    def _end_ghost(self):
+        ghost = self._ghost
+        if ghost is not None:
+            ghost["widget"].destroy()
+            self._ghost = None
 
     # ---------------------------------------------------------------- actions
     def _selected(self):
