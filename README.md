@@ -10,6 +10,41 @@ Built with Python and Tkinter.
 
 ![Pai](demo_header.png)
 
+## Features
+
+**Canvas and layers**
+- Layered canvas with groups, layer masks, blend modes, link layers, move-to-canvas/group, and rasterize
+- Per-canvas assets and a gallery, plus a full undo/redo history panel
+- Grid, off-canvas opacity, customizable sidebar panels, and keyboard shortcuts
+
+**Painting tools**
+- Brush, Erase, Fill, Pick, Clone, Smudge, Dodge, and Burn
+- Liquify, Warp, and Puppet Warp for freeform deformation
+- Symmetry modes for mirrored strokes
+
+**Selection and masks**
+- Rectangle, Lasso, Magic Wand, and Segment AI (click-to-segment) selection modes
+- Mask editing tools for inpaint and mask layers
+
+**Vector, text, and shapes**
+- Path and Vector tools, Shape tool with fill/stroke, and a Text tool
+- Gradient tool with linear, reflected, radial, square, diamond, and conical types
+
+**Transform**
+- Move, Crop, and Transform, plus canvas-level transforms
+
+**3D poses**
+- A built-in 3D pose tool for sketching figures and props
+
+**Filters**
+- Adjustments, Color, Blur & Sharpen, Stylize, Pixel & Color, and Manga categories
+
+**AI tools**
+- Image generation across nine model families (see [Supported models](#supported-models))
+- Reference images, ControlNet, and Region Prompts for guided generation
+- Remove Background, Upscale, and a job queue for batch work
+- Running and cached models are shown in the Loaded Models panel
+
 ## Requirements
 
 - Python 3.12–3.14 on your PATH
@@ -46,9 +81,31 @@ run.bat [--core-only] [--reinstall] [--setup-only] [--rocm] [--] [app args]
 
 The compute backend is auto-detected on first run: an NVIDIA GPU installs the CUDA build, an AMD GPU installs the ROCm build, macOS uses the CPU build, and an unrecognised GPU falls back to CUDA (which also runs on CPU). An AMD GPU whose target is unsupported or cannot be detected uses the CPU build instead; set `PAI_BACKEND` to `cuda`, `cpu` or `rocm` to override the detection.
 
-On AMD, the specific GPU target for the ROCm wheel is also detected (from `rocminfo`, the Linux KFD topology, the graphics driver's OpenCL runtime, `rocm-bootstrap-detect` or `clinfo`); set `PAI_ROCM_GFX` (e.g. `PAI_ROCM_GFX=gfx1100`) to override it. If the target cannot be detected, `--rocm` (or `PAI_BACKEND=rocm`) installs the `all` kernels instead of falling back to CPU.
+## Supported models
 
-Swapping GPU hardware (e.g. AMD to NVIDIA) is handled on the next launch: the changed backend is detected and the old torch build is uninstalled and replaced. `--reinstall` removes the whole `.venv` and rebuilds it from scratch.
+Generation runs through the model family you pick in the Generate panel:
+
+| Family | Notes |
+| --- | --- |
+| Anima | Cosmos-Predict2 DiT with a T5 adapter, aesthetic-tuned |
+| Qwen-Image 2.1 | Qwen3-VL text encoder, GGUF quantized DiT |
+| Flux | FLUX.1 dev |
+| Z-Image | Z-Image Turbo |
+| Krea 2 | Turbo DiT, includes AnyPaint masked editing |
+| MOSS Image | Instruction-tuned image model with JSON layout prompts |
+| MiniMax H3 | Qwen3-VL-32B text encoder with video VAE |
+| Fibo 2.0 | Bria Fibo 2.0 |
+| Stable Diffusion | SD 1.x / 2.x / SDXL, including Pony/Illustrious-style finetunes |
+
+Each family loads its components (DiT, text encoder, VAE) from separate files, so you can mix and match quantizations. Model Settings lets you point any slot at a custom file.
+
+The AI tools use additional local models:
+
+- **Upscaling** – Real-ESRGAN (RRDBNet), RCAN, SeedVR2 diffusion, and ONNX exports
+- **Background removal** – RMBG-2.0 (BiRefNet, full or quantized), BiRefNet general, U2Net (full/portrait/lite), and MODNet portrait matting
+- **Segmentation** – SAM ONNX encoder/decoder pairs for click-to-segment
+- **ControlNet** – ControlNet for SD 1.x / SDXL, Z-Image ControlNet, and Anima LLLite
+- **Adapters/LoRA** – standard LoRA plus the Anima reference adapter and Krea 2 AnyPaint
 
 ## Project files
 
