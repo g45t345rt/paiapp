@@ -614,7 +614,7 @@ class Layer:
         self._filter_key = key
         return result
 
-    def composited_image(self):
+    def composited_image(self, include_mask=True):
         """What the layer contributes to a composite: filtered pixels, texts, masked.
 
         The masked result is cached and reused while the base pixels, filter
@@ -623,20 +623,25 @@ class Layer:
         full-size pixels every time.         A link renders its master's content at the
         link's own offset (see :meth:`content_source`); with a per-instance
         transform, the content is resampled through that transform first.
+
+        ``include_mask=False`` returns the same content without folding the mask
+        into its alpha. The layer panel uses it for the row thumbnail, which
+        shows the layer and its mask as two separate previews.
         """
         source = self.content_source()
         if self.transform is not None:
-            return self._transformed_image(source, self.transform)
-        return source._composited_image_at(self.offset)
+            return self._transformed_image(source, self.transform, include_mask)
+        return source._composited_image_at(self.offset, include_mask)
 
-    def _transformed_image(self, source, matrix):
+    def _transformed_image(self, source, matrix, include_mask=True):
         """The source's composite resampled through ``matrix`` (cached).
 
         ``matrix`` maps the source's own pixel space into this layer's buffer
         space. The result is cropped to the matrix's bounding box, so its
         top-left is the box's top-left and the layer's ``offset`` places it.
+        ``include_mask`` is forwarded to the source's composite.
         """
-        base = source._composited_image_at(source.offset)
+        base = source._composited_image_at(source.offset, include_mask)
         left, top, right, bottom = _affine_bounds(matrix, base.size)
         left_i = math.floor(left)
         top_i = math.floor(top)
@@ -656,6 +661,7 @@ class Layer:
             tuple(matrix),
             left_i,
             top_i,
+            include_mask,
         )
         if self._transform_cache is not None and self._transform_key == key:
             return self._transform_cache
@@ -671,11 +677,12 @@ class Layer:
         self._transform_key = key
         return result
 
-    def _composited_image_at(self, offset):
+    def _composited_image_at(self, offset, include_mask=True):
         """``composited_image`` for this layer's own content drawn at ``offset``.
 
         Split out so a link layer can render its master's content at the link's
         offset; the cache keys on that offset as well as the content tokens.
+        With ``include_mask=False`` the mask is left out of the alpha channel.
         """
         image = self.filtered_image()
         if self.texts:
@@ -686,7 +693,7 @@ class Layer:
             image = self._poses_overlay(image, offset)
         if self.paths:
             image = self._path_overlay(image, offset)
-        if self.mask is None:
+        if self.mask is None or not include_mask:
             return image
         key = (
             self._image_token,

@@ -18,6 +18,14 @@ THUMB = 22
 ROW_PAD = 1
 ROW_H = THUMB + 2 * ROW_PAD
 
+# Gap between a layer's preview and its mask preview, in pixels, so the two
+# thumbnails read as separate cells instead of one wide image.
+MASK_GAP = 2
+
+# Tint a mask preview paints the kept region with, over the checkerboard.
+# Matches the Region Prompts panel so every mask thumbnail reads the same way.
+MASK_TINT = (90, 170, 255)
+
 # How long a layer's pixels must sit still before its preview is rebuilt, in
 # milliseconds. Downscaling a full-resolution layer costs milliseconds per
 # megapixel, so a preview is not rebuilt while the user is still painting: every
@@ -255,6 +263,7 @@ class LayerPanel(tk.Frame):
         self._row_widgets = []
         self._row_index = {}
         self._preview_cache = {}
+        self._mask_preview_cache = {}
         self._preview_job = None
         self._layers = []
         self._groups = []
@@ -573,8 +582,11 @@ class LayerPanel(tk.Frame):
         cell.pack_propagate(False)
         widgets.append(cell)
         token, photos = None, None
+        mask_token, mask_photos = None, None
         if layer is not None:
             token, photos = self._cached_preview(layer)
+            if layer.mask is not None:
+                mask_token, mask_photos = self._cached_mask_preview(layer)
         elif group is not None:
             token, photos = self._cached_group_preview(group)
         # The label is made either way, so a preview that could not be built has
@@ -585,6 +597,27 @@ class LayerPanel(tk.Frame):
             thumb.config(image=photo)
         thumb.place(relx=0.5, rely=0.5, anchor="center")
         widgets.append(thumb)
+        # A mask rides next to the layer's own preview, so the mask and the
+        # pixels it shapes are read together without opening the mask tools.
+        mask_cell = None
+        mask_thumb = None
+        mask_photo = None
+        mask_gap = None
+        if mask_photos is not None:
+            mask_gap = tk.Frame(row, width=MASK_GAP, bg=bg)
+            mask_gap.pack(side=tk.LEFT, fill=tk.Y)
+            widgets.append(mask_gap)
+            mask_cell = tk.Frame(row, width=THUMB, height=ROW_H, bg=bg)
+            mask_cell.pack(side=tk.LEFT, fill=tk.Y)
+            mask_cell.pack_propagate(False)
+            widgets.append(mask_cell)
+            mask_thumb = tk.Label(mask_cell, bg=bg, bd=0)
+            mask_photo = mask_photos[0] if mask_photos else None
+            if mask_photo is not None:
+                mask_thumb.config(image=mask_photo)
+            mask_thumb.place(relx=0.5, rely=0.5, anchor="center")
+            Tooltip(mask_thumb, "Layer mask")
+            widgets.append(mask_thumb)
         # Status icons claim the right edge before the name, so a long layer
         # name can shrink the label but never clip the icons off the row.
         badge_widgets = []
@@ -622,6 +655,10 @@ class LayerPanel(tk.Frame):
         self._row_widgets.append({
             "row": row, "cell": cell, "label": label,
             "thumb": thumb, "photos": photos, "photo": photo, "token": token,
+            "mask_cell": mask_cell, "mask_thumb": mask_thumb,
+            "mask_gap": mask_gap,
+            "mask_photos": mask_photos, "mask_photo": mask_photo,
+            "mask_token": mask_token,
             "hidden": bool(hidden), "badges": badge_widgets,
             "badge_strip": badge_strip,
         })
@@ -688,16 +725,18 @@ class LayerPanel(tk.Frame):
     def _build_photos(self, layer):
         """The ``(color, gray, dark)`` preview photos of ``layer``.
 
-        The preview mirrors what the layer contributes to the canvas - its
-        filtered, masked pixels with any editable text or vector strokes drawn
-        over them - so a vector or text layer is not blank in the list. The
-        grayscale pair is what a hidden layer's row shows, ``dark`` standing in
-        for a hidden row that is also selected. Returns ``(None, None, None)``
-        when no preview can be made.
+        The preview mirrors the layer's own content - its filtered pixels with
+        any editable text or vector strokes drawn over them - so a vector or
+        text layer is not blank in the list. The mask is left out because the
+        row shows it as a separate preview beside this one. The grayscale pair
+        is what a hidden layer's row shows, ``dark`` standing in for a hidden
+        row that is also selected. Returns ``(None, None, None)`` when no
+        preview can be made.
         """
         try:
             composited = getattr(layer, "composited_image", None)
-            source = composited() if composited is not None else layer.image
+            source = (composited(include_mask=False)
+                      if composited is not None else layer.image)
             color = self._thumb(source)
             gray = color.convert("L").convert("RGB")
             dark = Image.blend(gray, Image.new("RGB", gray.size, (0, 0, 0)), 0.25)
@@ -708,6 +747,62 @@ class LayerPanel(tk.Frame):
             )
         except (tk.TclError, ValueError):
             return None, None, None
+
+    def _cached_mask_preview(self, layer):
+        """The layer mask's ``(pixel token, preview photos)``, rebuilt if stale.
+
+        Mirrors :meth:`_cached_preview`; the token is the layer's pixel token,
+        which already folds in ``_mask_token``, so a mask edit matches the
+        layer preview's own staleness check. The cache holds the layer weakly.
+        """
+        token = layer.pixels_token
+        entry = self._mask_preview_cache.get(id(layer))
+        if entry is not None and entry["layer"]() is layer \
+                and entry["token"] == token:
+            return token, entry["photos"]
+        photos = self._build_mask_photos(layer)
+        if photos[0] is None:
+            return token, None
+        self._mask_preview_cache[id(layer)] = {
+            "layer": weakref.ref(layer), "token": token, "photos": photos,
+        }
+        return token, photos
+
+    def _build_mask_photos(self, layer):
+        """The ``(color, gray, dark)`` preview photos of ``layer``'s mask.
+
+        Kept regions are tinted over a checkerboard, matching the Region
+        Prompts panel's mask thumbnails, so a mask's shape reads at a glance.
+        The grayscale pair is what a hidden layer's row shows. Returns
+        ``(None, None, None)`` when the layer has no mask or no preview can be
+        made.
+        """
+        try:
+            mask = layer.mask
+            if mask is None:
+                return None, None, None
+            color = self._mask_thumb(mask)
+            gray = color.convert("L").convert("RGB")
+            dark = Image.blend(gray, Image.new("RGB", gray.size, (0, 0, 0)), 0.25)
+            return (
+                ImageTk.PhotoImage(color),
+                ImageTk.PhotoImage(gray),
+                ImageTk.PhotoImage(dark),
+            )
+        except (tk.TclError, ValueError):
+            return None, None, None
+
+    def _mask_thumb(self, mask):
+        """A tiny ``RGB`` preview of a mask: its kept region tinted over a checker."""
+        source = mask.convert("L")
+        width, height = source.size
+        scale = min(THUMB / max(1, width), THUMB / max(1, height), 1.0)
+        target = (max(1, round(width * scale)), max(1, round(height * scale)))
+        board = checkerboard(target)
+        tint = Image.new("RGBA", target, MASK_TINT + (255,))
+        tint.putalpha(source.resize(target, Image.BOX))
+        board.alpha_composite(tint)
+        return board.convert("RGB")
 
     def _cached_group_preview(self, group):
         """The group's ``(token, preview photos)``, rebuilding if stale.
@@ -857,18 +952,39 @@ class LayerPanel(tk.Frame):
                 widgets["photos"] = None
                 widgets["photo"] = None
                 widgets["thumb"].config(image="")
+                if widgets.get("mask_thumb") is not None:
+                    widgets["mask_photos"] = None
+                    widgets["mask_photo"] = None
+                    widgets["mask_token"] = token
+                    widgets["mask_thumb"].config(image="")
                 continue
             widgets["photos"] = photos
             widgets["token"] = token
             self._preview_cache[id(target)] = {
                 "layer": weakref.ref(target), "token": token, "photos": photos,
             }
+            if entry[0] == "layer" and widgets.get("mask_thumb") is not None:
+                mask_photos = self._build_mask_photos(target)
+                widgets["mask_photos"] = mask_photos
+                widgets["mask_photo"] = None
+                widgets["mask_token"] = token
+                if mask_photos[0] is None:
+                    widgets["mask_thumb"].config(image="")
+                else:
+                    self._mask_preview_cache[id(target)] = {
+                        "layer": weakref.ref(target), "token": token,
+                        "photos": mask_photos,
+                    }
             self._show_preview(widgets, row in self._selected)
 
     def _drop_dead_previews(self):
         """Forget cached previews whose layer has been deleted."""
         self._preview_cache = {
             key: entry for key, entry in self._preview_cache.items()
+            if entry["layer"]() is not None
+        }
+        self._mask_preview_cache = {
+            key: entry for key, entry in self._mask_preview_cache.items()
             if entry["layer"]() is not None
         }
 
@@ -1127,6 +1243,10 @@ class LayerPanel(tk.Frame):
                 row_bg, row_fg = bg, fg
             widgets["row"].config(bg=row_bg)
             widgets["cell"].config(bg=row_bg)
+            if widgets.get("mask_cell") is not None:
+                widgets["mask_gap"].config(bg=row_bg)
+                widgets["mask_cell"].config(bg=row_bg)
+                widgets["mask_thumb"].config(bg=row_bg)
             widgets["label"].config(bg=row_bg, fg=row_fg)
             if widgets["badge_strip"] is not None:
                 widgets["badge_strip"].config(bg=row_bg)
@@ -1148,20 +1268,28 @@ class LayerPanel(tk.Frame):
         """Show a row's color, grayscale or dark-grayscale preview.
 
         A normal row shows the layer's color preview; a hidden row shows the
-        grayscale one, or the darker grayscale while it is selected. Does
+        grayscale one, or the darker grayscale while it is selected. A layer
+        with a mask shows the same variant of its mask preview beside it. Does
         nothing when the row already shows the right photo or has none.
         """
         photos = widgets["photos"]
-        if not photos or photos[0] is None:
-            return
-        if widgets["hidden"]:
-            photo = photos[2] if selected else photos[1]
-        else:
-            photo = photos[0]
-        if widgets["photo"] is photo:
-            return
-        widgets["photo"] = photo
-        widgets["thumb"].config(image=photo)
+        if photos and photos[0] is not None:
+            if widgets["hidden"]:
+                photo = photos[2] if selected else photos[1]
+            else:
+                photo = photos[0]
+            if widgets["photo"] is not photo:
+                widgets["photo"] = photo
+                widgets["thumb"].config(image=photo)
+        mask_photos = widgets.get("mask_photos")
+        if mask_photos and mask_photos[0] is not None:
+            if widgets["hidden"]:
+                mask_photo = mask_photos[2] if selected else mask_photos[1]
+            else:
+                mask_photo = mask_photos[0]
+            if widgets["mask_photo"] is not mask_photo:
+                widgets["mask_photo"] = mask_photo
+                widgets["mask_thumb"].config(image=mask_photo)
 
     def _select_rows(self, rows, target):
         """Repaint the list for ``rows`` and route the ``target`` row.
