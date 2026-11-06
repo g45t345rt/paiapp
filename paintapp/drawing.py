@@ -818,6 +818,9 @@ class ToolsPanel(tk.Frame):
         for child in self.settings.winfo_children():
             child.destroy()
         self._brush_preview = None
+        # The advanced block's toggle button, if the tool has one; the symmetry
+        # block packs before it so its guide controls stay above "Advanced".
+        self._advanced_anchor = None
         builder = getattr(self, f"_settings_for_{active}", None)
         if builder is None:
             tk.Label(
@@ -885,6 +888,7 @@ class ToolsPanel(tk.Frame):
 
         button.config(command=lambda: (var.set(not var.get()), apply()))
         button.pack(fill=tk.X, pady=(6, 0))
+        self._advanced_anchor = button
         apply()
         return frame
 
@@ -2765,13 +2769,19 @@ class ToolsPanel(tk.Frame):
 
     # ------------------------------------------------------ symmetry settings
     def _symmetry_rows(self):
-        """The symmetry-guide block appended to painting tools' settings."""
+        """The symmetry-guide block for painting tools' settings.
+
+        The block is packed above the tool's "Advanced" toggle when it has one
+        (see :meth:`_advanced_toggle`), so the guide controls stay visible
+        rather than tucking away with the advanced rows.
+        """
         self._symmetry_mode_var = tk.StringVar(value=self.symmetry_mode)
         self._symmetry_count_var = tk.IntVar(value=self.symmetry_count)
         self._symmetry_mirror_var = tk.BooleanVar(value=self.symmetry_mirror)
-        tk.Frame(self.settings, height=1, bd=0).pack(fill=tk.X, pady=(6, 0))
+        block = tk.Frame(self.settings)
+        tk.Frame(block, height=1, bd=0).pack(fill=tk.X, pady=(6, 0))
         self._menu_row(
-            self.settings, "Symmetry", self._symmetry_mode_var,
+            block, "Symmetry", self._symmetry_mode_var,
             [("off", "Off"), ("vertical", "Vertical"),
              ("horizontal", "Horizontal"), ("both", "Both"),
              ("radial", "Radial")],
@@ -2781,10 +2791,10 @@ class ToolsPanel(tk.Frame):
         # packed before it, so a mode change shows or hides them without
         # rebuilding the panel (which would destroy the combobox mid-selection).
         self._symmetry_hint = tk.Label(
-            self.settings, text="Mirrored about the canvas center.",
+            block, text="Mirrored about the canvas center.",
             anchor="w", fg="#888888",
         )
-        self._symmetry_radial = tk.Frame(self.settings)
+        self._symmetry_radial = tk.Frame(block)
         self._slider_row(
             self._symmetry_radial, "Spokes", self._symmetry_count_var,
             symmetry.RADIAL_MIN, symmetry.RADIAL_MAX, self._on_symmetry_change,
@@ -2796,6 +2806,11 @@ class ToolsPanel(tk.Frame):
         self._symmetry_hint.pack(fill=tk.X, pady=(2, 0))
         if self.symmetry_mode == "radial":
             self._symmetry_radial.pack(fill=tk.X, before=self._symmetry_hint)
+        anchor = self._advanced_anchor
+        if anchor is not None:
+            block.pack(fill=tk.X, before=anchor)
+        else:
+            block.pack(fill=tk.X)
 
     def _on_symmetry_change(self, _event=None):
         self.symmetry_mode = self._symmetry_mode_var.get()
