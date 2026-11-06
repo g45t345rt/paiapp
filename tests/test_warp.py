@@ -697,11 +697,11 @@ def test_puppet_preview_geometry_and_cache():
     session.preview()
     vertices = session.deformed.copy()
     mesh = session.mesh_geometry()
-    cached = session._preview_source
+    cached = session._live
     session.set_pin_pos(0, 250, 240)
     session.preview()
-    check("drag reuses immutable preview texture",
-          session._preview_source is cached, True)
+    check("drag reuses the live full-resolution preview",
+          session._live is cached, True)
     session.set_pin_pos(0, 240, 240)
     session.render()
     check("preview and final use identical deformation",

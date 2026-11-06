@@ -556,8 +556,8 @@ class PuppetWarp:
         # ``angle`` is the rotation (radians) about the rest point, and
         # ``selected`` drives the overlay and multi-pin drags.
         self.pins = []
-        # True while ``image`` holds a reduced-resolution drag preview, so the
-        # caller knows to finish with an exact :meth:`render` when the drag ends.
+        # True while ``image`` holds a drag preview, so the caller knows to
+        # finish with an exact :meth:`render` when the drag ends.
         self.previewed = False
         height, width = self.source.shape[:2]
         self.mesh_delta = max(6.0, max(width, height) / float(self.MESH_CELLS))
@@ -566,11 +566,17 @@ class PuppetWarp:
             clip_alpha = np.asarray(self.clip.crop(box), dtype=np.float32) / 255.0
             self.support_alpha *= clip_alpha
         self.support = self.support_alpha > 0.01
-        self._preview_source = None
+        # The running full-resolution drag preview image and the vertices it was
+        # rendered from, so later frames only re-rasterize what moved.
+        self._live = None
+        self._live_vertices = None
         self._build_mesh()
 
     def _build_mesh(self):
         """Triangulate the silhouette with every pin as an exact vertex."""
+        # A rebuilt mesh invalidates the running live preview.
+        self._live = None
+        self._live_vertices = None
         extra = [np.asarray(pin["rest"]) - self.doc_origin for pin in self.pins]
         self.vertices, self.faces = puppetmesh.content_mesh(
             self.support_alpha, self.mesh_delta, extra_points=extra)
@@ -794,7 +800,7 @@ class PuppetWarp:
         return self._render_preview()
 
     def preview(self):
-        """Re-render a live drag at reduced resolution (see :meth:`render`)."""
+        """Re-render a live drag at full resolution, updated incrementally."""
         return self._render_preview()
 
     def reset(self):
@@ -1019,6 +1025,20 @@ class PuppetWarp:
         """Transfer the source through the current deformed mesh."""
         return self._render_at_scale(1, self.source)
 
+    def _warp_patch(self, source, factor, bounds):
+        """Rasterize ``bounds`` through the current mesh and unpremultiply it."""
+        patch = puppetmesh.warp_triangles(
+            source, self.vertices / factor, self.deformed / factor, self.faces, 0,
+            priorities=self._face_priorities(), bounds=bounds)
+        image = _unpremultiply(patch)
+        if factor != 1:
+            scale = 1.0 / factor
+            image = image.transform(
+                (image.width * factor, image.height * factor),
+                Image.AFFINE, (scale, 0, (1 - scale) / 2,
+                               0, scale, (1 - scale) / 2), Image.BILINEAR)
+        return image
+
     def _render_at_scale(self, factor, source):
         """Rasterize only visible deformed bounds using the same mesh at any scale."""
         image = self.original.copy()
@@ -1032,18 +1052,8 @@ class PuppetWarp:
         high = np.minimum(high, canvas_high)
         if np.any(high <= low):
             return self._clip_image(image)
-        bounds = (*low, *high)
-        patch = puppetmesh.warp_triangles(
-            source, self.vertices / factor, self.deformed / factor, self.faces, 0,
-            priorities=self._face_priorities(), bounds=bounds)
-        patch_image = _unpremultiply(patch)
-        if factor != 1:
-            scale = 1.0 / factor
-            patch_image = patch_image.transform(
-                (patch_image.width * factor, patch_image.height * factor),
-                Image.AFFINE, (scale, 0, (1 - scale) / 2,
-                               0, scale, (1 - scale) / 2), Image.BILINEAR)
-        image.alpha_composite(patch_image, dest=(
+        patch = self._warp_patch(source, factor, (*low, *high))
+        image.alpha_composite(patch, dest=(
             int(self.origin[0] + low[0] * factor),
             int(self.origin[1] + low[1] * factor)))
         return self._clip_image(image)
@@ -1068,37 +1078,59 @@ class PuppetWarp:
         self.image = self._render_exact()
         return self.image
 
-    def _preview_factor(self):
-        """The power-of-two downscale that keeps a drag preview affordable."""
-        height, width = self.source.shape[:2]
-        factor = 1
-        while math.ceil(width / factor) * math.ceil(height / factor) > self.PREVIEW_TARGET:
-            factor *= 2
-        return factor
-
     def _render_preview(self):
-        """A quicker render for a live drag; :meth:`render` is the exact one.
+        """A sharper live render for a drag; :meth:`render` is the final one.
 
-        Only the texture resolution changes; sharing the exact deformation keeps
-        anchors, thin connections and overlap order stable on mouse release.
+        Small layers are cheap enough to render exactly. For larger ones the
+        first drag frame renders the whole deformation at full resolution, then
+        each later frame re-rasterizes only the triangles that moved since the
+        previous frame and composites them onto the running image. The preview
+        therefore stays full resolution instead of blurring from a downscale.
         """
-        factor = self._preview_factor()
-        if factor <= 1 or not self.pins or self._static():
+        if not self.pins or self._static():
             return self.render()
-        self.previewed = True
+        height, width = self.source.shape[:2]
+        if width * height <= self.PREVIEW_TARGET:
+            return self.render()
         self._ensure_solved()
-        if self._preview_source is None:
-            height, width = self.source.shape[:2]
-            # Filter premultiplied channels and preserve mesh pixel coordinates.
-            shift = -(factor - 1) / (2.0 * factor)
-            channels = [Image.fromarray(self.source[..., i]).reduce(factor).transform(
-                (math.ceil(width / factor), math.ceil(height / factor)),
-                Image.AFFINE, (1, 0, shift, 0, 1, shift), Image.BILINEAR)
-                for i in range(4)]
-            self._preview_source = np.stack(
-                [np.asarray(channel) for channel in channels], axis=-1)
-        self.image = self._render_at_scale(factor, self._preview_source)
+        if self._live is None or not self.previewed:
+            self._live = self._render_solved()
+            self._live_vertices = self.deformed.copy()
+        else:
+            self._refresh_live()
+        self.previewed = True
+        self.image = self._live
         return self.image
+
+    def _refresh_live(self):
+        """Re-rasterize only the region of the live preview that moved."""
+        moved = np.linalg.norm(self.deformed - self._live_vertices, axis=1) > 0.5
+        if not moved.any():
+            return
+        changed = np.nonzero(moved[self.faces].any(axis=1))[0]
+        if not len(changed):
+            return
+        # The swept region covers both where those triangles are now and where
+        # they were, so vacated source pixels are cleared as well.
+        corners = np.vstack((
+            self.deformed[self.faces[changed]].reshape(-1, 2),
+            self._live_vertices[self.faces[changed]].reshape(-1, 2)))
+        low = np.floor(corners.min(axis=0) - 3).astype(int)
+        high = np.ceil(corners.max(axis=0) + 3).astype(int)
+        low = np.maximum(low, -np.asarray(self.origin))
+        high = np.minimum(
+            high, np.asarray(self._live.size) - np.asarray(self.origin))
+        self._live_vertices = self.deformed.copy()
+        if np.any(high <= low):
+            return
+        dest = (int(self.origin[0] + low[0]), int(self.origin[1] + low[1]))
+        self._live.paste(
+            (0, 0, 0, 0),
+            (dest[0], dest[1],
+             dest[0] + int(high[0] - low[0]), dest[1] + int(high[1] - low[1])))
+        self._live.alpha_composite(
+            self._warp_patch(self.source, 1, (*low, *high)), dest=dest)
+
 
     def commit(self):
         return self.image
