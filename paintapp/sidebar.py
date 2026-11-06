@@ -220,8 +220,7 @@ class _RailItem:
         total = self._finner.winfo_reqheight()
         view = self._fviewport.winfo_height()
         max_offset = max(0, total - view)
-        if self._foffset > max_offset:
-            self._foffset = max_offset
+        self._foffset = max(0, min(self._foffset, max_offset))
         self._finner.place_configure(y=-self._foffset)
         span = float(total) or 1.0
         self._fscroll.set(
