@@ -402,9 +402,6 @@ class ToolsPanel(tk.Frame):
         self.eraser_target = "transparent"
         self.eraser_color = "#ffffff"
         self.mask_value = 0
-        self.mask_opacity = 100
-        self.mask_hardness = 100
-        self.mask_antialias = True
         self.mask_erase = False
         self.mask_overlay = "#ff0000"
         # Paint bucket settings (see ``fill`` for how they map to pixels).
@@ -1975,12 +1972,19 @@ class ToolsPanel(tk.Frame):
 
     def _settings_for_mask(self):
         self._mask_value_var = tk.IntVar(value=self.mask_value)
-        self._mask_opacity_var = tk.IntVar(value=self.mask_opacity)
-        self._mask_hardness_var = tk.IntVar(value=self.mask_hardness)
-        self._mask_aa_var = tk.BooleanVar(value=self.mask_antialias)
         self._mask_erase_var = tk.BooleanVar(value=self.mask_erase)
         self._mask_feather_var = tk.IntVar(value=4)
 
+        # The mask paints with the active brush's stamping settings (hardness,
+        # flow, opacity, spacing, tip, pattern, grain, dynamics), so only the
+        # mask-specific controls live here; the rest are edited in the Brush
+        # tool and the Brushes panel.
+        tk.Label(
+            self.settings,
+            text=("Paints with the active brush. Choose a preset in the "
+                  "Brushes panel; edit its stamping in the Brush tool."),
+            anchor="w", fg="#888888", wraplength=210, justify="left",
+        ).pack(fill=tk.X, pady=(0, 4))
         tk.Label(self.settings, text="Size", anchor="w").pack(fill=tk.X)
         self._size_row(self.settings)
         value_row = tk.Frame(self.settings)
@@ -1993,12 +1997,6 @@ class ToolsPanel(tk.Frame):
             ).pack(side=tk.LEFT, padx=(0, 2))
         self._slider_row(self.settings, "Value", self._mask_value_var,
                          0, 255, self._sync_mask)
-        self._slider_row(self.settings, "Opacity", self._mask_opacity_var,
-                         1, 100, self._sync_mask)
-        self._slider_row(self.settings, "Hardness", self._mask_hardness_var,
-                         0, 100, self._sync_mask)
-        self._check_row(self.settings, "Anti-alias", self._mask_aa_var,
-                        self._sync_mask)
         self._check_row(self.settings, "Erase paint", self._mask_erase_var,
                         self._sync_mask)
         self._mask_overlay_btn = tk.Button(
@@ -2031,9 +2029,6 @@ class ToolsPanel(tk.Frame):
 
     def _sync_mask(self, *_):
         self.mask_value = max(0, min(255, self._int_var(self._mask_value_var, 0)))
-        self.mask_opacity = max(1, self._int_var(self._mask_opacity_var, 100))
-        self.mask_hardness = max(0, self._int_var(self._mask_hardness_var, 100))
-        self.mask_antialias = bool(self._mask_aa_var.get())
         self.mask_erase = bool(self._mask_erase_var.get())
 
     def _choose_mask_overlay(self):
@@ -3483,8 +3478,7 @@ class ToolsPanel(tk.Frame):
         "eraser_grain", "eraser_grain_scale", "eraser_grain_strength",
         "eraser_grain_mode", "eraser_jitter_hue", "eraser_jitter_sat",
         "eraser_jitter_val", "eraser_pickup",
-        "mask_value", "mask_opacity", "mask_hardness", "mask_antialias",
-        "mask_erase", "mask_overlay",
+        "mask_value", "mask_erase", "mask_overlay",
         "fill_tolerance", "fill_contiguous", "fill_antialias", "fill_gap",
         "fill_opacity", "fill_blend",
         "gradient_mode", "gradient_from", "gradient_to", "gradient_opacity",
@@ -4364,10 +4358,7 @@ class DrawingController:
         pointer speeds up so a fast flick is not left lagging behind.
         """
         tools = self.app.tools
-        if tools.mask_edit or tools.inpaint_mask_edit:
-            stabilize = 0
-            style = "simple"
-        elif tools.eraser:
+        if tools.eraser:
             stabilize = tools.eraser_stabilize
             style = getattr(tools, "eraser_stabilize_mode", "simple")
         else:
@@ -4445,11 +4436,20 @@ class DrawingController:
                 value = 0 if value >= 128 else 255
             if self._mask_invert:
                 value = 255 - value
+            # Masks paint with the active brush's stamping settings so a mask
+            # takes the same tip, spacing, hardness, grain and dynamics as the
+            # brush; only the painted *value* is mask-specific.
             return brush.Stroke(
-                layer, "mask", size=size, hardness=tools.mask_hardness,
-                flow=100, opacity=tools.mask_opacity, spacing=50,
-                antialias=tools.mask_antialias, tip="Round",
-                paint_value=value,
+                layer, "mask", size=size, hardness=tools.brush_hardness,
+                flow=tools.brush_flow, opacity=tools.brush_opacity,
+                spacing=tools.brush_spacing, antialias=tools.brush_antialias,
+                tip=tools.brush_tip.lower(), pattern=tools.brush_pattern,
+                paint_value=value, dynamics=self._brush_dynamics(),
+                grain=tools.brush_grain,
+                grain_scale=tools.brush_grain_scale / 100.0,
+                grain_strength=tools.brush_grain_strength / 100.0,
+                grain_mode=tools.brush_grain_mode,
+                wet_edge=tools.brush_wet_edge / 100.0,
             )
         if mode == "eraser":
             return brush.Stroke(
