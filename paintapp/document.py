@@ -4,7 +4,7 @@ import math
 
 from PIL import Image, ImageChops, ImageDraw
 
-from . import filters, path, poses, textrender, vector
+from . import brush, filters, path, poses, textrender, vector
 from .history import History
 
 # Largest content area (in pixels) for which the below/above backdrop cache is
@@ -16,22 +16,82 @@ from .history import History
 MAX_BACKDROP_PIXELS = 12_000_000
 
 # Layer blend modes, in menu order. "normal" is plain over-compositing; the
-# others mix the layer's color with the pixels already composited beneath it
-# (Pillow's ImageChops provide the C implementations).
+# others mix the layer's color with the pixels already composited beneath it.
+# Pillow's ImageChops provide the C implementations for :data:`BLEND_OPS`; the
+# remaining modes (dodge/burn, exclusion and the HSL hue/saturation/colour/
+# luminosity set) are computed with numpy by ``brush._blend``, the same code the
+# paint tools use, so a layer and a brush share one blend implementation.
 BLEND_MODES = [
     ("normal", "Normal"),
-    ("multiply", "Multiply"),
-    ("screen", "Screen"),
-    ("overlay", "Overlay"),
     ("darken", "Darken"),
+    ("multiply", "Multiply"),
+    ("color_burn", "Color Burn"),
+    ("linear_burn", "Linear Burn"),
+    ("darker_color", "Darker Color"),
     ("lighten", "Lighten"),
-    ("difference", "Difference"),
+    ("screen", "Screen"),
+    ("color_dodge", "Color Dodge"),
     ("add", "Add"),
-    ("subtract", "Subtract"),
-    ("hard_light", "Hard Light"),
+    ("lighter_color", "Lighter Color"),
+    ("overlay", "Overlay"),
     ("soft_light", "Soft Light"),
+    ("hard_light", "Hard Light"),
+    ("vivid_light", "Vivid Light"),
+    ("linear_light", "Linear Light"),
+    ("pin_light", "Pin Light"),
+    ("hard_mix", "Hard Mix"),
+    ("difference", "Difference"),
+    ("exclusion", "Exclusion"),
+    ("subtract", "Subtract"),
+    ("divide", "Divide"),
+    ("hue", "Hue"),
+    ("saturation", "Saturation"),
+    ("color", "Color"),
+    ("luminosity", "Luminosity"),
 ]
 BLEND_LABELS = {mode: label for mode, label in BLEND_MODES}
+
+# Blend modes grouped the way image editors present them. The layer blend
+# combobox inserts a display-only divider between groups so the long list reads
+# as categories instead of one flat column. Divider rows use the same
+# ``— Group —`` style as the generation panel's model picker
+# (:func:`paintapp.generation.GenerationPanel._model_catalog`).
+BLEND_GROUPS = [
+    ("Normal", ["normal"]),
+    ("Darken", ["darken", "multiply", "color_burn", "linear_burn",
+                "darker_color"]),
+    ("Lighten", ["lighten", "screen", "color_dodge", "add", "lighter_color"]),
+    ("Contrast", ["overlay", "soft_light", "hard_light", "vivid_light",
+                  "linear_light", "pin_light", "hard_mix"]),
+    ("Comparative", ["difference", "exclusion", "subtract", "divide"]),
+    ("Component", ["hue", "saturation", "color", "luminosity"]),
+]
+BLEND_DIVIDER_PREFIX = "\u2014 "
+
+
+def blend_divider_label(group):
+    """A display-only group header in the models-combobox divider style."""
+    return BLEND_DIVIDER_PREFIX + group + " \u2014"
+
+
+def is_blend_divider(label):
+    """True when ``label`` is a display-only divider in the blend menu."""
+    return str(label).startswith(BLEND_DIVIDER_PREFIX)
+
+
+def blend_mode_labels():
+    """Return layer blend menu values, grouped with display-only dividers."""
+    labels = []
+    for group, modes in BLEND_GROUPS:
+        labels.append(blend_divider_label(group))
+        for mode in modes:
+            labels.append(BLEND_LABELS[mode])
+    return labels
+
+
+def blend_headers():
+    """The set of display-only divider labels in the blend menu."""
+    return {blend_divider_label(group) for group, _modes in BLEND_GROUPS}
 BLEND_OPS = {
     "multiply": ImageChops.multiply,
     "screen": ImageChops.screen,
@@ -169,14 +229,34 @@ def _paste_layer(base, layer, left, top, clip=None, scale=1.0, offset=None):
     # ``alpha_composite`` raises "images do not match" on a mode mismatch.
     if sub.mode != "RGBA":
         sub = sub.convert("RGBA")
-    blend_op = BLEND_OPS.get(layer.blend)
-    if blend_op is not None:
+    blend_mode = layer.blend
+    if blend_mode != "normal":
         # Mix the layer's color with the pixels already under it (the backdrop),
         # keeping the layer's own alpha; the over-composite below then applies
         # that alpha, which is the standard "blend then composite" formula.
         backdrop = base.crop((dest[0], dest[1],
                               dest[0] + sub.width, dest[1] + sub.height))
-        mixed = blend_op(backdrop.convert("RGB"), sub.convert("RGB")).convert("RGBA")
+        backdrop_rgb = backdrop.convert("RGB")
+        sub_rgb = sub.convert("RGB")
+        blend_op = BLEND_OPS.get(blend_mode)
+        if blend_op is not None:
+            mixed = blend_op(backdrop_rgb, sub_rgb)
+        else:
+            # Dodge/burn, exclusion and the HSL modes: share the tools' numpy
+            # implementation rather than duplicating the channel maths.
+            mixed = brush._blend(blend_mode, backdrop_rgb, sub_rgb)
+        # A fully transparent backdrop pixel has no color to blend against, so a
+        # bare area would otherwise read as black (e.g. multiply over alpha 0);
+        # fall back to the layer's own pixels there, matching the brush tools.
+        # Threshold the mask first: feeding the raw alpha to ``Image.composite``
+        # would linearly mix the layer's raw color into *partially* transparent
+        # pixels, washing out the blend for alpha 1..254. Only alpha 0 has no
+        # color to blend with; the final ``alpha_composite`` below applies the
+        # layer's alpha and the backdrop's coverage correctly.
+        if backdrop.mode == "RGBA":
+            opaque = backdrop.getchannel("A").point(lambda a: 255 if a else 0)
+            mixed = Image.composite(mixed, sub_rgb, opaque)
+        mixed = mixed.convert("RGBA")
         mixed.putalpha(sub.getchannel("A"))
         sub = mixed
     if clip is not None:

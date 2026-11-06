@@ -355,11 +355,17 @@ class LayerPanel(tk.Frame):
         self.blend_var = tk.StringVar(value="Normal")
         self.blend_menu = ttk.Combobox(
             blend_row, textvariable=self.blend_var,
-            values=[label for _mode, label in document.BLEND_MODES],
+            values=document.blend_mode_labels(),
             state="readonly", width=1,
         )
         self.blend_menu.bind("<<ComboboxSelected>>", self._handle_blend)
         self.blend_menu.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        # ttk builds the combobox drop-down lazily and rebuilds its rows on
+        # every post, so the group headers are recolored from its <Map> handler
+        # (mirrors GenerationPanel's model picker) rather than once.
+        self._blend_popdown_path = None
+        self._blend_headers = document.blend_headers()
+        self.after_idle(self._blend_popdown)
 
         opacity_row = tk.Frame(self)
         opacity_row.pack(fill=tk.X, pady=(4, 2))
@@ -2229,10 +2235,84 @@ class LayerPanel(tk.Frame):
         if self._on_blend is None:
             return
         label = self.blend_var.get()
+        if document.is_blend_divider(label):
+            # Divider rows are display-only; selecting one must not change the
+            # layer. Restore the label of the layer's current blend mode.
+            active = (self._layers[self._active]
+                      if self._layers and self._active < len(self._layers)
+                      else None)
+            blend = getattr(active, "blend", "normal") if active else "normal"
+            self.blend_var.set(document.BLEND_LABELS.get(blend, "Normal"))
+            return
         for mode, mode_label in document.BLEND_MODES:
             if mode_label == label:
                 self._on_blend(mode)
                 return
+
+    def _blend_popdown(self):
+        """The blend combobox's drop-down path, created on first use.
+
+        ``ttk`` builds the pop-down itself, so it is not a tkinter widget; it
+        is addressed by its Tcl path. The pop-down is hidden until the picker
+        is first posted and its rows are rebuilt every time it opens, so the
+        recoloring is driven by a ``<Map>`` binding set up here. This mirrors
+        the model picker in ``generation``.
+        """
+        exists = self._blend_popdown_path is not None and self.blend_menu.tk.call(
+            "winfo", "exists", self._blend_popdown_path
+        )
+        if not exists:
+            try:
+                self._blend_popdown_path = self.blend_menu.tk.call(
+                    "ttk::combobox::PopdownWindow", self.blend_menu
+                )
+            except tk.TclError:
+                self._blend_popdown_path = None
+                return None
+            self.blend_menu.tk.call(
+                "bind", self._blend_popdown_path, "<Map>", "+"
+                + self.blend_menu.register(self._recolor_blend_rows)
+            )
+        return self._blend_popdown_path
+
+    def _blend_listbox(self):
+        """The listbox Tcl path inside the pop-down, or ``None``."""
+        popdown = self._blend_popdown()
+        return self._find_listbox(popdown) if popdown else None
+
+    def _find_listbox(self, path):
+        tkcmd = self.blend_menu.tk
+        children = tkcmd.splitlist(tkcmd.call("winfo", "children", path))
+        for child in children:
+            if tkcmd.call("winfo", "class", child) == "Listbox":
+                return child
+            found = self._find_listbox(child)
+            if found is not None:
+                return found
+        return None
+
+    def _recolor_blend_rows(self, _event=None):
+        """Tint the group header rows so they stand apart from the modes.
+
+        The dashes stay; a distinct foreground and background make the headers
+        read as section labels even though a Tk listbox cannot bold a single
+        row. Mirrors the model picker in ``generation``.
+        """
+        listbox = self._blend_listbox()
+        if listbox is None:
+            return
+        tkcmd = self.blend_menu.tk
+        header = (theme.color("accent"), theme.color("stripe_bg"))
+        row = (theme.color("text"), theme.color("listbox_bg"))
+        count = int(tkcmd.call(listbox, "size"))
+        for index, value in enumerate(self.blend_menu.cget("values")):
+            if index >= count:
+                break
+            fg, bg = header if value in self._blend_headers else row
+            tkcmd.call(
+                listbox, "itemconfigure", index,
+                "-foreground", fg, "-background", bg,
+            )
 
     def _handle_mask_edit(self):
         self._on_mask_edit(self.mask_edit_var.get())

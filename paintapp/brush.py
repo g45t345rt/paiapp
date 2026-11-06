@@ -22,19 +22,27 @@ from PIL import Image, ImageChops, ImageDraw, ImageFilter
 # is handled separately because it needs no channel maths.
 BLEND_MODES = {
     "normal": "Normal",
-    "multiply": "Multiply",
-    "screen": "Screen",
-    "overlay": "Overlay",
-    "lighten": "Lighten",
     "darken": "Darken",
-    "add": "Add",
-    "subtract": "Subtract",
-    "hard_light": "Hard Light",
-    "soft_light": "Soft Light",
-    "color_dodge": "Color Dodge",
+    "multiply": "Multiply",
     "color_burn": "Color Burn",
+    "linear_burn": "Linear Burn",
+    "darker_color": "Darker Color",
+    "lighten": "Lighten",
+    "screen": "Screen",
+    "color_dodge": "Color Dodge",
+    "add": "Add",
+    "lighter_color": "Lighter Color",
+    "overlay": "Overlay",
+    "soft_light": "Soft Light",
+    "hard_light": "Hard Light",
+    "vivid_light": "Vivid Light",
+    "linear_light": "Linear Light",
+    "pin_light": "Pin Light",
+    "hard_mix": "Hard Mix",
     "difference": "Difference",
     "exclusion": "Exclusion",
+    "subtract": "Subtract",
+    "divide": "Divide",
     "hue": "Hue",
     "saturation": "Saturation",
     "color": "Color",
@@ -455,12 +463,44 @@ def _blend_hsl(mode, base, src):
     return _hsl_to_rgb(base_h, base_s, src_l)  # luminosity
 
 
+def _luminance(arr):
+    """Per-pixel Rec.709 luminance of an ``HxWx3`` array in ``0..1``."""
+    return (0.2126 * arr[..., 0] + 0.7152 * arr[..., 1]
+            + 0.0722 * arr[..., 2])
+
+
 def _blend_x(mode, base, src):
     """The numpy blends (values in ``0..1``) not covered by ``_BLEND_OPS``."""
     if mode == "color_dodge":
         return base / np.maximum(1e-6, 1.0 - src)
     if mode == "color_burn":
         return 1.0 - (1.0 - base) / np.maximum(1e-6, src)
+    if mode == "linear_burn":
+        return np.clip(base + src - 1.0, 0.0, 1.0)
+    if mode == "linear_light":
+        return np.clip(base + 2.0 * src - 1.0, 0.0, 1.0)
+    if mode == "vivid_light":
+        burn = 1.0 - (1.0 - base) / np.maximum(1e-6, 2.0 * src)
+        dodge = base / np.maximum(1e-6, 2.0 - 2.0 * src)
+        return np.clip(np.where(src <= 0.5, burn, dodge), 0.0, 1.0)
+    if mode == "pin_light":
+        dark = np.minimum(base, 2.0 * src)
+        light = np.maximum(base, 2.0 * (src - 0.5))
+        return np.clip(np.where(src <= 0.5, dark, light), 0.0, 1.0)
+    if mode == "hard_mix":
+        return np.where(base + src >= 1.0, 1.0, 0.0)
+    if mode == "divide":
+        return np.clip(base / np.maximum(1e-6, src), 0.0, 1.0)
+    if mode in ("darker_color", "lighter_color"):
+        # Whole-pixel decision: take all three channels from whichever pixel is
+        # darker/lighter by luminance (Photoshop's Darker/Lighter Color).
+        base_lum = _luminance(base)
+        src_lum = _luminance(src)
+        if mode == "darker_color":
+            choose_base = base_lum <= src_lum
+        else:
+            choose_base = base_lum >= src_lum
+        return np.where(choose_base[..., None], base, src)
     if mode == "exclusion":
         return base + src - 2.0 * base * src
     return _blend_hsl(mode, base, src)
