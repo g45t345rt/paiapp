@@ -494,6 +494,10 @@ class PaintApp:
         self.root.after(30_000, self._auto_unload_tick)
         self.show_offscreen = True
         self.mask_overlay_color = (255, 0, 0)
+        # Mask editing state (layer mask, inpaint mask) the canvas currently
+        # shows a veil for, so leaving either mode by switching tools can
+        # repaint the view and drop the veil without waiting for a click.
+        self._mask_preview_state = (False, False)
         self._text_style = None
         # Warm the system font registry off the main thread so the first font
         # picker open does not scan every font directory synchronously.
@@ -4865,6 +4869,10 @@ class PaintApp:
             tools.arrow_tool = True
         tools._sync_buttons()
         self.layer_panel.set_mask_edit(enabled)
+        # This method repaints below, so record the state to keep the mode-change
+        # handler from rendering a second time for the same change.
+        self._mask_preview_state = (bool(tools.mask_edit),
+                                    bool(tools.inpaint_mask_edit))
         self._on_mode_change()
         self.render()
 
@@ -4917,6 +4925,10 @@ class PaintApp:
         tools._sync_buttons()
         if hasattr(self, "gen"):
             self.gen.set_inpaint_mask_edit(enabled)
+        # This method repaints below, so record the state to keep the mode-change
+        # handler from rendering a second time for the same change.
+        self._mask_preview_state = (bool(tools.mask_edit),
+                                    bool(tools.inpaint_mask_edit))
         self._on_mode_change()
         self.render()
         if enabled:
@@ -6220,6 +6232,13 @@ class PaintApp:
             # the layer mask's paint value.
             tools.mask_value = self._mask_value_before_inpaint
             self._mask_value_before_inpaint = None
+        # Switching tools clears the mask-edit flags directly, so repaint when
+        # that changes which veil the canvas should show; otherwise the old
+        # overlay lingers until the next click triggers a render.
+        mask_state = (bool(tools.mask_edit), bool(tools.inpaint_mask_edit))
+        if mask_state != self._mask_preview_state:
+            self._mask_preview_state = mask_state
+            self.render()
         self._report_layer()
         self._report_tool()
         if hasattr(self, "brush_library"):
