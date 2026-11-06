@@ -90,7 +90,7 @@ Generation runs through the model family you pick in the Generate panel:
 | Anima | Cosmos-Predict2 DiT with a T5 adapter, aesthetic-tuned |
 | Qwen-Image 2.1 | Qwen3-VL text encoder, GGUF quantized DiT |
 | Flux | FLUX.1 dev |
-| Z-Image | Z-Image Turbo |
+| Z-Image | Z-Image Turbo, including NitroFusion2 1–2 step distillation |
 | Krea 2 | Turbo DiT, includes AnyPaint masked editing |
 | MOSS Image | Instruction-tuned image model with JSON layout prompts |
 | MiniMax H3 | Qwen3-VL-32B text encoder with video VAE |

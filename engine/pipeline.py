@@ -60,7 +60,7 @@ from .latent import (
     QwenImage21Latent,
     Wan21,
 )
-from .lora import apply_lora, usage
+from .lora import apply_lora, is_dedistill, usage
 from .loaded_models import record
 from .h3 import load_dit as load_h3_dit
 from .h3_layout import build_still_packed_sequence as h3_still_layout
@@ -98,6 +98,7 @@ from .sampler import (
     ZImageApplyModel,
     anima_ref_guider,
     calculate_shift,
+    linear_sigmas,
     scheduler_sigmas,
     sample,
 )
@@ -1128,10 +1129,21 @@ def _generate_z(prompt, cfg, image=None, progress=None, cancel=None, mask=None,
         raise RuntimeError("Z-Image load failed.")
 
     dit, text, vae = base["dit"], base["text"], base["vae"]
+    dit_path = cfg.get("dit") or paths.ZIMAGE_DEFAULTS["dit"]
+    nitro = paths.z_image_kind(dit_path) == "nitrofusion"
     width, height = int(cfg["width"]), int(cfg["height"])
     lh, lw = height // 8, width // 8
     latent_format = FluxLatent()
-    ms = ModelSamplingFlow(shift=3.0)
+    ms = ModelSamplingFlow(shift=6.0 if nitro else 3.0)
+
+    # NitroFusion2's de-distillation LoRA is applied on the first step only: it
+    # takes the model back toward Z-Image-Turbo to remove artifacts, then the
+    # second step runs NitroFusion2 alone. Schedule it by step, not uniformly.
+    lora_schedule = []
+    if nitro and int(cfg["steps"]) >= 2:
+        for lora_path, _strength in _cfg_loras(cfg):
+            if is_dedistill(lora_path):
+                lora_schedule.append((lora_path, (1.0, 0.0)))
 
     specs = _cfg_controlnets(cfg, "controlnet")
     control_latent = None
@@ -1190,14 +1202,21 @@ def _generate_z(prompt, cfg, image=None, progress=None, cancel=None, mask=None,
             latent = torch.zeros(1, 16, lh, lw)
         latent_in = latent.to(DEVICE)
 
-        sigmas = scheduler_sigmas(
-ms, int(cfg["steps"]), float(cfg["denoise"]), cfg.get("scheduler", "simple"), cfg
-    ).to(DEVICE)
+        denoise = float(cfg["denoise"])
+        if nitro and denoise > 0.9999:
+            # NitroFusion2 samples on an explicit linear ramp (1 -> 0); a
+            # partial-denoise img2img keeps the scheduler so denoise still bites.
+            sigmas = linear_sigmas(int(cfg["steps"])).to(DEVICE)
+        else:
+            sigmas = scheduler_sigmas(
+                ms, int(cfg["steps"]), denoise, cfg.get("scheduler", "simple"), cfg
+            ).to(DEVICE)
         noise = torch.randn(latent.shape, generator=generator, dtype=torch.float32, device="cpu")
 
         model = ZImageApplyModel(
             dit, DIT_DTYPE, control_latent=control_latent, control_scale=control_scale,
             control_start=control_start, control_end=control_end,
+            lora_schedule=lora_schedule,
         )
         total = max(1, len(sigmas) - 1)
         emit = _make_preview(cfg, preview, latent_format, out_size=(width, height))
@@ -1233,6 +1252,7 @@ ms, int(cfg["steps"]), float(cfg["denoise"]), cfg.get("scheduler", "simple"), cf
                     ).to(DEVICE, DIT_DTYPE),
                     control_scale=control_ctx["strength"],
                     control_start=control_ctx["start"], control_end=control_ctx["end"],
+                    lora_schedule=lora_schedule,
                 )
             samples = _hires_fix(
                 cfg, samples, ms, model2, ctx_pos_plain, ctx_neg,

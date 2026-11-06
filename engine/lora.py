@@ -17,6 +17,8 @@ against the model's module names, which lets underscore-style keys
 each update is kept separately and summed at call time.
 """
 
+import os
+
 import torch
 import torch.nn.functional as F
 
@@ -156,7 +158,9 @@ def _wrap(module, down, up, scale, source, strength):
     entries = getattr(module, "_pai_lora", None)
     if entries is None:
         entries = module._pai_lora = []
-    entries.append((down, up, scale, source, strength))
+    # ``factor`` is a mutable per-step multiplier (see :func:`set_scale`); it
+    # starts at 1.0 and lets a caller schedule a LoRA by sampler step.
+    entries.append([down, up, scale, source, strength, 1.0])
     if getattr(module, "_pai_lora_wrapped", False):
         return
     module._pai_lora_wrapped = True
@@ -165,7 +169,7 @@ def _wrap(module, down, up, scale, source, strength):
 
     def forward(x, *args, **kwargs):
         out = original(x, *args, **kwargs)
-        for down, up, scale, _source, _strength in module._pai_lora:
+        for down, up, scale, _source, _strength, factor in module._pai_lora:
             d = down.to(device=out.device, dtype=out.dtype)
             u = up.to(device=out.device, dtype=out.dtype)
             if is_embedding:
@@ -176,10 +180,36 @@ def _wrap(module, down, up, scale, source, strength):
                 # weight is ``[out, in]``, down ``[rank, in]``, up ``[out, rank]``,
                 # so ``F.linear(F.linear(x, down), up)`` gives ``x @ A^T @ B^T``.
                 update = F.linear(F.linear(x, d), u)
-            out = out + update * scale
+            out = out + update * scale * factor
         return out
 
     module.forward = forward
+
+
+def set_scale(model, source, factor):
+    """Scale every update whose ``source`` matches by ``factor`` at forward time.
+
+    ``factor`` multiplies the LoRA's own strength, so ``0.0`` disables it without
+    unloading; the low-rank factors stay resident. This lets a caller schedule a
+    LoRA by sampler step -- for example NitroFusion2's de-distillation LoRA,
+    which the model card applies on the first step only (see
+    :func:`is_dedistill`).
+    """
+    factor = float(factor)
+    for module in model.modules():
+        for entry in getattr(module, "_pai_lora", None) or ():
+            if entry[3] == source:
+                entry[5] = factor
+
+
+def is_dedistill(path):
+    """Whether a LoRA file is a Z-Image de-distillation LoRA (NitroFusion2).
+
+    The de-distill LoRA takes NitroFusion2 back toward Z-Image-Turbo; the model
+    card applies it at half strength on the first step and turns it off for the
+    rest, so the engine schedules it by step rather than applying it uniformly.
+    """
+    return "dedistill" in os.path.basename(path or "").lower()
 
 
 def remove_lora(model):
@@ -200,7 +230,7 @@ def usage(model):
     """
     found = {}
     for module in model.modules():
-        for down, up, _scale, source, strength in getattr(module, "_pai_lora", None) or ():
+        for down, up, _scale, source, strength, _factor in getattr(module, "_pai_lora", None) or ():
             item = found.get(source)
             if item is None:
                 item = found[source] = {

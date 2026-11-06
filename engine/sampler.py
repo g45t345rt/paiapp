@@ -15,6 +15,7 @@ from PIL import Image, ImageFilter
 
 from .anima_ref import DEFAULT_SLOTS, AnimaRefConditioning, activate, restore
 from . import diffusion_samplers as _extra
+from . import lora as _lora
 
 SHIFT = 3.0
 MULTIPLIER = 1.0
@@ -179,6 +180,16 @@ def scheduler_sigmas(model_sampling, steps, denoise, name="normal", params=None)
 def ksampler_sigmas(model_sampling, steps, denoise):
     """Sigmas for ``steps`` at ``denoise`` (ComfyUI ``KSampler.set_steps``)."""
     return scheduler_sigmas(model_sampling, steps, denoise, "simple")
+
+
+def linear_sigmas(steps):
+    """A linear flow-matching sigma schedule from 1 to 0 (NitroFusion2).
+
+    NitroFusion2 is sampled on an explicit linear schedule rather than a
+    shifted one: two steps give ``[1.0, 0.5, 0.0]`` (the model card's
+    ``sigmas=[1.0, 0.5]``), and any step count generalises the same way.
+    """
+    return torch.linspace(1.0, 0.0, max(1, int(steps)) + 1)
 
 
 class AnimaApplyModel:
@@ -771,10 +782,15 @@ class ZImageApplyModel:
     With ``control_latent`` set, the DiT's ControlNet branch steers every step:
     the control image's VAE latent is the hint and ``control_scale`` its strength
     (0 disables the effect).
+
+    ``lora_schedule`` is a list of ``(source, factors)`` entries that scale a
+    LoRA by step: ``factors`` is indexed by the step number (clamped to its last
+    value) and multiplies the LoRA's own strength. NitroFusion2 uses it for its
+    de-distillation LoRA, which applies on the first step only.
     """
 
     def __init__(self, dit, dtype=torch.bfloat16, control_latent=None, control_scale=1.0,
-                 control_start=0.0, control_end=1.0):
+                 control_start=0.0, control_end=1.0, lora_schedule=None):
         self.dit = dit
         self.dtype = dtype
         self.control_latent = control_latent
@@ -782,14 +798,22 @@ class ZImageApplyModel:
         self._base_scale = control_scale
         self.control_start = control_start
         self.control_end = control_end
+        self.lora_schedule = list(lora_schedule or [])
 
     def set_step(self, index, total):
-        """Scale the control branch to 0 outside its start/end range."""
+        """Scale the control branch to 0 outside its start/end range.
+
+        Also advances any scheduled LoRA to this step's multiplier.
+        """
         frac = index / max(1, total)
         self.control_scale = (
             self._base_scale
             if self.control_start <= frac <= self.control_end else 0.0
         )
+        for source, factors in self.lora_schedule:
+            if not factors:
+                continue
+            _lora.set_scale(self.dit, source, factors[min(index, len(factors) - 1)])
 
     def apply_model(self, x, sigma, context):
         s = reshape_sigma(sigma, x.ndim)

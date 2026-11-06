@@ -464,6 +464,34 @@ def checkpoint_kind(path):
     return "standard"
 
 
+def _is_nitrofusion(path):
+    """Whether a filename reads as NitroFusion2 (``nitrofusion`` or ``nf2``).
+
+    NitroFusion2's files are named ``nitrofusion2_*`` and ``nf2-*`` (the DiT and
+    GGUF tiers) or ``nf2-dedistill-lora.safetensors``. The ``nf2`` token is only
+    matched at the start of the name or after a ``-``/``_`` so an unrelated name
+    like ``conf2`` does not collide.
+    """
+    name = os.path.basename(path or "").lower()
+    return (
+        "nitrofusion" in name
+        or name.startswith("nf2")
+        or "nf2-" in name
+        or "nf2_" in name
+    )
+
+
+def z_image_kind(path):
+    """Classify a Z-Image model file: ``"nitrofusion"`` or ``"z_image"``.
+
+    NitroFusion2 is a 1-2 step adversarial distillation of Z-Image-Turbo; the
+    guess only changes the default steps/CFG and the engine's sampling schedule
+    (a linear sigma ramp at a higher flow shift), and every field stays editable
+    in the generate panel.
+    """
+    return "nitrofusion" if _is_nitrofusion(path) else "z_image"
+
+
 def _stem(path):
     return os.path.splitext(os.path.basename(path))[0]
 
@@ -492,7 +520,7 @@ def classify_model(path, in_checkpoints=False):
         "fl2va" in name or "ref2va" in name or "fl2v" in name or "ref2v" in name
     ):
         return "MiniMax H3", "h3"
-    if "z_image" in name or "zimage" in name or "z-image" in name:
+    if "z_image" in name or "zimage" in name or "z-image" in name or _is_nitrofusion(path):
         return "Z-Image", "z_image"
     # Fibo 2.0's model unit is a diffusers directory (or Hub repo id) whose name
     # carries "fibo" (``Fibo-2.0-dev``), not a transformer file.
@@ -826,6 +854,14 @@ def family_defaults(family, path=None):
             "width": 1024, "height": 1024,
         }
     if family == "z_image":
+        if z_image_kind(path) == "nitrofusion":
+            # NitroFusion2: a 1-2 step adversarial distillation of Z-Image-Turbo,
+            # guidance-free, sampled on a linear flow schedule (see
+            # :func:`engine.sampler.linear_sigmas`) at a higher shift.
+            return {
+                "steps": 2, "cfg": 1.0, "sampler": "euler", "scheduler": "simple",
+                "width": 1024, "height": 1024,
+            }
         # Z-Image-Turbo: 8 steps, guidance-free (CFG 1.0), res_multistep.
         return {
             "steps": 8, "cfg": 1.0, "sampler": "res_multistep", "scheduler": "simple",
