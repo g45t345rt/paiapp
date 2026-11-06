@@ -3218,8 +3218,8 @@ class CanvasView(tk.Canvas):
         accent = theme.color("accent") or "#0078d7"
         mesh = data.get("mesh")
         if data.get("show_mesh") and mesh:
-            for start, end in mesh:
-                self._puppet_polyline([start, end], accent)
+            for polyline in mesh:
+                self._puppet_polyline(polyline, accent)
         handle_radius = data.get("handle_radius", 20.0)
         for pin in data.get("pins", []):
             rx, ry = pin["rest"]

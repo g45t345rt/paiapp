@@ -177,11 +177,26 @@ def content_mesh(alpha, delta, extra_points=()):
 
     vertices = np.asarray(points, dtype=np.float64)
     faces = Delaunay(vertices).simplices.astype(np.int64)
-    kept = []
-    for face in faces:
-        tri = vertices[face]
-        if _triangle_has_content(tri, mask):
-            kept.append(face)
+    # Cheaply reject the many triangles whose bounding box holds no content at
+    # all (using a summed-area table of the mask) before the exact, per-pixel
+    # inside test. On a sparse silhouette this skips a large share of faces.
+    triangles = vertices[faces]
+    low_x = np.clip(np.floor(triangles[:, :, 0].min(axis=1)).astype(np.int64),
+                    0, width - 1)
+    high_x = np.clip(np.ceil(triangles[:, :, 0].max(axis=1)).astype(np.int64),
+                     0, width - 1)
+    low_y = np.clip(np.floor(triangles[:, :, 1].min(axis=1)).astype(np.int64),
+                    0, height - 1)
+    high_y = np.clip(np.ceil(triangles[:, :, 1].max(axis=1)).astype(np.int64),
+                     0, height - 1)
+    integral = np.zeros((height + 1, width + 1), dtype=np.int64)
+    integral[1:, 1:] = np.cumsum(np.cumsum(mask, axis=0), axis=1)
+    box_sum = (integral[high_y + 1, high_x + 1] - integral[low_y, high_x + 1]
+               - integral[high_y + 1, low_x] + integral[low_y, low_x])
+    kept = [
+        faces[index] for index in np.nonzero(box_sum > 0)[0]
+        if _triangle_has_content(vertices[faces[index]], mask)
+    ]
     if not kept:
         return triangular_mesh(width, height, delta)
     faces = np.asarray(kept, dtype=np.int64)
@@ -347,44 +362,71 @@ class TwoStepARAP:
                 opposites.setdefault(key, []).append(int(other))
 
         count_edges = len(self.edges)
+        # The three or four vertices around every edge: its two ends plus the
+        # one or two opposite triangle corners.
         self.gi = np.full((count_edges, 4), -1, dtype=np.int64)
-        self.g_product = np.zeros((count_edges, 2, 8), dtype=np.float64)
-        h = np.zeros((count_edges * 2, 8), dtype=np.float64)
-        self.rest_edges = np.empty((count_edges, 2), dtype=np.float64)
-        a1 = sparse.lil_matrix((count_edges * 2, self.n * 2), dtype=np.float64)
-        a2 = sparse.lil_matrix((count_edges, self.n), dtype=np.float64)
+        self.gi[:, :2] = self.edges
+        for k in range(count_edges):
+            i, j = int(self.edges[k, 0]), int(self.edges[k, 1])
+            opposite = opposites.get((min(i, j), max(i, j)), ())
+            for slot, other in enumerate(opposite[:2]):
+                self.gi[k, 2 + slot] = other
 
-        for k, (i, j) in enumerate(self.edges):
-            i, j = int(i), int(j)
-            opposite = opposites.get((min(i, j), max(i, j)), [])
-            neighbours = [i, j] + opposite[:2]
-            self.gi[k, :len(neighbours)] = neighbours
-            g = np.empty((len(neighbours) * 2, 4), dtype=np.float64)
-            for row, index in enumerate(neighbours):
-                x, y = self.rest[index]
-                g[row * 2] = (x, y, 1.0, 0.0)
-                g[row * 2 + 1] = (y, -x, 0.0, 1.0)
-            product = np.linalg.lstsq(g.T @ g, g.T, rcond=None)[0][:2]
-            width = len(neighbours) * 2
-            self.g_product[k, :, :width] = product
+        # Build the per-edge least-squares frames and the sparse systems for all
+        # edges at once. Filling a lil_matrix element by element here used to
+        # dominate pin placement (tens of thousands of scipy setitem calls);
+        # vectorised construction is roughly an order of magnitude faster.
+        valid = self.gi >= 0
+        coords = self.rest[np.maximum(self.gi, 0)]
+        x = np.where(valid, coords[..., 0], 0.0)
+        y = np.where(valid, coords[..., 1], 0.0)
+        ones = valid.astype(np.float64)
+        g = np.zeros((count_edges, 8, 4), dtype=np.float64)
+        g[:, 0::2, 0] = x
+        g[:, 0::2, 1] = y
+        g[:, 0::2, 2] = ones
+        g[:, 1::2, 0] = y
+        g[:, 1::2, 1] = -x
+        g[:, 1::2, 3] = ones
+        gt = np.swapaxes(g, 1, 2)
+        product = np.linalg.pinv(gt @ g) @ gt
+        self.g_product = product[:, :2, :]
 
-            ex, ey = self.rest[j] - self.rest[i]
-            self.rest_edges[k] = (ex, ey)
-            edge_frame = np.array(((ex, ey), (ey, -ex)))
-            oz = np.zeros((2, 8), dtype=np.float64)
-            oz[0, 0] = oz[1, 1] = -1.0
-            oz[0, 2] = oz[1, 3] = 1.0
-            h[k * 2:k * 2 + 2, :width] = (
-                oz[:, :width] - edge_frame @ product)
-            for column, index in enumerate(neighbours):
-                a1[k * 2, index * 2:index * 2 + 2] = h[k * 2, column * 2:column * 2 + 2]
-                a1[k * 2 + 1, index * 2:index * 2 + 2] = h[k * 2 + 1, column * 2:column * 2 + 2]
-            a2[k, i] = -1.0
-            a2[k, j] = 1.0
+        self.rest_edges = (
+            self.rest[self.edges[:, 1]] - self.rest[self.edges[:, 0]])
+        edge_frame = np.stack(
+            (self.rest_edges, self.rest_edges[:, ::-1] * (1.0, -1.0)), axis=1)
+        oz = np.zeros((1, 2, 8), dtype=np.float64)
+        oz[0, 0, 0] = oz[0, 1, 1] = -1.0
+        oz[0, 0, 2] = oz[0, 1, 3] = 1.0
+        h = oz - edge_frame @ self.g_product
 
-        self.a1 = a1.tocsr()
+        edge_index = np.repeat(
+            np.arange(count_edges)[:, None], 4, axis=1)
+        neighbour = self.gi
+        selected = neighbour >= 0
+        row0 = (2 * edge_index)[selected]
+        col0 = (2 * neighbour)[selected]
+        first = h[:, 0, :].reshape(count_edges, 4, 2)[selected]
+        second = h[:, 1, :].reshape(count_edges, 4, 2)[selected]
+        a1 = sparse.coo_matrix((
+            np.concatenate((first[:, 0], first[:, 1],
+                            second[:, 0], second[:, 1])),
+            (np.concatenate((row0, row0, row0 + 1, row0 + 1)),
+             np.concatenate((col0, col0 + 1, col0, col0 + 1))),
+        ), shape=(count_edges * 2, self.n * 2)).tocsr()
+
+        rows2 = np.repeat(np.arange(count_edges), 2)
+        data2 = np.empty(count_edges * 2, dtype=np.float64)
+        data2[0::2] = -1.0
+        data2[1::2] = 1.0
+        a2 = sparse.coo_matrix(
+            (data2, (rows2, self.edges.reshape(-1))),
+            shape=(count_edges, self.n)).tocsr()
+
+        self.a1 = a1
         self.a1_normal = (self.a1.T @ self.a1).tocsr()
-        self.a2 = a2.tocsr()
+        self.a2 = a2
         self.a2_normal = (self.a2.T @ self.a2).tocsr()
         self._cache_key = None
         self._solver1 = None

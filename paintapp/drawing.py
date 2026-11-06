@@ -476,7 +476,9 @@ class ToolsPanel(tk.Frame):
         # pin rotations auto-correct. Pins live in the live session.
         self.puppet_influence = 200
         self.puppet_expansion = 20
-        self.puppet_show_mesh = True
+        # The full triangulation is noisy over a detailed drawing; show only the
+        # pins unless the user opts into the mesh from the tool settings.
+        self.puppet_show_mesh = False
         self.puppet_correct_rotation = True
         # Select tool mode: "rect" (marquee), "lasso", "wand", or "segment".
         self.select_mode = "rect"
@@ -7978,10 +7980,10 @@ class DrawingController:
         if self._puppet is None:
             view.set_puppet_overlay(None)
             return
-        show_mesh = bool(getattr(self.app.tools, "puppet_show_mesh", True))
+        show_mesh = bool(getattr(self.app.tools, "puppet_show_mesh", False))
         view.set_puppet_overlay({
             "pins": self._puppet.pin_geometry(),
-            "mesh": self._puppet.mesh_geometry() if show_mesh else None,
+            "mesh": self._puppet.mesh_polylines() if show_mesh else None,
             "show_mesh": show_mesh,
             "band": self._puppet_band if self._puppet_moved else None,
             "handle_radius": self.PUPPET_HANDLE / max(view.zoom, 1e-6),

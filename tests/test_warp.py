@@ -526,7 +526,23 @@ def test_puppet_inactive_disconnected_part_stays_fixed():
           abs(green - channel_centroid(layer.image, "G")[0]) < 0.1, True)
 
 
-def test_puppet_reset_and_clear_restore():
+def test_puppet_drag_bends_connected_drawing_locally():
+    # A single connected bar spans the whole width, like one connected figure.
+    layer = Layer("t", (400, 120), (0, 0, 0, 0))
+    layer.image.paste((255, 0, 0, 255), (40, 50, 360, 70))
+    session = warp.PuppetWarp(layer, layer.image.getbbox(), influence=55)
+    near = session.add_pin(70.0, 60.0)
+    session.add_pin(330.0, 60.0)
+    session.set_pin_pos(near, 70.0, 20.0)
+    session.render()
+    red = np.asarray(session.image.getchannel("R")) > 170
+    ys, xs = np.nonzero(red)
+    check("the dragged end follows its pin", int(ys.min()) < 45, True)
+    check("the far end of the same component stays anchored",
+          abs(int(xs.max()) - 359) < 12, True)
+
+
+
     layer = make_layer()
     session = warp.PuppetWarp(layer, layer.image.getbbox())
     session.add_pin(32.0, 32.0)
@@ -714,8 +730,14 @@ def test_puppet_far_drag_is_bounded():
     session = warp.PuppetWarp(layer, layer.image.getbbox())
     session.add_pin(200, 220)
     session.set_pin_pos(0, 1_000_000, 1_000_000)
-    check("off-canvas preview is safely clipped", session.preview().getbbox(), None)
-    check("off-canvas exact render is safely clipped", session.render().getbbox(), None)
+    preview = session.preview()
+    exact = session.render()
+    check("preview stays on the canvas",
+          preview.getbbox() is not None and preview.size == (700, 500), True)
+    check("exact render stays on the canvas",
+          exact.getbbox() is not None and exact.size == (700, 500), True)
+    check("off-canvas drag keeps the anchored drawing",
+          total_alpha(exact) > 0, True)
 
 
 def test_puppet_add_pin_on_deformed_drawing():

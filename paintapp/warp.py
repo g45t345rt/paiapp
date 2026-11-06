@@ -838,25 +838,63 @@ class PuppetWarp:
 
         The mesh is generated from the rendered/selected silhouette, so its
         edges follow the drawing rather than covering the whole bounding box.
-        Returns ``(start, end)`` document-pixel edges.
+        Returns every ``(start, end)`` document-pixel edge; the overlay draws
+        :meth:`mesh_polylines` instead so it needs far fewer canvas items.
         """
         if self._static():
             deformed = self.vertices
-            edges = self.edges
         else:
             deformed = self._ensure_solved(iterations=6)
-            edges = self.edges
         left, top = self.doc_origin
-        # Thousands of Tk line items are far more expensive than the sparse
-        # solve. A representative subset keeps overlay redraws interactive; the
-        # full triangle set is still used by the renderer.
-        stride = max(1, int(math.ceil(len(edges) / 600.0)))
         return [
             (
                 (left + float(deformed[i, 0]), top + float(deformed[i, 1])),
                 (left + float(deformed[j, 0]), top + float(deformed[j, 1])),
             )
-            for i, j in edges[::stride]
+            for i, j in self.edges
+        ]
+
+    def mesh_polylines(self):
+        """The deformed mesh as connected polylines for the overlay.
+
+        Drawing one canvas item per triangle edge needs thousands of items and
+        is far too slow to redraw while dragging, which is why the overlay used
+        to show only every Nth edge (a scattering of disconnected dashes). Here
+        the edges are walked into connected trails instead, so the *whole* mesh
+        renders as a few hundred polylines with no missing edges. Returns
+        document-pixel polylines.
+        """
+        if self._static():
+            deformed = self.vertices
+        else:
+            deformed = self._ensure_solved(iterations=6)
+        left, top = self.doc_origin
+        # Undirected adjacency of every mesh edge; a drawn trail removes edges
+        # as it consumes them so each edge is emitted exactly once.
+        adjacency = {}
+        for i, j in self.edges:
+            i, j = int(i), int(j)
+            adjacency.setdefault(i, set()).add(j)
+            adjacency.setdefault(j, set()).add(i)
+        polylines = []
+        for start in list(adjacency):
+            while adjacency.get(start):
+                path = [start]
+                current = start
+                while True:
+                    neighbours = adjacency[current]
+                    if not neighbours:
+                        break
+                    nxt = neighbours.pop()
+                    adjacency[nxt].discard(current)
+                    path.append(nxt)
+                    current = nxt
+                if len(path) > 1:
+                    polylines.append(path)
+        return [
+            [(left + float(deformed[v, 0]), top + float(deformed[v, 1]))
+             for v in path]
+            for path in polylines
         ]
 
     def _pin_frame(self, pin, scale=1.0):
@@ -878,9 +916,15 @@ class PuppetWarp:
         pin_components = np.zeros(len(self.pins), dtype=np.int64)
         rotation_radius = max(
             mesh_delta * 1.5, min(self.influence * scale, mesh_delta * 3.0))
+        # Every pin reaches at most ``influence`` document pixels. Anything
+        # farther from *all* pins is anchored to rest, so a drag bends the mesh
+        # around its pin instead of deforming the whole connected sheet.
+        reach = max(mesh_delta * 1.5, self.influence * scale)
 
+        pin_frames = []
         for pin_index, pin in enumerate(self.pins):
             rest, pos, rotation = self._pin_frame(pin, scale)
+            pin_frames.append((rest, pos, rotation))
             offset = vertices - rest
             distance = np.hypot(offset[:, 0], offset[:, 1])
             nearest = int(np.argmin(distance))
@@ -898,6 +942,14 @@ class PuppetWarp:
             claim_distance[better] = distance[better]
             claimed[better] = True
 
+        nearest_reach = np.full(count, np.inf)
+        for rest, _pos, _rotation in pin_frames:
+            distance = np.hypot(vertices[:, 0] - rest[0], vertices[:, 1] - rest[1])
+            nearest_reach = np.minimum(nearest_reach, distance)
+        unreached = nearest_reach > reach
+        target[unreached] = vertices[unreached]
+        claimed[unreached] = True
+
         for component in range(int(components.max()) + 1):
             members = components == component
             pin_indices = np.nonzero(pin_components == component)[0]
@@ -905,10 +957,15 @@ class PuppetWarp:
                 target[members] = vertices[members]
                 claimed[members] = True
             elif len(pin_indices) == 1:
-                rest, pos, rotation = self._pin_frame(
-                    self.pins[pin_indices[0]], scale)
-                target[members] = (vertices[members] - rest) @ rotation.T + pos
-                claimed[members] = True
+                # Only a connected part small enough to sit entirely inside one
+                # pin's reach still moves rigidly; a large figure (all one
+                # component) is deformed locally around the pin instead.
+                rest, pos, rotation = pin_frames[pin_indices[0]]
+                member_distance = np.hypot(
+                    vertices[members, 0] - rest[0], vertices[members, 1] - rest[1])
+                if bool((member_distance <= reach).all()):
+                    target[members] = (vertices[members] - rest) @ rotation.T + pos
+                    claimed[members] = True
         # A rotation neighbourhood must never displace another pin's anchor.
         for nearest, pos in anchors:
             target[nearest] = pos
