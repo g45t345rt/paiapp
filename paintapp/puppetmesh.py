@@ -19,6 +19,8 @@ The solver follows Sorkine & Alexa, "As-Rigid-As-Possible Surface Modeling"
 (2007) with uniform edge weights.
 """
 
+import math
+
 import numpy as np
 from scipy import sparse
 from scipy.spatial import Delaunay
@@ -138,14 +140,42 @@ def _triangle_has_content(tri, mask):
     return bool((inside & mask[y0:y1 + 1, x0:x1 + 1]).any())
 
 
-def content_mesh(alpha, delta, extra_points=()):
-    """Delaunay mesh over a silhouette, with optional exact pin positions.
+def triangular_lattice(width, height, delta):
+    """A staggered lattice of near-equilateral triangles over a rectangle.
 
-    A regular interior sampling supplies well-conditioned deformation cells;
-    opaque pixel-edge samples pull the outer mesh onto thin limbs, hair and
-    clothing. Empty triangles are removed, while every triangle touching ink is
-    retained. ``extra_points`` inserts clicked pin locations as real vertices so
-    an arm pin never snaps to a nearby torso or background grid vertex.
+    Rows are ``delta * sqrt(3) / 2`` apart and every other row is offset by half
+    a cell, so the triangles are close to equilateral instead of the right
+    triangles a square grid split along its diagonals produces. Every point lies
+    within the rectangle, and each row reaches the right edge so the mesh covers
+    the whole area.
+    """
+    width = max(1.0, float(width))
+    height = max(1.0, float(height))
+    delta = max(4.0, float(delta))
+    row = delta * math.sqrt(3.0) / 2.0
+    rows = max(1, int(math.ceil(height / row)))
+    points = []
+    for index in range(rows + 1):
+        y = min(index * row, height)
+        offset = (index % 2) * delta / 2.0
+        xs = list(np.arange(offset, width, delta))
+        if not xs or xs[-1] < width - 1e-6:
+            xs.append(width)
+        points.extend(
+            (min(float(x), width), y) for x in xs if x <= width + 1e-6)
+        if y >= height:
+            break
+    return points
+
+
+def content_mesh(alpha, delta, extra_points=()):
+    """Triangular mesh over a silhouette, with optional exact pin positions.
+
+    The mesh starts from a regular :func:`triangular_lattice` and keeps every
+    triangle that touches ink, so the lattice stays uniform and well-shaped
+    rather than degenerating into the thin slivers a contour-sampled Delaunay
+    leaves along the outline. ``extra_points`` inserts clicked pin locations as
+    real vertices so a pin never snaps to a neighbouring lattice vertex.
     """
     alpha = np.asarray(alpha)
     if alpha.ndim != 2:
@@ -155,21 +185,7 @@ def content_mesh(alpha, delta, extra_points=()):
         return triangular_mesh(width, height, delta)
     mask = alpha > 0.01
     delta = max(4.0, float(delta))
-    xs = np.unique(np.concatenate((np.arange(0.0, width, delta), [float(width)])))
-    ys = np.unique(np.concatenate((np.arange(0.0, height, delta), [float(height)])))
-    gx, gy = np.meshgrid(xs, ys)
-    points = list(map(tuple, np.stack((gx.ravel(), gy.ravel()), axis=1)))
-
-    padded = np.pad(mask, 1)
-    vertical = np.nonzero(padded[1:-1, 1:-1] != padded[1:-1, :-2])
-    horizontal = np.nonzero(padded[1:-1, 1:-1] != padded[:-2, 1:-1])
-    vertical_count = len(vertical[0])
-    stride = max(1, int(np.ceil((vertical_count + len(horizontal[0])) / 1200.0)))
-    for y, x in zip(vertical[0][::stride], vertical[1][::stride]):
-        points.extend(((int(x), int(y)), (int(x), int(y + 1))))
-    start = (-vertical_count) % stride
-    for y, x in zip(horizontal[0][start::stride], horizontal[1][start::stride]):
-        points.extend(((int(x), int(y)), (int(x + 1), int(y))))
+    points = triangular_lattice(width, height, delta)
     points.extend((float(x), float(y)) for x, y in extra_points)
     points = list(dict.fromkeys(points))
     if len(points) < 3:
