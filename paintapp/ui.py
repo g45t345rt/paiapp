@@ -941,6 +941,11 @@ class Tooltip:
 
     DELAY = 500
 
+    # A tooltip wraps once it grows past this many pixels, so a long layer or
+    # group name reads on several lines instead of stretching across the
+    # screen or running off its edge.
+    MAX_WIDTH = 360
+
     def __init__(self, widget, text):
         self.widget = widget
         self.text = text
@@ -993,6 +998,7 @@ class Tooltip:
         tk.Label(
             win, text=self.text, bg=theme.color("panel_bg"),
             fg=theme.color("text"), padx=6, pady=2, justify="left",
+            wraplength=self.MAX_WIDTH,
         ).pack(padx=1, pady=1)
         win.update_idletasks()
         x = self.widget.winfo_rootx() + 8

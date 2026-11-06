@@ -2,7 +2,7 @@
 
 import tkinter as tk
 import weakref
-from tkinter import ttk
+from tkinter import font as tkfont, ttk
 
 from PIL import Image, ImageTk
 
@@ -87,6 +87,38 @@ ICON_LOCKED = "\U0001f512"
 ICON_MASK = "\u25d0"
 ICON_CLIPPED = "\u2934"
 ICON_VECTOR = "\u25c7"
+
+# Tail appended to a row name that cannot fit its label, so a long layer,
+# group, filter or text name ends in an ellipsis instead of being clipped or
+# pushing the row's status icons off the right edge.
+ELLIPSIS = "\u2026"
+
+# Horizontal chrome a Tk label spends on border and padding, in pixels, kept
+# out of the width the name is measured against so the last glyph is not clipped.
+LABEL_CHROME = 4
+
+
+def _fit_text(font, text, width):
+    """Trim ``text`` to ``width`` pixels, ending with an ellipsis if needed.
+
+    ``font`` measures the string in the same face the label draws it in. The
+    longest prefix that still leaves room for :data:`ELLIPSIS` is found by
+    binary search so the caller can run this on every resize cheaply.
+    """
+    if width <= 0 or font.measure(text) <= width:
+        return text
+    tail = font.measure(ELLIPSIS)
+    if width <= tail:
+        return ELLIPSIS
+    low, high = 0, len(text)
+    while low < high:
+        mid = (low + high + 1) // 2
+        if font.measure(text[:mid]) + tail <= width:
+            low = mid
+        else:
+            high = mid - 1
+    return text[:low].rstrip() + ELLIPSIS
+
 
 
 def _gray(hex_color, factor=1.0):
@@ -647,6 +679,10 @@ class LayerPanel(tk.Frame):
         widgets.append(label)
         self._rows.append(entry)
         index = len(self._rows) - 1
+        label.bind("<Configure>", lambda e, i=index: self._fit_row_label(e, i))
+        # The name's tooltip stays empty until the label actually has to trim
+        # the name, so hovering only explains a name the row cannot show whole.
+        name_tip = Tooltip(label, "")
         for widget in widgets:
             self._row_index[widget] = index
             widget.bind("<Button-1>", lambda e, i=index: self._on_press(e, i))
@@ -667,8 +703,42 @@ class LayerPanel(tk.Frame):
             "mask_token": mask_token,
             "hidden": bool(hidden), "badges": badge_widgets,
             "badge_strip": badge_strip,
+            "full_text": text, "font": None,
+            "tooltip": name_tip, "truncated": None,
         })
         return index
+
+    def _fit_row_label(self, event, index):
+        """Trim row ``index``'s name to its label width with an ellipsis.
+
+        Bound to the name label's ``<Configure>``, so a long name ends in a
+        trailing ellipsis whenever the row is narrowed, and comes back in full
+        when it widens. The label is packed to fill the row and expand, so the
+        shrinking text never changes the row's layout.
+        """
+        if index >= len(self._row_widgets):
+            return
+        widgets = self._row_widgets[index]
+        full_text = widgets.get("full_text")
+        if not full_text:
+            return
+        label = widgets["label"]
+        font = widgets.get("font")
+        if font is None:
+            try:
+                font = tkfont.Font(root=self, font=label.cget("font"))
+            except tk.TclError:
+                font = tkfont.nametofont("TkDefaultFont")
+            widgets["font"] = font
+        text = _fit_text(font, full_text, event.width - LABEL_CHROME)
+        if label.cget("text") != text:
+            label.config(text=text)
+        # Only a trimmed name needs the tooltip, and it is retargeted only when
+        # the trimmed/whole state flips so a resize does not churn the popup.
+        truncated = text != full_text
+        if widgets.get("truncated") != truncated:
+            widgets["truncated"] = truncated
+            widgets["tooltip"].set_text(full_text if truncated else "")
 
     def _paint_badge(self, icon, icon_name, glyph, bg, color):
         """Draw one status badge: its Tabler icon, or ``glyph`` as a fallback.
