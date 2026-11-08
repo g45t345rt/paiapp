@@ -41,6 +41,9 @@ from .constants import (
     PANEL_FLOAT_MIN_H,
     PANEL_FLOAT_PAD,
     SIDEBAR_GRIP,
+    TOOL_RAIL_W,
+    TOOL_RAIL_MIN_W,
+    TOOL_RAIL_MAX_W,
 )
 
 from .scrollbar import ArrowScrollbar
@@ -1788,3 +1791,192 @@ class Sidebar(tk.Frame):
         new_w = max(SIDEBAR_MIN_W, min(new_w, max_w))
         self.rail.configure(width=new_w)
         self._viewport.configure(width=new_w)
+
+
+class ToolsRail(tk.Frame):
+    """A dedicated, resizable rail that hosts only the tool selector.
+
+    Kept separate from the panel sidebars so the tool palette owns its width
+    independently: dragging its splitter steps it through three layouts, from a
+    single icon column, to two icon columns, to one column of icon+label
+    buttons. ``content`` is the frame the
+    :class:`~paintapp.drawing.ToolsPanel` is built into, and ``on_resize`` is
+    called with the content's new width so the panel can re-lay its buttons out.
+
+    A one-column labelled palette is taller than the rail, so the content sits
+    in a placed inner frame scrolled by a vertical bar (the same blit-free model
+    the panel sidebars use). Unlike :class:`Sidebar` this rail holds no panels
+    and has no header, drag or floating behaviour; it is a plain, resizable
+    column pinned to the left of the canvas.
+    """
+
+    def __init__(self, parent, width=TOOL_RAIL_W):
+        super().__init__(parent)
+        self._body = parent
+        self._dragging = False
+        self._content_w = -1
+        self._offset = 0
+        self._content_h = 0
+        # Called with the content width after every resize; the app points it at
+        # the ToolsPanel so its buttons can step through the rail's layouts.
+        self.on_resize = None
+        # Called with the rail width once a splitter drag ends, so the app can
+        # persist it across reloads without writing on every motion event.
+        self.on_width_commit = None
+
+        rail = tk.Frame(self, width=width)
+        rail.pack_propagate(False)
+        theme.register(rail, bg="bg")
+        self.rail = rail
+
+        splitter = tk.Frame(
+            self, width=SIDEBAR_SPLITTER_W, cursor="sb_h_double_arrow",
+        )
+        theme.register(splitter, bg="splitter")
+        splitter.pack_propagate(False)
+        grip = tk.Frame(splitter, width=1)
+        theme.register(grip, bg="splitter_line")
+        grip.pack(fill=tk.Y, expand=True)
+        self._splitter = splitter
+        self._grip = grip
+
+        # The rail sits on the left, so its canvas-facing edge (the splitter) is
+        # on the right and its scrollbar goes on the outer (left) edge.
+        rail.pack(side=tk.LEFT, fill=tk.Y)
+        splitter.pack(side=tk.LEFT, fill=tk.Y)
+
+        for widget in (splitter, grip):
+            widget.bind("<Enter>", lambda _e: self._highlight_splitter(True))
+            widget.bind("<Leave>", lambda _e: self._highlight_splitter(False))
+            widget.bind("<Button-1>", self._start_resize)
+            widget.bind("<B1-Motion>", self._on_resize)
+            widget.bind("<ButtonRelease-1>", self._end_resize)
+
+        scrollbar = ArrowScrollbar(
+            rail, command=self._on_scrollbar, width=SIDEBAR_SCROLLBAR_W,
+        )
+        scrollbar.pack(side=tk.LEFT, fill=tk.Y)
+        self._scrollbar = scrollbar
+
+        viewport = tk.Frame(rail)
+        theme.register(viewport, bg="bg")
+        viewport.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        self._viewport = viewport
+
+        # A placed inner frame (rather than canvas scrolling) keeps fast wheel
+        # moves clean on Windows; see :class:`Sidebar` for why.
+        self.inner = tk.Frame(viewport)
+        theme.register(self.inner, bg="bg")
+        self.inner.place(x=0, y=0, width=max(1, width - SIDEBAR_SCROLLBAR_W))
+        self.inner.bind("<Configure>", lambda _e: self._update_scroll())
+        viewport.bind("<Configure>", self._on_viewport_configure)
+
+        self.content = tk.Frame(self.inner)
+        theme.register(self.content, bg="bg")
+        self.content.pack(fill=tk.X)
+        self.content.bind("<Configure>", self._on_content_configure)
+
+        self.winfo_toplevel().bind_all("<MouseWheel>", self._on_wheel, add="+")
+        self.after_idle(self._update_scroll)
+
+    # ------------------------------------------------------------------- mount
+    def mount(self, **grid_opts):
+        self.grid(**grid_opts)
+
+    def _on_content_configure(self, event):
+        if event.width == self._content_w:
+            return
+        self._content_w = event.width
+        if self.on_resize is not None:
+            self.on_resize(event.width)
+
+    # ---------------------------------------------------------------- resizing
+    def _start_resize(self, _event):
+        self._dragging = True
+        self._highlight_splitter(True)
+
+    def _end_resize(self, _event):
+        self._dragging = False
+        self._highlight_splitter(True)
+        if self.on_width_commit is not None:
+            self.on_width_commit(int(self.rail.cget("width")))
+
+    def _highlight_splitter(self, active):
+        if active or not self._dragging:
+            self._splitter.configure(
+                bg=theme.color("splitter_hover" if active else "splitter")
+            )
+            self._grip.configure(
+                bg=theme.color("splitter_hover_line" if active else "splitter_line")
+            )
+
+    def _on_resize(self, event):
+        new_w = event.x_root - self.winfo_rootx()
+        # Cap at the tool rail's own maximum and at half the body, so the canvas
+        # keeps usable room.
+        max_w = max(TOOL_RAIL_MIN_W,
+                    min(TOOL_RAIL_MAX_W, self._body.winfo_width() // 2))
+        new_w = max(TOOL_RAIL_MIN_W, min(new_w, max_w))
+        self.rail.configure(width=new_w)
+
+    # --------------------------------------------------------------- scrolling
+    def _on_wheel(self, event):
+        """Scroll the rail when the wheel is over it (other rails ignore it)."""
+        try:
+            widget = self.winfo_containing(event.x_root, event.y_root)
+        except KeyError:
+            return
+        while widget is not None:
+            if widget in (self.rail, self.inner, self._viewport):
+                self._scroll_by(int(-event.delta / 120) * SCROLL_UNIT)
+                return
+            widget = getattr(widget, "master", None)
+
+    def _max_offset(self):
+        return max(0, self.inner.winfo_reqheight() - self._viewport.winfo_height())
+
+    def _update_scroll(self):
+        self._content_h = self.inner.winfo_reqheight()
+        max_offset = self._max_offset()
+        if self._offset > max_offset:
+            self._offset = max_offset
+            self.inner.place_configure(y=-self._offset)
+        total = float(self._content_h) or 1.0
+        view = self._viewport.winfo_height()
+        self._scrollbar.set(
+            self._offset / total,
+            min(1.0, (self._offset + view) / total),
+        )
+
+    def _scroll_by(self, delta):
+        offset = max(0, min(self._offset + delta, self._max_offset()))
+        self._offset = offset
+        self.inner.place_configure(y=-offset)
+        self._content_h = self.inner.winfo_reqheight()
+        total = float(self._content_h) or 1.0
+        view = self._viewport.winfo_height()
+        self._scrollbar.set(
+            self._offset / total,
+            min(1.0, (self._offset + view) / total),
+        )
+
+    def _on_scrollbar(self, *args):
+        if not args:
+            return
+        action = args[0]
+        if action == "moveto":
+            self._scroll_by(
+                int(float(args[1]) * self.inner.winfo_reqheight()) - self._offset
+            )
+        elif action == "scroll":
+            number = int(args[1])
+            what = args[2] if len(args) > 2 else "units"
+            step = (
+                self._viewport.winfo_height() if what == "pages"
+                else SCROLL_UNIT
+            )
+            self._scroll_by(number * step)
+
+    def _on_viewport_configure(self, event):
+        self.inner.place_configure(width=max(1, event.width))
+        self._update_scroll()

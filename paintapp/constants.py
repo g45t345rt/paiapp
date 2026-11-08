@@ -71,6 +71,18 @@ SIDEBAR_HEADER_BG = "#dcdcdc"
 SIDEBAR_HEADER_FG = "#333333"
 SIDEBAR_HEADER_ACTIVE_BG = "#c8dcf0"
 SIDEBAR_HEADER_H = 24
+
+# The dedicated tool rail that sits outside the panel sidebars. It grows through
+# three layouts as it widens: one icon column, two icon columns, then one column
+# of icon+label buttons. ``TOOL_RAIL_W`` is its default width, ``TOOL_RAIL_MIN_W``
+# the narrowest a splitter drag may make it, ``TOOL_ICON2_MIN_W`` where a second
+# icon column fits, and ``TOOL_FULL_MIN_W`` where a button is wide enough to show
+# its label beside the icon.
+TOOL_RAIL_W = 96
+TOOL_RAIL_MIN_W = 44
+TOOL_RAIL_MAX_W = 180
+TOOL_ICON2_MIN_W = 68
+TOOL_FULL_MIN_W = 150
 PANEL_FLOAT_MIN_W = 180
 PANEL_FLOAT_MIN_H = 120
 # Gap between a floating container's border and its header/content. The gutter
@@ -92,7 +104,6 @@ SIDEBAR_GHOST_BLEND = "#eeeeee"
 PANELS = [
     ("color", "Color"),
     ("brushes", "Brushes"),
-    ("tools", "Tools"),
     ("tool_settings", "Tool Settings"),
     ("layout", "Layout Control"),
     ("layers", "Layers"),
@@ -112,9 +123,11 @@ PANELS = [
 # Sidebar sides a panel can be docked to.
 PANEL_SIDES = ("left", "right")
 
-# Where each panel starts. Anything not listed starts on the right rail.
+# Where each panel starts. Anything not listed starts on the right rail. The
+# tool selector is not listed: it lives in its own dedicated rail (see
+# :data:`TOOL_RAIL_W`), not in a panel sidebar.
 DEFAULT_PANEL_SIDES = {
-    "color": "left", "tools": "left", "brushes": "left", "tool_settings": "left",
+    "color": "left", "brushes": "left", "tool_settings": "left",
 }
 
 # Panels that start collapsed (header only); the rest start expanded.

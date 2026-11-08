@@ -14,6 +14,7 @@ from . import (
 )
 from .constants import (
     ALT_STATE_MASK, BRUSH_SLIDER_MAX, MAX_BRUSH_SIZE, PATH_OUTLINE_MAX, rgba,
+    TOOL_FULL_MIN_W, TOOL_ICON2_MIN_W,
 )
 from .gizmo import SelectionGizmo, TransformGizmo
 from .layout_to_image import (
@@ -596,20 +597,22 @@ class ToolsPanel(tk.Frame):
             value=min(self.brush_size, BRUSH_SLIDER_MAX))
         self.size_var.trace_add("write", self._on_size_var_changed)
 
-        grid = tk.Frame(self)
-        grid.pack(fill=tk.X)
-        for column in range(self.TOOL_COLUMNS):
-            grid.columnconfigure(column, weight=1, uniform="tool")
+        # The tool grid is re-laid-out on every rail resize: a narrow rail shows
+        # icons alone, a wide one shows each tool's label beside its icon (see
+        # :meth:`set_width`). ``_columns`` and ``_compact`` hold the current
+        # layout so a resize only rebuilds when the arrangement actually changes.
+        self._grid = tk.Frame(self)
+        self._grid.pack(fill=tk.X)
+        self._compact = False
+        self._columns = self.TOOL_COLUMNS
         self._tool_buttons = {}
         self._tool_labels = {}
-        for index, (key, label) in enumerate(self.TOOL_BUTTONS):
+        for key, label in self.TOOL_BUTTONS:
             command = (
                 self.mask_edit_clicked if key == "mask"
                 else (lambda k=key: self.select(k))
             )
-            button = tk.Button(grid, command=command)
-            row, column = divmod(index, self.TOOL_COLUMNS)
-            button.grid(row=row, column=column, sticky="ew", padx=1, pady=1)
+            button = tk.Button(self._grid, command=command)
             Tooltip(button, label)
             self._tool_buttons[key] = button
             self._tool_labels[key] = label
@@ -620,7 +623,51 @@ class ToolsPanel(tk.Frame):
             self.settings = tk.LabelFrame(self, text="Tool settings")
             self.settings.pack(fill=tk.X, pady=(6, 8))
 
+        # Lays out the buttons and syncs their icons; ``self.settings`` must
+        # exist first because the sync rebuilds the settings panel.
+        self._relayout_tools()
+
+    # ------------------------------------------------------------- tool layout
+    def _relayout_tools(self):
+        """Arrange the tool buttons for the current compact/full state.
+
+        Drops every column's weight, re-applies it to the active column count,
+        then re-grids each button. The final :meth:`_sync_buttons` re-styles the
+        icons for the (possibly changed) compact state.
+        """
+        grid = self._grid
+        for column in range(grid.grid_size()[0]):
+            grid.columnconfigure(column, weight=0, uniform="")
+        for column in range(self._columns):
+            grid.columnconfigure(column, weight=1, uniform="tool")
+        for index, (key, _label) in enumerate(self.TOOL_BUTTONS):
+            row, column = divmod(index, self._columns)
+            self._tool_buttons[key].grid(
+                row=row, column=column, sticky="ew", padx=1, pady=1)
         self._sync_buttons()
+
+    def set_width(self, width):
+        """Adapt the button layout to the tool rail's available ``width``.
+
+        The palette steps through three layouts as the rail widens: a single
+        column of icon-only buttons, two columns of icon-only buttons once
+        :data:`TOOL_ICON2_MIN_W` is reached, and finally a single column of
+        icon+label buttons once there is room for a label at
+        :data:`TOOL_FULL_MIN_W`. In the two icon-only states each button keeps
+        its label as a tooltip.
+        """
+        width = max(1, int(width))
+        if width >= TOOL_FULL_MIN_W:
+            compact, columns = False, 1
+        elif width >= TOOL_ICON2_MIN_W:
+            compact, columns = True, 2
+        else:
+            compact, columns = True, 1
+        if compact == self._compact and columns == self._columns:
+            return
+        self._compact = compact
+        self._columns = columns
+        self._relayout_tools()
 
     # ------------------------------------------------------------------ tools
     def _active_tool(self):
@@ -795,6 +842,10 @@ class ToolsPanel(tk.Frame):
         Tk puts no gap between them. A button showing an image reads ``width``
         in pixels rather than text units, so it is cleared to let the button
         size itself.
+
+        In the rail's compact (narrow) state the label is dropped and the icon
+        is centered, so the button fits an icon-only column; the label stays
+        reachable as the button's tooltip.
         """
         name = self.TOOL_ICONS.get(key)
         label = self._tool_labels.get(key, key)
@@ -803,11 +854,17 @@ class ToolsPanel(tk.Frame):
             color = theme.color("accent" if active else "text")
             image = icons.photo(name, self.TOOL_ICON, color,
                                 padding=self.TOOL_PAD)
-        if image is not None:
-            button.config(image=image, text=f" {label}", compound="left",
-                          anchor="w", width=0, height=0)
+        if image is None:
+            # No rasterised icon: always fall back to the text label, even in the
+            # compact state, so the button never goes blank.
+            button.config(image="", text=label, anchor="w", width=0, height=0,
+                          padx=0, pady=0)
+        elif self._compact:
+            button.config(image=image, text="", compound="center",
+                          anchor="center", width=0, height=0, padx=2, pady=2)
         else:
-            button.config(image="", text=label, anchor="w", width=0, height=0)
+            button.config(image=image, text=f" {label}", compound="left",
+                          anchor="w", width=0, height=0, padx=0, pady=0)
 
     # --------------------------------------------------------------- settings
     def _render_settings(self, active):

@@ -36,6 +36,7 @@ from .colorpicker import ColorPicker
 from .constants import (    APP_NAME, APP_VERSION, DONATE_URL, CONTRIBUTE_URL, DISCORD_URL, CANVAS_W,
     CANVAS_H, MAX_CANVAS_SIZE, SIDEBAR_MIN_W, PANELS, PANEL_SIDES,
     DEFAULT_PANEL_SIDES, DEFAULT_COLLAPSED_PANELS, DEFAULT_PANEL_GROUPS, rgba,
+    TOOL_RAIL_W, TOOL_RAIL_MIN_W, TOOL_RAIL_MAX_W,
 )
 from .document import Canvas
 from .drawing import DrawingController, ToolsPanel
@@ -66,7 +67,7 @@ from .removal import BackgroundPanel
 from .regions_panel import MASK_PAINTED, RegionsPanel, decode_mask
 from .selection import Selection
 from .shortcuts import ShortcutManager
-from .sidebar import Sidebar
+from .sidebar import Sidebar, ToolsRail
 from .ui import PopupMenu, StatusBar, build_menubar
 from .upscale_panel import UpscalePanel
 
@@ -654,10 +655,11 @@ class PaintApp:
     def _build_body(self):
         body = tk.Frame(self.root)
         body.pack(fill=tk.BOTH, expand=True)
-        # Three columns: the left rail, the canvas (which absorbs the slack),
-        # and the right rail. A sidebar with no docked panels removes itself
-        # from the grid, so the canvas simply takes the freed space.
-        body.columnconfigure(1, weight=1)
+        # Four columns: the dedicated tool rail, the left panel rail, the canvas
+        # (which absorbs the slack), and the right panel rail. A sidebar with no
+        # docked panels removes itself from the grid, so the canvas simply takes
+        # the freed space.
+        body.columnconfigure(2, weight=1)
         body.rowconfigure(0, weight=1)
 
         self.area = CanvasArea(
@@ -673,6 +675,9 @@ class PaintApp:
             on_context=self._canvas_tab_menu,
         )
 
+        # The tool selector gets its own resizable rail, separate from the panel
+        # sidebars, so it can be narrowed to an icon-only strip on its own.
+        self.tools_rail = ToolsRail(body, width=self.tool_rail_width)
         self.left_sidebar = Sidebar(body, self.root, side="left")
         self.right_sidebar = Sidebar(body, self.root, side="right")
         self.left_sidebar.other = self.right_sidebar
@@ -686,12 +691,13 @@ class PaintApp:
         self._panel_hosts = {}
         self._panel_sides = self._load_panel_sides()
 
-        # Mount the sidebars before the canvas: each claims its width first,
+        # Mount the rails before the canvas: each claims its width first,
         # then the area takes only the space that is left and shrinks as a
-        # sidebar grows.
-        self.left_sidebar.mount(row=0, column=0, sticky="ns", pady=8)
-        self.area.grid(row=0, column=1, sticky="nsew", padx=(8, 0), pady=8)
-        self.right_sidebar.mount(row=0, column=2, sticky="ns", pady=8)
+        # rail grows.
+        self.tools_rail.mount(row=0, column=0, sticky="ns", pady=8)
+        self.left_sidebar.mount(row=0, column=1, sticky="ns", pady=8)
+        self.area.grid(row=0, column=2, sticky="nsew", padx=(8, 0), pady=8)
+        self.right_sidebar.mount(row=0, column=3, sticky="ns", pady=8)
         self.area.rebuild(self.canvases)
 
         self._build_panels()
@@ -759,6 +765,25 @@ class PaintApp:
         settings["panel_sides"] = dict(self._panel_sides)
         theme.write_settings(settings)
 
+    def _load_tool_rail_width(self):
+        """The saved tool-rail width, clamped to its allowed range."""
+        stored = theme.read_settings().get("tool_rail_width")
+        try:
+            width = int(stored)
+        except (TypeError, ValueError):
+            width = TOOL_RAIL_W
+        return max(TOOL_RAIL_MIN_W, min(width, TOOL_RAIL_MAX_W))
+
+    def _save_tool_rail_width(self, width):
+        """Persist a tool-rail resize so it is restored on the next launch."""
+        try:
+            width = max(TOOL_RAIL_MIN_W, min(int(width), TOOL_RAIL_MAX_W))
+        except (TypeError, ValueError):
+            return
+        settings = theme.read_settings()
+        settings["tool_rail_width"] = width
+        theme.write_settings(settings)
+
     # ------------------------------------------------------------ settings
     def _load_settings(self):
         """Load the persisted interface/canvas preferences into attributes.
@@ -821,6 +846,8 @@ class PaintApp:
             else colormanagement.SRGB
         )
         self._export_defaults = self._load_export_defaults()
+        # Width of the dedicated tool rail, restored so the user's resize sticks.
+        self.tool_rail_width = self._load_tool_rail_width()
         # Push the saved generation-engine tuning into the engine now, so the
         # first preload/generation already honours it (generation re-applies it
         # each run, but a preload or an unload should not need a generation first).
@@ -865,9 +892,11 @@ class PaintApp:
         self.colorpicker = ColorPicker(content, on_change=self._on_color_changed)
         self.colorpicker.pack(fill=tk.X)
 
-        content = self._add_panel("tools", "Tools")
+        # The tool selector is built into the dedicated tool rail, not a panel
+        # sidebar; its options still get their own "Tool Settings" panel. The
+        # rail reports its width so the buttons swap between icon-only and full.
         self.tools = ToolsPanel(
-            content,
+            self.tools_rail.content,
             settings_parent=self._add_panel("tool_settings", "Tool Settings"),
             on_mode_change=self._on_mode_change, on_brush_size=self._on_brush_size,
             on_mask_edit=self.toggle_mask_edit,
@@ -895,6 +924,8 @@ class PaintApp:
             on_layout_capture=self._layout_selection_box,
         )
         self.tools.pack(fill=tk.X)
+        self.tools_rail.on_resize = self.tools.set_width
+        self.tools_rail.on_width_commit = self._save_tool_rail_width
 
         content = self._add_panel("brushes", "Brushes", index=1)
         self.brush_library = BrushLibraryPanel(
