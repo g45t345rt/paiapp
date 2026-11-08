@@ -11,7 +11,7 @@ supersampled canvas would cost too much memory.
 """
 
 import numpy as np
-from PIL import Image, ImageChops
+from PIL import Image, ImageChops, ImageFilter
 
 # Supersampling factor for a canvas that comfortably fits the memory cap.
 SCALE = 3
@@ -54,4 +54,29 @@ def downscale(image, scale):
     out = np.empty((out_size[1], out_size[0], 4), dtype=np.uint8)
     out[..., :3] = rgb.astype(np.uint8)
     out[..., 3] = np.asarray(small_alpha)
+    return Image.fromarray(out, "RGBA")
+
+
+def blur_premultiplied(image, radius):
+    """Soften an RGBA ``image``'s alpha by ``radius`` without a dark halo.
+
+    Feathering is a Gaussian blur of the coverage, but the colour must stay the
+    paint's own. Blurring a sprite whose transparent pixels are black would drag
+    that black into the softened edge and leave a dark ring, so the colour is
+    premultiplied by alpha before the blur and divided back out afterwards - the
+    same trick :func:`downscale` uses.
+    """
+    if radius <= 0:
+        return image
+    rgba = image.convert("RGBA")
+    alpha = rgba.getchannel("A")
+    premultiplied = ImageChops.multiply(rgba.convert("RGB"), alpha.convert("RGB"))
+    blurred_alpha = alpha.filter(ImageFilter.GaussianBlur(radius))
+    blurred_color = premultiplied.filter(ImageFilter.GaussianBlur(radius))
+    a = np.asarray(blurred_alpha, dtype=np.float32) / 255.0
+    rgb = np.asarray(blurred_color, dtype=np.float32)
+    rgb = np.clip(rgb / np.maximum(a, 1e-6)[..., None], 0.0, 255.0)
+    out = np.empty((rgba.height, rgba.width, 4), dtype=np.uint8)
+    out[..., :3] = rgb.astype(np.uint8)
+    out[..., 3] = np.asarray(blurred_alpha)
     return Image.fromarray(out, "RGBA")

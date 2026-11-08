@@ -17,7 +17,7 @@ until it is rasterized.
 
 import math
 
-from PIL import Image, ImageDraw, ImageFilter
+from PIL import Image, ImageDraw
 
 from . import antialias
 from .constants import PATH_OUTLINE_MAX, rgba
@@ -672,11 +672,16 @@ def paste(image, spec, offset=(0, 0)):
     _paint(ImageDraw.Draw(temp), spec, (ox + left, oy + top), scale)
     if scale > 1:
         temp = antialias.downscale(temp, scale)
-    mask = temp.getchannel("A")
     if feather:
-        mask = mask.filter(ImageFilter.GaussianBlur(feather))
+        temp = antialias.blur_premultiplied(temp, feather)
     if opacity < 100:
-        mask = mask.point(lambda value: value * opacity // 100)
-    image.paste(temp, (left, top), mask)
+        temp.putalpha(
+            temp.getchannel("A").point(lambda value: value * opacity // 100)
+        )
+    # ``alpha_composite`` is a true source-over composite. ``Image.paste`` with a
+    # mask linearly blends every channel by the mask, including alpha, so an
+    # anti-aliased edge comes out darkened with its coverage squared - a fringe
+    # over the layers below. ``temp`` is clipped to ``image``, so ``dest`` fits.
+    image.alpha_composite(temp, dest=(left, top))
     return image
 
