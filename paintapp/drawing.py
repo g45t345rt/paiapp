@@ -9583,15 +9583,24 @@ class DrawingController:
             if item.is_locked() and not item.is_link:
                 continue
             self._move_layers.append((item, tuple(item.offset), {
-                # Texts and vector items live in document space, so they are
-                # shifted with the pixels rather than left pinned to the page
-                # (which would clip them as the layer's window slides over them).
-                # A link's content belongs to its master, so it is not shifted.
+                # Texts, vector items, path objects and pose figures live in
+                # document space, so they are shifted with the pixels rather than
+                # left pinned to the page (which would clip them as the layer's
+                # window slides over them).
+                # A link's stroke/fill/path content belongs to its master, so it
+                # is not shifted.
                 "texts": [(spec, spec["x"], spec["y"]) for spec in item.texts],
+                # Pose ``x``/``y`` are derived from the shared scene anchor, so
+                # the scene - not the specs - is what a move shifts.
+                "pose_scene": self._move_pose_scene(item),
                 "vector": [] if item.is_link else [
                     (spec, vector.item_snapshot(spec))
                     for spec in (list(getattr(item, "strokes", []))
                                  + list(getattr(item, "fills", [])))
+                ],
+                "paths": [] if item.is_link else [
+                    (spec, pathspec.clone(spec))
+                    for spec in list(getattr(item, "paths", []))
                 ],
             }))
         self._move_origin = (x, y)
@@ -9608,19 +9617,44 @@ class DrawingController:
         dy = y - oy
         for layer, (start_x, start_y), extra in self._move_layers:
             layer.offset = (start_x + dx, start_y + dy)
-            # Document-space content (text objects, vector lines and fills) is
-            # shifted with the pixels so it travels with the layer.
+            # Document-space content (text objects, pose figures, vector lines
+            # and fills, and path objects) is shifted with the pixels so it
+            # travels with the layer.
             for spec, spec_x, spec_y in extra["texts"]:
                 spec["x"] = spec_x + dx
                 spec["y"] = spec_y + dy
             if extra["texts"]:
                 layer.invalidate_texts()
+            if extra["pose_scene"] is not None:
+                scene, scene_x, scene_y = extra["pose_scene"]
+                scene["x"] = scene_x + dx
+                scene["y"] = scene_y + dy
+                layer.invalidate_poses()
             for spec, snapshot in extra["vector"]:
                 vector.item_restore(spec, snapshot)
                 vector.item_translate(spec, dx, dy)
             if extra["vector"]:
                 layer.invalidate_vectors()
+            for spec, snapshot in extra["paths"]:
+                pathspec.apply_geometry(spec, pathspec.to_path(snapshot))
+                pathspec.translate(spec, dx, dy)
+            if extra["paths"]:
+                layer.invalidate_paths()
         self.app.render()
+
+    def _move_pose_scene(self, layer):
+        """Snapshot a layer's poses scene anchor for a move, or ``None``.
+
+        A pose figure's ``x``/``y`` are recomputed from the shared scene anchor
+        before every render, so a move shifts the scene - not the specs. A link's
+        figures belong to its master, so its own scene is left alone.
+        """
+        if layer.is_link:
+            return None
+        scene = getattr(layer, "pose_scene", None)
+        if not isinstance(scene, dict):
+            return None
+        return (scene, float(scene.get("x", 0.0)), float(scene.get("y", 0.0)))
 
     def _end_move(self):
         self._move_layers = []
