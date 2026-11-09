@@ -4,7 +4,7 @@
 # environment (such as a ComfyUI venv) is required or used.
 #
 # POSIX counterpart of run.bat for Linux and macOS (also works under Git Bash
-# or WSL on Windows). Run with:  sh run.sh [--core-only] [--reinstall] [--] [app args]
+# or WSL on Windows). Run with:  sh run.sh [--core-only] [--reinstall] [--setup-only] [--rocm] [--] [app args]
 #
 # When no supported Python (3.12-3.14) is on PATH the launcher offers to
 # download and install one (Homebrew/apt/dnf/zypper/pacman, then the official
