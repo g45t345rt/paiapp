@@ -9582,6 +9582,7 @@ class DrawingController:
         for item in (doc.layers[index] for index in indices):
             if item.is_locked() and not item.is_link:
                 continue
+            item._content_delta = (0, 0)
             self._move_layers.append((item, tuple(item.offset), {
                 # Texts, vector items, path objects and pose figures live in
                 # document space, so they are shifted with the pixels rather than
@@ -9603,6 +9604,10 @@ class DrawingController:
                     for spec in list(getattr(item, "paths", []))
                 ],
             }))
+        # Freeze the view's content bounds for the drag so its scroll region does
+        # not track the moved layer (see ``PaintApp._content_bounds``).
+        if self._move_layers:
+            self.app._move_bounds = self.app._content_bounds()
         self._move_origin = (x, y)
         self._move_pushed = False
 
@@ -9615,31 +9620,18 @@ class DrawingController:
         ox, oy = self._move_origin
         dx = x - ox
         dy = y - oy
-        for layer, (start_x, start_y), extra in self._move_layers:
+        for layer, (start_x, start_y), _extra in self._move_layers:
             layer.offset = (start_x + dx, start_y + dy)
             # Document-space content (text objects, pose figures, vector lines
-            # and fills, and path objects) is shifted with the pixels so it
-            # travels with the layer.
-            for spec, spec_x, spec_y in extra["texts"]:
-                spec["x"] = spec_x + dx
-                spec["y"] = spec_y + dy
-            if extra["texts"]:
-                layer.invalidate_texts()
-            if extra["pose_scene"] is not None:
-                scene, scene_x, scene_y = extra["pose_scene"]
-                scene["x"] = scene_x + dx
-                scene["y"] = scene_y + dy
-                layer.invalidate_poses()
-            for spec, snapshot in extra["vector"]:
-                vector.item_restore(spec, snapshot)
-                vector.item_translate(spec, dx, dy)
-            if extra["vector"]:
-                layer.invalidate_vectors()
-            for spec, snapshot in extra["paths"]:
-                pathspec.apply_geometry(spec, pathspec.to_path(snapshot))
-                pathspec.translate(spec, dx, dy)
-            if extra["paths"]:
-                layer.invalidate_paths()
+            # and fills, and path objects) is drawn at ``spec - offset``, so it
+            # would stay pinned to the page as the offset slides. Translating
+            # every spec here would instead re-rasterise every overlay on each
+            # motion event (the path/pose move lag). Instead, record the drag
+            # delta: the layer's own image is drawn at ``spec - content_offset``
+            # with ``content_offset`` held at the drag's start, so it does not
+            # change at all during the drag - only the placement slides over the
+            # backdrop - and the specs are translated once on release.
+            layer._content_delta = (dx, dy)
         self.app.render()
 
     def _move_pose_scene(self, layer):
@@ -9657,9 +9649,41 @@ class DrawingController:
         return (scene, float(scene.get("x", 0.0)), float(scene.get("y", 0.0)))
 
     def _end_move(self):
+        # Bake the drag delta into the moved layers' specs once, at release. The
+        # overlays were drawn all drag at the start offset (see ``_move_to``), so
+        # shifting the specs and clearing the delta leaves the layer's own image
+        # unchanged on screen; only the now-stale overlay caches are dropped, so
+        # they are rebuilt once rather than on every motion event.
+        for layer, _start, extra in self._move_layers:
+            dx, dy = layer._content_delta
+            if dx or dy:
+                for spec, spec_x, spec_y in extra["texts"]:
+                    spec["x"] = spec_x + dx
+                    spec["y"] = spec_y + dy
+                if extra["texts"]:
+                    layer.invalidate_texts()
+                if extra["pose_scene"] is not None:
+                    scene, scene_x, scene_y = extra["pose_scene"]
+                    scene["x"] = scene_x + dx
+                    scene["y"] = scene_y + dy
+                    layer.invalidate_poses()
+                for spec, snapshot in extra["vector"]:
+                    vector.item_restore(spec, snapshot)
+                    vector.item_translate(spec, dx, dy)
+                if extra["vector"]:
+                    layer.invalidate_vectors()
+                for spec, snapshot in extra["paths"]:
+                    pathspec.apply_geometry(spec, pathspec.to_path(snapshot))
+                    pathspec.translate(spec, dx, dy)
+                if extra["paths"]:
+                    layer.invalidate_paths()
+            layer._content_delta = (0, 0)
         self._move_layers = []
         self._move_origin = None
         self._move_pushed = False
+        # Let the scroll region follow the new content bounds again now the drag
+        # has ended.
+        self.app._move_bounds = None
 
     # ----------------------------------------------------------------- guides
     # Guides are grabbed with the Move tool, so a brush stroke near one still

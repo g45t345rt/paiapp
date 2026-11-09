@@ -494,6 +494,15 @@ class PaintApp:
         self._last_model_activity = time.monotonic()
         self.root.after(30_000, self._auto_unload_tick)
         self.show_offscreen = True
+        # Frozen content bounds ``((left, top), (w, h))`` while a Move drag is in
+        # progress, else ``None``. With the off-canvas preview on, the content
+        # bounds follow the dragged layer, so the view's scroll region would be
+        # rebuilt - and the camera re-anchored - on every motion event; on a real
+        # window that nudges the view by a pixel each frame, so the untouched
+        # layers appear to jitter. Holding the bounds steady for the drag keeps
+        # the region fixed and the other layers still (see
+        # ``DrawingController._begin_move`` / ``_end_move``).
+        self._move_bounds = None
         self.mask_overlay_color = (255, 0, 0)
         # Mask editing state (layer mask, inpaint mask) the canvas currently
         # shows a veil for, so leaving either mode by switching tools can
@@ -1914,6 +1923,11 @@ class PaintApp:
         """Full content bounds ``(origin, size)`` for the view's scroll region."""
         if self.current is None:
             return (0, 0), (0, 0)
+        if self._move_bounds is not None:
+            # A Move drag holds the scroll region steady so the camera cannot be
+            # re-anchored (and the untouched layers jitter) as the moved layer
+            # changes the content bounds.
+            return self._move_bounds
         if self.show_offscreen:
             left, top, right, bottom = self.current.content_bounds()
             return (left, top), (right - left, bottom - top)

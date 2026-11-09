@@ -377,6 +377,14 @@ class Layer:
         # layer only changes this offset, so content dragged past the canvas
         # edge is retained and reappears when the layer is moved back.
         self.offset = (0, 0)
+        # A transient ``(dx, dy)`` applied by the Move tool *while a drag is in
+        # progress*: the document-space content (texts, vectors, poses, paths)
+        # is drawn at ``spec - content_offset`` rather than ``spec - offset``, so
+        # a drag can slide the layer's placement without translating every spec
+        # (which would re-rasterise every overlay on each motion event). It is
+        # held at the drag's start offset and baked into the specs on release
+        # (see ``DrawingController._move_to`` / ``_end_move``).
+        self._content_delta = (0, 0)
         # Non-destructive filter chain, applied in order at composite time.
         # Each entry is a spec dict (see ``filters``); the base ``image`` is
         # never modified by them.
@@ -637,6 +645,22 @@ class Layer:
             source._path_token,
         )
 
+    def content_offset(self):
+        """``offset`` minus the in-progress move delta, for drawing content.
+
+        Document-space content is rendered at ``spec - content_offset`` so a
+        Move drag can slide the layer's placement (via ``offset``) while the
+        content appears to travel with it, without translating the specs. During
+        a drag ``content_offset`` stays at the drag's start, so the layer's own
+        image (and its overlay caches) is unchanged and only its placement
+        moves; with no drag in progress it is simply :attr:`offset`.
+        """
+        dx, dy = self._content_delta
+        if not dx and not dy:
+            return self.offset
+        ox, oy = self.offset
+        return (ox - dx, oy - dy)
+
     def invalidate_texts(self):
         """Drop the cached text overlay (call after editing ``texts``)."""
         self._text_token += 1
@@ -711,7 +735,7 @@ class Layer:
         source = self.content_source()
         if self.transform is not None:
             return self._transformed_image(source, self.transform, include_mask)
-        return source._composited_image_at(self.offset, include_mask)
+        return source._composited_image_at(self.content_offset(), include_mask)
 
     def _transformed_image(self, source, matrix, include_mask=True):
         """The source's composite resampled through ``matrix`` (cached).
@@ -721,7 +745,7 @@ class Layer:
         top-left is the box's top-left and the layer's ``offset`` places it.
         ``include_mask`` is forwarded to the source's composite.
         """
-        base = source._composited_image_at(source.offset, include_mask)
+        base = source._composited_image_at(source.content_offset(), include_mask)
         left, top, right, bottom = _affine_bounds(matrix, base.size)
         left_i = math.floor(left)
         top_i = math.floor(top)
@@ -807,7 +831,7 @@ class Layer:
         source = self.content_source()
         if self.transform is not None:
             return self._transformed_image(source, self.transform).crop(box)
-        return source._composited_region_at(box, self.offset)
+        return source._composited_region_at(box, self.content_offset())
 
     def _composited_region_at(self, box, offset):
         """``composited_region`` for this layer's own content drawn at ``offset``."""
@@ -829,7 +853,7 @@ class Layer:
 
     def _text_overlay(self, image, offset=None):
         """``image`` with every text object drawn over it (cached)."""
-        offset = self.offset if offset is None else offset
+        offset = self.content_offset() if offset is None else offset
         key = (
             self._image_token, filters.chain_key(self.filters), self._text_token,
             tuple(offset),
@@ -845,7 +869,7 @@ class Layer:
 
     def _vector_overlay(self, image, offset=None):
         """``image`` with every stroke drawn over it (cached)."""
-        offset = self.offset if offset is None else offset
+        offset = self.content_offset() if offset is None else offset
         key = (
             self._image_token, filters.chain_key(self.filters),
             self._text_token, self._vector_token, tuple(offset),
@@ -863,7 +887,7 @@ class Layer:
 
     def _poses_overlay(self, image, offset=None):
         """``image`` with every poses figure drawn over it (cached)."""
-        offset = self.offset if offset is None else offset
+        offset = self.content_offset() if offset is None else offset
         key = (
             self._image_token, filters.chain_key(self.filters),
             self._text_token, self._vector_token, self._poses_token,
@@ -881,7 +905,7 @@ class Layer:
 
     def _path_overlay(self, image, offset=None):
         """``image`` with every path object drawn over it (cached)."""
-        offset = self.offset if offset is None else offset
+        offset = self.content_offset() if offset is None else offset
         key = (
             self._image_token, filters.chain_key(self.filters),
             self._text_token, self._vector_token, self._poses_token,
