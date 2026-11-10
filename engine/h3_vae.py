@@ -649,7 +649,7 @@ def load_vae(path, device="cpu", dtype=torch.bfloat16, model=None, tick=None,
     mapping is shared (the image checkpoint is the same encoder with a 2D
     decoder).
     """
-    from .moss_text import _dequant
+    from .quant_formats import _dequant
     from .safetensors_io import open_safetensors
 
     if model is None:

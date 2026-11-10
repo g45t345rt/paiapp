@@ -26,9 +26,11 @@ The forward is the stock Qwen3-VL text decoder (RMSNorm, GQA self-attention with
 per-head q/k norm, RoPE, SwiGLU MLP). For a text-only prompt all three mRoPE
 grids are the same ``arange`` positions, so the 3-axis interleave collapses to
 ordinary RoPE over the head dim. Weights load from the ComfyUI-layout safetensors
-(optionally int8/convrot, via :func:`engine.moss_text._copy_weight`); the
-tokenizer reuses the Qwen2 BPE data shipped for Anima (:mod:`engine.tokenizer_data`),
-whose vocab matches Qwen3-VL's 151936 entries for ordinary prompt text.
+(optionally int8/convrot or NVFP4/AWQ, via :func:`engine.quant_formats._copy_weight`);
+for NVFP4, the AWQ ``pre_quant_scale`` for o/down projections is applied to the
+activation. The tokenizer reuses the Qwen2 BPE data shipped for Anima
+(:mod:`engine.tokenizer_data`), whose vocab matches Qwen3-VL's 151936 entries for
+ordinary prompt text.
 """
 
 import os
@@ -36,7 +38,7 @@ import os
 import torch
 import torch.nn.functional as F
 
-from .moss_text import _copy_weight
+from .quant_formats import _copy_weight
 from .safetensors_io import open_safetensors
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
@@ -74,6 +76,14 @@ _LAYER_SPEC = (
     ("gate", "mlp.gate_proj.weight", ("intermediate", "hidden")),
     ("up", "mlp.up_proj.weight", ("intermediate", "hidden")),
     ("down", "mlp.down_proj.weight", ("hidden", "intermediate")),
+)
+
+# AWQ checkpoints carry an input-channel smoothing scale for the projections
+# into o_proj and down_proj only (their inputs are the attention/MLP outputs,
+# not a LayerNorm). The int8 ConvRot checkpoint omits them.
+_OPTIONAL_SPEC = (
+    ("o_pre", "self_attn.o_proj.pre_quant_scale", ("q_dim",)),
+    ("down_pre", "mlp.down_proj.pre_quant_scale", ("intermediate",)),
 )
 
 _EMBED_KEY = "model.embed_tokens.weight"
@@ -122,20 +132,35 @@ def _load_layer(handle, names, index, dtype, dims, scratch):
             dst = torch.empty(tuple(dims[part] for part in shape_spec), dtype=dtype)
             scratch[name] = dst
         _copy_weight(handle, names, key, dst, dtype)
+    for name, suffix, shape_spec in _OPTIONAL_SPEC:
+        key = f"model.layers.{index}.{suffix}"
+        if key not in names:
+            scratch[name] = None
+            continue
+        dst = scratch.get(name)
+        if dst is None:
+            dst = torch.empty(tuple(dims[part] for part in shape_spec), dtype=dtype)
+            scratch[name] = dst
+        _copy_weight(handle, names, key, dst, dtype)
     return scratch
 
 
-def _embed_rows(handle, ids, dtype):
+def _embed_rows(handle, ids, dtype, names):
     """Gather the prompt's embedding rows as a fresh, owned tensor.
 
     ``slice[int]`` returns a *zero-copy* view over safetensors' shared buffer, and
     ``.to(dtype)`` on a matching dtype is a no-op -- so the row stayed a view over
     memory whose lifetime is not guaranteed, and gathering it later could fault
     (an access violation, seen only inside the app). Read one contiguous slice
-    and ``clone`` it into memory we own before indexing.
+    and ``clone`` it into memory we own before indexing. NVFP4 checkpoints store
+    the embedding as int8 with a per-row scale, so dequantize that slice too.
     """
     low, high = int(min(ids)), int(max(ids))
     rows = handle.get_slice(_EMBED_KEY)[low:high + 1].clone()
+    scale_key = _EMBED_KEY + "_scale"
+    if rows.dtype == torch.int8 and scale_key in names:
+        scale = handle.get_tensor(scale_key)[low:high + 1].to(torch.float32)
+        rows = rows.to(torch.float32) * scale
     index = torch.as_tensor([int(i) - low for i in ids], dtype=torch.long)
     return rows.index_select(0, index).to(dtype)
 
@@ -163,12 +188,16 @@ def _attention(x, weights, cos, sin, dims):
 
     out = F.scaled_dot_product_attention(q, k, v, is_causal=True, enable_gqa=True)
     out = out.transpose(1, 2).reshape(batch, length, -1)
+    if weights.get("o_pre") is not None:
+        out = out * weights["o_pre"].to(out.dtype)
     return F.linear(out, weights["o_proj"])
 
 
 def _mlp(x, weights):
-    return F.linear(F.silu(F.linear(x, weights["gate"])) * F.linear(x, weights["up"]),
-                    weights["down"])
+    h = F.silu(F.linear(x, weights["gate"])) * F.linear(x, weights["up"])
+    if weights.get("down_pre") is not None:
+        h = h * weights["down_pre"].to(h.dtype)
+    return F.linear(h, weights["down"])
 
 
 class Qwen3VLTextStreamEncoder:
@@ -210,7 +239,7 @@ class Qwen3VLTextStreamEncoder:
         ids = list(ids) or [PAD]
         with open_safetensors(self.path) as handle:
             names = set(handle.keys())
-            x = _embed_rows(handle, ids, self.dtype).unsqueeze(0).to(self.device)
+            x = _embed_rows(handle, ids, self.dtype, names).unsqueeze(0).to(self.device)
             cos, sin = _rope_tables(self._inv_freq, x.shape[1], self.dtype)
             cos = cos.unsqueeze(0).to(self.device)
             sin = sin.unsqueeze(0).to(self.device)

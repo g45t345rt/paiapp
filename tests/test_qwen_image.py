@@ -17,7 +17,7 @@ import torch
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 
-from engine import moss_text  # noqa: E402
+from engine import quant_formats  # noqa: E402
 from engine import qwen_image  # noqa: E402
 
 FAILED = []
@@ -49,7 +49,7 @@ def test_safetensors_int8_convrot():
         names, get, raw, bytes_of, close = qwen_image._model_source(path, torch.float32)
         try:
             got = get("transformer_blocks.0.attn.to_q.weight")
-            want = moss_text._unrotate(weight.to(torch.float32) * scale, 256)
+            want = quant_formats._unrotate(weight.to(torch.float32) * scale, 256)
             check("int8 convrot un-rotates", bool(torch.allclose(got, want, atol=1e-5)), True)
             check("int8 convrot dtype is float", got.dtype, torch.float32)
             check("bf16 passthrough", bool(torch.equal(get("transformer_blocks.0.attn.norm_q.weight"),

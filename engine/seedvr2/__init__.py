@@ -125,10 +125,10 @@ def _safetensors_state(path, dtype, prefixes):
     """Build a ``{stripped_name: tensor}`` state dict, dequantising as needed.
 
     Handles plain fp16/bf16/fp32, fp8 (cast up), and ComfyUI ``int8_tensorwise``
-    (optionally ``convrot``) via :func:`engine.moss_text._dequant`.
+    (optionally ``convrot``) via :func:`engine.quant_formats._dequant`.
     """
     from safetensors import safe_open
-    from ..moss_text import _dequant
+    from ..quant_formats import _dequant
 
     with safe_open(path, framework="pt", device="cpu") as handle:
         names = handle.keys()

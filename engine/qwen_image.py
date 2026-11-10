@@ -6,7 +6,7 @@ set of block weights. Ported from the architecture ComfyUI mirrors
 rewritten to depend only on ``torch``. Weights load from a GGUF state dict (see
 :mod:`engine.gguf`) or a safetensors file, including ComfyUI's ``int8_tensorwise``
 quantisation with the optional ``convrot`` rotation (``*_int8_convrot`` files,
-dequantized via :mod:`engine.moss_text`).
+dequantized via :mod:`engine.quant_formats`).
 
 Text2image, img2img and reference-image conditioning: condition images are packed
 ahead of the target latents and substituted into the vision slots the text
@@ -539,7 +539,7 @@ def _safetensors_weight(handle, names, key, dtype):
     Plain bf16/f16 tensors are copied row-chunked; fp8 weights are dequantized
     with their scale side-car (see :func:`engine.krea2._fp8_reader`) and ComfyUI
     ``int8_tensorwise`` (+ convrot) weights are reconstructed (see
-    :func:`engine.moss_text._copy_weight`), so a plain ``F.linear`` reproduces
+    :func:`engine.quant_formats._copy_weight`), so a plain ``F.linear`` reproduces
     ComfyUI's result.
     """
     slice_ = handle.get_slice(key)
@@ -550,7 +550,7 @@ def _safetensors_weight(handle, names, key, dtype):
 
         buf.copy_(_fp8_reader(handle, names)(key).reshape(shape).to(dtype))
     else:
-        from .moss_text import _copy_weight
+        from .quant_formats import _copy_weight
 
         _copy_weight(handle, names, key, buf, dtype)
     return buf

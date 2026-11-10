@@ -597,7 +597,7 @@ def load_dit(path, device="cpu", dtype=torch.bfloat16, model=None, tick=None,
     Builds a full :class:`MiniMaxH3DiT` unless a ``model_cls``/prebuilt ``model``
     is given (`MiniMaxH3ImageDiT` for the image checkpoint). The key map is
     near-identity (ComfyUI names match this module's), so loading is a per-tensor
-    :func:`engine.moss_text._dequant` copy. fp32 islands are preserved.
+    :func:`engine.quant_formats._dequant` copy. fp32 islands are preserved.
 
     Memory
     ------
@@ -612,7 +612,7 @@ def load_dit(path, device="cpu", dtype=torch.bfloat16, model=None, tick=None,
     (or ``"full"``) to keep the old dense dtype path, and pass a prebuilt
     ``model`` to patch it in place.
     """
-    from .moss_text import _copy_weight, _dequant
+    from .quant_formats import _copy_weight, _dequant
     from .precision import (build_on_dtype, build_on_meta, skip_random_init,
                             to_fp8, _want_fp8)
     from .safetensors_io import open_safetensors

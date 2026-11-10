@@ -15,7 +15,7 @@ the tensor from that, sharing no lifetime with any loader.
 It is a drop-in for the subset of the ``safe_open`` interface the engine's
 loaders use (``keys`` / ``get_tensor`` / ``get_slice`` with ``get_shape`` /
 ``get_dtype`` / row slicing / ``metadata``), so it can be passed to
-:func:`engine.moss_text._copy_weight` and :func:`engine.moss_text._dequant`.
+:func:`engine.quant_formats._copy_weight` and :func:`engine.quant_formats._dequant`.
 """
 
 import json

@@ -173,9 +173,9 @@ def test_classify_and_slots():
 
 
 def test_convrot_hadamard():
-    from engine import moss_text
+    from engine import quant_formats
 
-    h = moss_text._hadamard(256)
+    h = quant_formats._hadamard(256)
     eye = torch.eye(256)
     check("hadamard symmetric", bool(torch.allclose(h, h.T, atol=1e-6)), True)
     check("hadamard orthogonal", bool(torch.allclose(h @ h.T, eye, atol=1e-5)), True)
@@ -185,14 +185,14 @@ def test_convrot_hadamard():
 def test_convrot_fold_identity():
     import torch.nn.functional as F
 
-    from engine import moss_text
+    from engine import quant_formats
 
-    h = torch.block_diag(moss_text._hadamard(256), moss_text._hadamard(256))
+    h = torch.block_diag(quant_formats._hadamard(256), quant_formats._hadamard(256))
     x = torch.randn(3, 512)
     w_rot = torch.randn(8, 512)
     # ComfyUI computes (x H) @ W_rot^T; folding H into the weight must match.
     check("convrot fold identity",
-          bool(torch.allclose((x @ h) @ w_rot.T, F.linear(x, moss_text._unrotate(w_rot, 256)), atol=1e-4)),
+          bool(torch.allclose((x @ h) @ w_rot.T, F.linear(x, quant_formats._unrotate(w_rot, 256)), atol=1e-4)),
           True)
 
 
@@ -202,7 +202,7 @@ def test_dit_int8_convrot_dequant_metadata():
 
     from safetensors.torch import save_file
 
-    from engine import moss_text
+    from engine import quant_formats
     from engine.moss_image import _checkpoint_source
 
     torch.manual_seed(0)
@@ -220,7 +220,7 @@ def test_dit_int8_convrot_dequant_metadata():
         shapes, fetch, close = _checkpoint_source(path, torch.float32)
         try:
             got = fetch("layers.0.proj.q.weight")
-            want = moss_text._unrotate(weight.to(torch.float32) * scale, 256)
+            want = quant_formats._unrotate(weight.to(torch.float32) * scale, 256)
             check("dit metadata convrot un-rotates", bool(torch.allclose(got, want, atol=1e-5)), True)
         finally:
             close()
@@ -232,7 +232,7 @@ def test_dit_int8_convrot_dequant():
 
     from safetensors.torch import save_file
 
-    from engine import moss_text
+    from engine import quant_formats
     from engine.moss_image import _checkpoint_source
 
     torch.manual_seed(0)
@@ -250,7 +250,7 @@ def test_dit_int8_convrot_dequant():
         shapes, fetch, close = _checkpoint_source(path, torch.float32)
         try:
             got = fetch("layers.0.proj.q.weight")
-            want = moss_text._unrotate(weight.to(torch.float32) * scale, 256)
+            want = quant_formats._unrotate(weight.to(torch.float32) * scale, 256)
             check("dit dequant strips prefix and un-rotates", bool(torch.allclose(got, want, atol=1e-5)), True)
             check("dit dequant dtype is float", got.dtype, torch.float32)
         finally:

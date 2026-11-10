@@ -352,7 +352,7 @@ def _checkpoint_source(path, dtype):
 
     from safetensors import safe_open
 
-    from .moss_text import _dequant
+    from .quant_formats import _dequant
 
     handle = safe_open(path, framework="pt", device="cpu")
     keys = list(handle.keys())

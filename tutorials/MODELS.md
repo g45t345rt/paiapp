@@ -56,7 +56,7 @@ No model is required for the paint tools. AI generation, upscaling, and backgrou
 | Component | File | Folder |
 | --- | --- | --- |
 | Diffusion model | `moss_image_sft_bf16.safetensors` | `diffusion_models/` |
-| Text encoder | `qwen3.5_9b_bf16.safetensors` | `text_encoders/` |
+| Text encoder | `qwen3.5_9b_bf16.safetensors`, `qwen3.5_9b_int8_convrot.safetensors`, or `qwen3.5_9b_w4a8_gptq.safetensors` | `text_encoders/` |
 | VAE | `flux2-vae_small.safetensors` | `vae/` |
 
 ### MiniMax H3
@@ -64,15 +64,19 @@ No model is required for the paint tools. AI generation, upscaling, and backgrou
 | Component | File | Folder |
 | --- | --- | --- |
 | Diffusion model | `minimax_h3_fl2va_pruned_int8_convrot.safetensors` | `diffusion_models/` |
-| Text encoder | `qwen3vl_32b_minimax_h3_int8_convrot.safetensors` | `text_encoders/` |
+| Text encoder | `qwen3vl_32b_minimax_h3_int8_convrot.safetensors` (or `qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors`) | `text_encoders/` |
 | VAE | `minimax_h3_video_vae_int8_convrot.safetensors` | `vae/` |
+
+Both 32B text-encoder quantizations stream through the same loader; install
+either one and select it in Model Settings if the default int8 file is not the
+one you have.
 
 ### MiniMax H3 Image
 
 | Component | File | Folder |
 | --- | --- | --- |
 | Diffusion model | `minimax_h3_image_pruned_int8_convrot.safetensors` | `diffusion_models/` |
-| Text encoder | `qwen3vl_32b_minimax_h3_int8_convrot.safetensors` (same as MiniMax H3) | `text_encoders/` |
+| Text encoder | `qwen3vl_32b_minimax_h3_int8_convrot.safetensors` or `qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors` (same as MiniMax H3) | `text_encoders/` |
 | VAE | `minimax_h3_image_vae_fp16.safetensors` | `vae/` |
 
 The image model runs on a fixed 6-step PDD schedule at guidance 1. Put up to 16

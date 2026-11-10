@@ -10,21 +10,23 @@ trims the user turn and leaves an open `` thinking`` block):
 
 The model is a dense hybrid linear-attention transformer (``Qwen3_5TextModel`` /
 ``Qwen3_5Model`` in ``transformers`` >= 5.3). Weights may be a plain bf16
-``.safetensors`` or ComfyUI's ``int8_tensorwise`` quantisation with the optional
-``convrot`` rotation (``qwen3.5_9b_int8_convrot.safetensors``), which
-:func:`_dequant` reconstructs. The config and tokenizer come from a Hugging Face
+``.safetensors`` or any of ComfyUI's text-encoder quantisations; the shared
+codec in :mod:`engine.quant_formats` handles ``int8_tensorwise`` (+convrot),
+packed ``nvfp4`` and ``asym_w4a8_int8`` (the latter is the
+``qwen3.5_9b_w4a8_gptq`` text encoder: packed int4 codes, a Lloyd-Max codebook,
+fp8 group scales and ConvRot). The config and
+tokenizer come from a Hugging Face
 repo id (or a local directory) -- point ``repo`` at it, or pass a directory as
 ``weights_path`` to load everything from there.
 """
 
-import json
-import math
 import os
 
 import torch
 from safetensors import safe_open
 
 from .precision import build_on_dtype, build_on_meta, skip_random_init
+from .quant_formats import _copy_weight
 
 # Where the Qwen3.5-9B config and tokenizer are read from when the model is
 # given as a bare weights file. A local directory passed as ``weights_path``
@@ -33,19 +35,6 @@ _DEFAULT_REPO = "Qwen/Qwen3.5-9B"
 
 _PREFIX = "<|im_start|>user\n"
 _SUFFIX = "<|im_end|>\n<|im_start|>assistant\n thinking\n"
-
-# Row-chunk budget for loading weights; bounds the float32 transient so a 9B
-# model loads within RAM (see ``_copy_weight``).
-_CHUNK_BYTES = 128 << 20
-
-_DTYPE_BYTES = {
-    "F64": 8, "I64": 8, "F32": 4, "I32": 4, "F16": 2, "BF16": 2, "I16": 2,
-    "I8": 1, "U8": 1, "BOOL": 1,
-}
-
-
-def _itemsize(dtype_name):
-    return _DTYPE_BYTES.get(dtype_name, 4)
 
 
 def _build_model(config):
@@ -73,126 +62,6 @@ def _build_model(config):
             "(no Qwen3_5Model/Qwen3_5TextModel found)."
         )
     raise RuntimeError("Could not build the Qwen3.5 text model: " + "; ".join(errors))
-
-
-# ------------------------------------------------------------- int8 / convrot
-# ComfyUI's ``int8_tensorwise`` files store ``X.weight`` as int8 with a
-# per-output-row ``X.weight_scale``; ``convrot`` additionally rotates groups of
-# 256 along the last dim by a normalized regular Hadamard matrix. The rotation
-# is symmetric and self-inverse, so un-rotating the dequantized weight lets a
-# plain ``F.linear`` reproduce ComfyUI's result exactly.
-def _hadamard(size):
-    h4 = torch.tensor(
-        [[1, 1, 1, -1], [1, 1, -1, 1], [1, -1, 1, 1], [-1, 1, 1, 1]], dtype=torch.float32,
-    )
-    h = h4
-    while h.shape[0] < size:
-        h = torch.kron(h, h4)
-    return h / math.sqrt(size)
-
-
-def _unrotate(weight, group_size):
-    """Un-rotate the ``convrot`` rotation: ``W @ H_block`` along the last dim."""
-    if group_size < 4 or weight.shape[-1] % group_size:
-        return weight
-    h = _hadamard(group_size).to(weight.dtype)
-    rows, cols = weight.shape
-    return (weight.reshape(rows, cols // group_size, group_size) @ h).reshape(rows, cols)
-
-
-def _dequant(handle, names, key):
-    """Reconstruct one tensor, dequantizing ComfyUI int8 (+ convrot) weights."""
-    tensor = handle.get_tensor(key)
-    scale_key = key + "_scale"
-    if tensor.dtype != torch.int8 or scale_key not in names:
-        return tensor
-    value = tensor.to(torch.float32) * handle.get_tensor(scale_key).to(torch.float32)
-    group_size, convrot = _quant_conf(handle, names, key)
-    return _unrotate(value, group_size) if convrot else value
-
-
-def _copy_weight(handle, names, key, dst, dtype):
-    """Dequantize ``key`` into the ``dst`` parameter in bounded row chunks.
-
-    Full-tensor materialisation would need ~4 GB for the 248320x4096 embedding
-    alone; chunking keeps the float32 transient at ``_CHUNK_BYTES`` regardless of
-    the tensor's size.
-    """
-    scale_key = key + "_scale"
-    sl = handle.get_slice(key)
-    shape = sl.get_shape()
-    rows = int(shape[0])
-    cols = int(shape[1]) if len(shape) > 1 else 1
-    if sl.get_dtype() != "I8" or scale_key not in names:
-        step = max(1, _CHUNK_BYTES // max(1, cols * _itemsize(sl.get_dtype())))
-        for start in range(0, rows, step):
-            dst[start:start + step].copy_(sl[start:start + step].to(dtype))
-        return
-    group_size, convrot = _quant_conf(handle, names, key)
-    scale = handle.get_tensor(scale_key).to(torch.float32)
-    per_row = scale.dim() >= 2
-    scale_sl = handle.get_slice(scale_key) if per_row else None
-    step = max(1, _CHUNK_BYTES // max(1, cols * 4))
-    for start in range(0, rows, step):
-        stop = start + step
-        chunk = sl[start:stop].to(torch.float32)
-        factor = scale_sl[start:stop].to(torch.float32) if per_row else scale
-        value = chunk * factor
-        if convrot:
-            value = _unrotate(value, group_size)
-        dst[start:stop].copy_(value.to(dtype))
-
-
-def _strip_component_prefix(name):
-    """Drop a leading module prefix so a tensor name matches metadata layer keys."""
-    for prefix in (
-        "model.diffusion_model.", "diffusion_model.", "model.language_model.",
-        "language_model.", "model.",
-    ):
-        if name.startswith(prefix):
-            return name[len(prefix):]
-    return name
-
-
-def _metadata_quant_layers(handle):
-    """The ``_quantization_metadata`` layer map from the file's ``__metadata__``.
-
-    Some int8 checkpoints (the MOSS DiT ``*_int8_convrot`` files) do not carry a
-    sibling ``X.comfy_quant`` tensor at all; instead the whole quant config lives
-    in the safetensors ``__metadata__`` as a JSON string keyed by module path
-    (``layers.0.proj.q``). Returns ``{}`` when the file has no such metadata.
-    """
-    try:
-        meta = handle.metadata() or {}
-    except Exception:
-        return {}
-    raw = meta.get("_quantization_metadata")
-    if not raw:
-        return {}
-    try:
-        return json.loads(raw).get("layers", {}) or {}
-    except (ValueError, TypeError):
-        return {}
-
-
-def _quant_conf(handle, names, key):
-    """``(group_size, convrot)`` for a quantized weight (defaults when absent).
-
-    A sibling ``X.comfy_quant`` tensor wins when present; otherwise the
-    file-level ``_quantization_metadata`` is consulted (the MOSS DiT layout,
-    which keys the config by module path rather than by tensor name).
-    """
-    conf_key = key[: -len(".weight")] + ".comfy_quant"
-    if conf_key in names:
-        conf = json.loads(bytes(handle.get_tensor(conf_key).to(torch.uint8).numpy().tobytes()).decode())
-        return int(conf.get("convrot_groupsize", 256)), bool(conf.get("convrot"))
-    name = _strip_component_prefix(key)
-    if name.endswith(".weight"):
-        name = name[: -len(".weight")]
-    conf = _metadata_quant_layers(handle).get(name)
-    if conf:
-        return int(conf.get("convrot_groupsize", 256)), bool(conf.get("convrot"))
-    return 0, False
 
 
 def _load_weights(model, handle, dtype, tick=None):

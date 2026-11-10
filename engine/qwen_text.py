@@ -225,7 +225,7 @@ def _safetensors_keys(name):
 def _safetensors_weight(handle, names, key, shape, dtype):
     """Dequantize one safetensors tensor into a fresh tensor of ``shape``.
 
-    Reuses :func:`engine.moss_text._copy_weight` for the plain and ComfyUI int8
+    Reuses :func:`engine.quant_formats._copy_weight` for the plain and ComfyUI int8
     (+ convrot) weights; fp8 weights are scaled through
     :func:`engine.krea2._fp8_reader`.
     """
@@ -235,7 +235,7 @@ def _safetensors_weight(handle, names, key, shape, dtype):
 
         buf.copy_(_fp8_reader(handle, names)(key).reshape(shape).to(dtype))
     else:
-        from .moss_text import _copy_weight
+        from .quant_formats import _copy_weight
 
         _copy_weight(handle, names, key, buf, dtype)
     return buf
