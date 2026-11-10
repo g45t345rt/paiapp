@@ -300,9 +300,16 @@ class GenerationPanel(tk.Frame):
         )
         self.recipe_delete_btn.pack(side=tk.LEFT, padx=(2, 0))
 
+        # Info note about what a family's built-in sampler actually uses; set by
+        # :meth:`_refresh_h3_fields`. Sits between the recipe picker and the
+        # Steps row, and is hidden while empty so most families add no height.
+        self.h3_note = tk.Label(self, text="", anchor="w")
+        theme.register(self.h3_note, fg="muted")
+
         opts = tk.Frame(self)
         opts.pack(fill=tk.X, pady=(4, 0))
         opts.columnconfigure(0, weight=1)
+        self._opts_row = opts
 
         def row(index, text):
             bg = "stripe_bg" if index % 2 else "panel_bg"
@@ -316,9 +323,6 @@ class GenerationPanel(tk.Frame):
             controls = tk.Frame(line)
             controls.grid(row=0, column=1, sticky="e", padx=(0, 2), pady=2)
             theme.register(controls, bg=bg)
-            # Keep the caption reachable so a family can grey it (see
-            # :meth:`_refresh_h3_fields`).
-            controls._caption = caption
             return controls
 
         self.steps_var = tk.IntVar(value=10)
@@ -379,11 +383,6 @@ class GenerationPanel(tk.Frame):
             values=list(engine_paths.SCHEDULERS), state="readonly", width=14,
         )
         self.scheduler_combo.pack(side=tk.LEFT)
-        # Shown only for families whose sampler settings are fixed (H3); see
-        # :meth:`_refresh_h3_fields`.
-        self.h3_note = tk.Label(sched_field, text="", anchor="e")
-        theme.register(self.h3_note, fg="muted")
-        self.h3_note.pack(side=tk.LEFT, padx=(6, 0))
 
         # Each schedule's shape parameters, shown under the picker. Only the
         # chosen schedule's row is shown; the others collapse, so a schedule with
@@ -1305,42 +1304,26 @@ class GenerationPanel(tk.Frame):
         self._refresh_h3_fields(family)
 
     def _refresh_h3_fields(self, family):
-        """Grey out the sampler settings a family does not honour.
+        """Note the sampler settings a family's built-in sampler runs at.
 
         MiniMax H3 always runs its own dual-schedule rectified-flow Euler at
-        guidance 1 (see :func:`engine.pipeline._generate_h3`), so the CFG,
-        Sampler and Scheduler fields have no effect. MiniMax H3 Image runs a
-        fixed 6-step PDD grid at guidance 1 (see
-        :func:`engine.pipeline._generate_h3_image`), so Steps is fixed too.
-        Fibo 2.0 runs diffusers' own pipeline sampler, so its Sampler and
-        Scheduler are inert while Steps and CFG (which map to the pipeline's
-        ``guidance_scale``) still apply.
+        guidance 1 (see :func:`engine.pipeline._generate_h3`), so CFG, Sampler
+        and Scheduler are inert; MiniMax H3 Image runs a 6-step PDD grid at
+        guidance 1 (see :func:`engine.pipeline._generate_h3_image`), so Steps is
+        inert too. Fibo 2.0 runs diffusers' own pipeline sampler, so its Sampler
+        and Scheduler are inert. The fields stay editable anyway -- a LoRA or a
+        future loader may still consume them -- so the note only records what
+        the pipeline currently uses.
         """
-        fixed_cfg = family in ("h3", "h3_image")
-        fixed_sched = family in ("h3", "h3_image", "fibo")
-        fixed_steps = family == "h3_image"
-        for widget, fixed in (
-            (self.steps_spin, fixed_steps),
-            (self.cfg_spin, fixed_cfg),
-            (self.sampler_combo, fixed_sched),
-            (self.scheduler_combo, fixed_sched),
-        ):
-            if isinstance(widget, ttk.Combobox):
-                widget.configure(state="disabled" if fixed else "readonly")
-            else:
-                widget.configure(state=tk.DISABLED if fixed else tk.NORMAL)
-            caption = getattr(widget.master, "_caption", None)
-            if caption is not None:
-                theme.register(caption, fg="muted" if fixed else "text")
-        if family == "h3":
-            note = "fixed guidance 1 / Euler"
-        elif family == "h3_image":
-            note = "fixed guidance 1 / 6-step PDD grid"
-        elif family == "fibo":
-            note = "uses the pipeline's own sampler"
-        else:
-            note = ""
+        note = {
+            "h3": "fixed guidance 1 / Euler",
+            "h3_image": "fixed guidance 1 / 6-step PDD grid",
+            "fibo": "uses the pipeline's own sampler",
+        }.get(family, "")
         self.h3_note.configure(text=note)
+        self.h3_note.pack_forget()
+        if note:
+            self.h3_note.pack(fill=tk.X, pady=(2, 0), before=self._opts_row)
 
     def _set_preset_fields(self, values):
         """Set the sampler fields from ``values`` without echoing into storage."""
