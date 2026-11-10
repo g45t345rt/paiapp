@@ -322,9 +322,10 @@ class GenerationPanel(tk.Frame):
             return controls
 
         self.steps_var = tk.IntVar(value=10)
-        tk.Spinbox(
+        self.steps_spin = tk.Spinbox(
             row(0, "Steps:"), from_=1, to=50, width=4, textvariable=self.steps_var
-        ).pack(side=tk.LEFT)
+        )
+        self.steps_spin.pack(side=tk.LEFT)
 
         seed_field = row(1, "Seed:")
         self.seed_var = tk.IntVar(value=0)
@@ -1180,6 +1181,11 @@ class GenerationPanel(tk.Frame):
             for slot in ("text", "vae"):
                 if components.get(slot):
                     config[slot] = components[slot]
+        elif family == "h3_image":
+            config["dit"] = path
+            for slot in ("text", "vae"):
+                if components.get(slot):
+                    config[slot] = components[slot]
         else:
             config["model"] = path
             for slot in ("clip", "vae"):
@@ -1303,13 +1309,18 @@ class GenerationPanel(tk.Frame):
 
         MiniMax H3 always runs its own dual-schedule rectified-flow Euler at
         guidance 1 (see :func:`engine.pipeline._generate_h3`), so the CFG,
-        Sampler and Scheduler fields have no effect. Fibo 2.0 runs diffusers'
-        own pipeline sampler, so its Sampler and Scheduler are inert while Steps
-        and CFG (which map to the pipeline's ``guidance_scale``) still apply.
+        Sampler and Scheduler fields have no effect. MiniMax H3 Image runs a
+        fixed 6-step PDD grid at guidance 1 (see
+        :func:`engine.pipeline._generate_h3_image`), so Steps is fixed too.
+        Fibo 2.0 runs diffusers' own pipeline sampler, so its Sampler and
+        Scheduler are inert while Steps and CFG (which map to the pipeline's
+        ``guidance_scale``) still apply.
         """
-        fixed_cfg = family == "h3"
-        fixed_sched = family in ("h3", "fibo")
+        fixed_cfg = family in ("h3", "h3_image")
+        fixed_sched = family in ("h3", "h3_image", "fibo")
+        fixed_steps = family == "h3_image"
         for widget, fixed in (
+            (self.steps_spin, fixed_steps),
             (self.cfg_spin, fixed_cfg),
             (self.sampler_combo, fixed_sched),
             (self.scheduler_combo, fixed_sched),
@@ -1323,6 +1334,8 @@ class GenerationPanel(tk.Frame):
                 theme.register(caption, fg="muted" if fixed else "text")
         if family == "h3":
             note = "fixed guidance 1 / Euler"
+        elif family == "h3_image":
+            note = "fixed guidance 1 / 6-step PDD grid"
         elif family == "fibo":
             note = "uses the pipeline's own sampler"
         else:

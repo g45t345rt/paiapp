@@ -67,6 +67,19 @@ No model is required for the paint tools. AI generation, upscaling, and backgrou
 | Text encoder | `qwen3vl_32b_minimax_h3_int8_convrot.safetensors` | `text_encoders/` |
 | VAE | `minimax_h3_video_vae_int8_convrot.safetensors` | `vae/` |
 
+### MiniMax H3 Image
+
+| Component | File | Folder |
+| --- | --- | --- |
+| Diffusion model | `minimax_h3_image_pruned_int8_convrot.safetensors` | `diffusion_models/` |
+| Text encoder | `qwen3vl_32b_minimax_h3_int8_convrot.safetensors` (same as MiniMax H3) | `text_encoders/` |
+| VAE | `minimax_h3_image_vae_fp16.safetensors` | `vae/` |
+
+The image model runs on a fixed 6-step PDD schedule at guidance 1. Put up to 16
+reference images in the References panel, or use the Generate panel's Source
+image, for editing; an empty reference list is plain text-to-image. The native
+working range is roughly 4–16 MP (2048×2048 is the default).
+
 ### Fibo 2.0
 
 | Component | File | Folder |

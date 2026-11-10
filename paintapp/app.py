@@ -8287,16 +8287,17 @@ class PaintApp:
                 reference_image = self._resolve_anima_reference(bindings)
                 if reference_image is None:
                     return
-        # Qwen-Image reference images (multi-image edit): capture each now so a
-        # later selection/layer/canvas change cannot retarget a queued job. They
-        # are separate from the img2img Source and from the Anima reference.
+        # Reference images for multi-image edit (Qwen-Image and MiniMax H3 Image):
+        # capture each now so a later selection/layer/canvas change cannot
+        # retarget a queued job. They are separate from the img2img Source and
+        # from the Anima reference.
         qwen_ref_images = None
-        if self.gen.model_family() == "qwen_image":
+        if self.gen.model_family() in ("qwen_image", "h3_image"):
             bindings = self.references_panel.qwen_reference_bindings()
             if bindings:
                 if region_entries:
                     self.set_result(
-                        "Turn off Region prompts when using Qwen references.", "warn"
+                        "Turn off Region prompts when using reference images.", "warn"
                     )
                     return
                 qwen_ref_images = self._resolve_qwen_references(bindings)

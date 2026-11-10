@@ -44,6 +44,7 @@ KINDS = {
     "flux_vae": ("Flux VAE", VAE),
     "flux2_vae": ("FLUX.2 VAE", VAE),
     "h3_video_vae": ("MiniMax H3 Video VAE", VAE),
+    "h3_image_vae": ("MiniMax H3 Image VAE", VAE),
     "controlnet_sd15": ("ControlNet \u00b7 SD 1.5", CONTROL),
     "controlnet_sdxl": ("ControlNet \u00b7 SDXL", CONTROL),
     "controlnet_zimage": ("ControlNet \u00b7 Z-Image", CONTROL),
@@ -57,6 +58,7 @@ KINDS = {
     "krea2": ("Krea 2", MODEL),
     "moss_image": ("MOSS Image", MODEL),
     "h3": ("MiniMax H3", MODEL),
+    "h3_image": ("MiniMax H3 Image", MODEL),
     "fibo": ("Fibo 2.0", MODEL),
     "sd15": ("SD 1.5", MODEL),
     "sdxl": ("SDXL", MODEL),
@@ -70,11 +72,11 @@ CATEGORY_KINDS = {
         "qwen3vl_8b", "qwen3_5_9b", "qwen3vl_32b",
     ),
     VAE: ("qwen_image_vae", "qwen_image_21_vae", "flux_vae", "flux2_vae",
-          "h3_video_vae"),
+          "h3_video_vae", "h3_image_vae"),
     CONTROL: ("controlnet_sd15", "controlnet_sdxl", "controlnet_zimage", "lllite"),
     ADAPTER: ("anima_ref", "anypaint"),
     MODEL: ("anima", "qwen_image", "flux", "z_image", "krea2", "moss_image",
-            "h3", "fibo", "sd15", "sdxl", "stable_diffusion"),
+            "h3", "h3_image", "fibo", "sd15", "sdxl", "stable_diffusion"),
 }
 
 # Settings pool name -> detection category. Anima LLLite adapters are a
@@ -107,6 +109,8 @@ SLOT_KIND = {
     ("moss_image", "vae"): "flux2_vae",
     ("h3", "text"): "qwen3vl_32b",
     ("h3", "vae"): "h3_video_vae",
+    ("h3_image", "text"): "qwen3vl_32b",
+    ("h3_image", "vae"): "h3_image_vae",
 }
 
 # Component slot -> the curated pool its default file is drawn from.
@@ -603,8 +607,11 @@ def _vae_kind(name, shapes):
 def _vae_token(name):
     if "vae" not in name:
         return "flux_vae" if name == "ae.safetensors" else None
-    # MiniMax H3's video VAE (``minimax_h3_video_vae_*``): the only H3 VAE the
-    # engine runs (the optional single-frame image VAE is not used).
+    # MiniMax H3's image VAE (``minimax_h3_image_vae_*``) is a 2D decoder; the
+    # video VAE is the ``minimax_h3_video_vae_*`` file. Check the image token
+    # first because both contain "minimax" and "h3".
+    if "minimax_h3_image" in name or "minimax-h3-image" in name or "h3_image" in name:
+        return "h3_image_vae"
     if "minimax" in name or "h3" in name:
         return "h3_video_vae"
     # Require "qwen" for a Qwen VAE, so WAN's "wan_2.1_vae" is not read as the
@@ -652,6 +659,18 @@ def _model_from_shapes(shapes, arch):
             key.startswith("blocks.") for key in stripped
         ):
             return "anima"
+        # MiniMax H3 DiTs share the ``blocks.`` prefix but use the H3 patch
+        # projection; the image checkpoint drops the audio branch (no
+        # ``audio_patch_proj``/``final_layer.audio_out``).
+        if "video_patch_proj.weight" in stripped and any(
+            key.startswith("blocks.") for key in stripped
+        ):
+            if any(
+                key in stripped for key in
+                ("audio_patch_proj.weight", "final_layer.audio_out.weight")
+            ):
+                return "h3"
+            return "h3_image"
         if any(key.startswith("model.diffusion_model.") for key in original):
             return _classic_kind(original)
     if arch:

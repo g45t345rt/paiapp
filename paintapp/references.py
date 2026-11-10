@@ -10,10 +10,11 @@ section:
   reference. Only the ``anima`` family honours it; the adapters live in their own
   ``adapters/`` pool (not ``loras/``) because an ordinary LoRA applies on every
   run while this one is active only while a reference is attached.
-* Qwen-Image reference images (multi-image edit): an ordered list, each encoded
-  by the Qwen3-VL vision tower and substituted into the DiT's vision slots, so a
-  run conditions on several reference images at once. Only the ``qwen_image``
-  family honours it.
+* Reference images (multi-image edit): an ordered list for Qwen-Image, each
+  encoded by the Qwen3-VL vision tower and substituted into the DiT's vision
+  slots, and for MiniMax H3 Image, each encoded by the H3 image VAE and packed as
+  a reference frame. A run conditions on several reference images at once. Only
+  the ``qwen_image`` and ``h3_image`` families honour it.
 * Krea 2 AnyPaint (arbitrary-mask inpainting/outpainting): a functional adapter
   LoRA for Krea 2 that turns the masked region of the canvas into a generated
   edit while preserving the rest. It reuses the Generate panel's Source and
@@ -226,9 +227,9 @@ class ReferencesPanel(tk.Frame):
         qref_divider.pack(fill=tk.X, pady=(6, 0))
         theme.register(qref_divider, bg="border")
 
-        # -------------------------------------------------- qwen reference images
+        # -------------------------------------------------- reference images
         self._qwen_section = _Section(
-            self, "Qwen references", open_by_default=True,
+            self, "Reference images", open_by_default=True,
         )
         self.qref_header = self._qwen_section.header
         self.qref_add_btn = tk.Button(
@@ -317,6 +318,7 @@ class ReferencesPanel(tk.Frame):
         active = {
             "anima": getattr(self, "_anima_section", None),
             "qwen_image": getattr(self, "_qwen_section", None),
+            "h3_image": getattr(self, "_qwen_section", None),
             "krea2": getattr(self, "_anypaint_section", None),
         }.get(self._family)
         for section in (
@@ -511,8 +513,8 @@ class ReferencesPanel(tk.Frame):
         return self._row_bindings(self._qwen_refs)
 
     def _refresh_qwen_reference_state(self):
-        """Grey the Qwen reference controls out for other families."""
-        supported = self._family == "qwen_image"
+        """Grey the reference controls out for families that do not support them."""
+        supported = self._family in ("qwen_image", "h3_image")
         assignable = supported and self._on_capture is not None
         self.qref_add_btn.configure(state=tk.NORMAL if supported else tk.DISABLED)
         for row in self._qwen_refs:
@@ -660,7 +662,7 @@ class ReferencesPanel(tk.Frame):
             config["ref_correction"] = self.ref_correction_var.get()
             config["ref_offset_h"] = float(self.ref_offset_var.get())
             config["ref_megapixels"] = float(self.ref_megapixels_var.get())
-        elif self._family == "qwen_image" and self.qwen_reference_bindings():
+        elif self._family in ("qwen_image", "h3_image") and self.qwen_reference_bindings():
             config["qwen_refs"] = self.qwen_reference_bindings()
         if self._family == "krea2" and self.anypaint_var.get():
             config["anypaint"] = True

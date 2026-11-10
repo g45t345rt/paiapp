@@ -17,6 +17,7 @@ The forward returns the **raw data-ward velocity** (the scheduler uses
 Only ``torch`` is required; int8/convrot dequant is handled by the loader.
 """
 
+import json
 import math
 
 import torch
@@ -32,6 +33,53 @@ FRAME_RESCALE = 5.0 / 3.0
 VIDEO_TAG = 0
 TEXT_TAG = 1
 AUDIO_TAG = 2
+
+# MiniMax-H3-Image's PDD head bank is baked into the checkpoint metadata. The
+# values below are the released 6-step grid and are only a fallback for a
+# converted checkpoint that lost its ``__metadata__`` block.
+H3_IMAGE_PDD_STEPS = 6
+H3_IMAGE_PDD_SIGMAS = (
+    1.0,
+    0.9675236940383911,
+    0.8875485062599182,
+    0.75,
+    0.5327739119529724,
+    0.23200887441635132,
+    0.0,
+)
+# Reference-image rows are conditioned at the clean end of the schedule (the
+# image model has no audio stream to shift).
+VISUAL_COND_TIMESTEP = 0.999
+
+
+def image_config(path):
+    """``(pdd_steps, pdd_sigmas)`` from an H3-Image checkpoint's metadata.
+
+    The Comfy-Org repackage stores ``{"transformer": {"pdd_steps": 6,
+    "pdd_sigmas": [...]}}`` in the safetensors ``__metadata__``. A missing block
+    falls back to the released 6-step grid.
+    """
+    steps, sigmas = H3_IMAGE_PDD_STEPS, list(H3_IMAGE_PDD_SIGMAS)
+    try:
+        from .safetensors_io import open_safetensors
+
+        handle = open_safetensors(path)
+        try:
+            meta = handle.metadata() or {}
+        finally:
+            handle.close()
+        raw = meta.get("config")
+        if raw:
+            config = json.loads(raw)
+            transformer = config.get("transformer") or {}
+            steps = int(transformer.get("pdd_steps") or steps)
+            if transformer.get("pdd_sigmas"):
+                sigmas = [float(value) for value in transformer["pdd_sigmas"]]
+    except Exception:
+        pass
+    if len(sigmas) != steps + 1:
+        steps, sigmas = H3_IMAGE_PDD_STEPS, list(H3_IMAGE_PDD_SIGMAS)
+    return steps, sigmas
 
 
 def time_shift_sigma(sigma, from_shift, to_shift):
@@ -209,12 +257,22 @@ class _DiTBlock(nn.Module):
 
 
 class _FinalLayer(nn.Module):
-    def __init__(self, hidden, t_dim, video_dim, audio_dim, eps, apply_silu):
+    def __init__(self, hidden, t_dim, video_dim, audio_dim, eps, apply_silu,
+                 pdd_steps=1):
         super().__init__()
+        self.video_dim = video_dim
+        self._pdd_steps = max(1, int(pdd_steps))
         self.norm = nn.RMSNorm(hidden, eps=eps)
         self.adaln_proj = _AdalnProj(t_dim, hidden, 2, 1, apply_silu=apply_silu)
-        self.video_out = nn.Linear(hidden, video_dim, bias=True)
-        self.audio_out = nn.Linear(hidden, audio_dim, bias=True)
+        self.video_out = nn.Linear(hidden, video_dim * self._pdd_steps, bias=True)
+        self.audio_out = (
+            nn.Linear(hidden, audio_dim * self._pdd_steps, bias=True)
+            if audio_dim is not None else None
+        )
+
+    @property
+    def pdd_steps(self):
+        return self.video_out.weight.shape[0] // self.video_dim
 
     def forward(self, x, t_emb, video_seg, audio_seg):
         shift, scale = self.adaln_proj(t_emb)
@@ -224,7 +282,56 @@ class _FinalLayer(nn.Module):
             return (self.norm(x[a:b]) * (1.0 + scale[row].to(scale.dtype))
                     + shift[row].to(shift.dtype)).to(torch.float32)
 
-        return self.video_out(mod(video_seg)), self.audio_out(mod(audio_seg))
+        video = mod(video_seg)
+        audio = mod(audio_seg) if self.audio_out is not None else None
+        if self.pdd_steps > 1:
+            raise RuntimeError("PDD heads need the image forward (see forward_image).")
+        return self.video_out(video), (self.audio_out(audio) if audio is not None else None)
+
+    def forward_image(self, x, t_emb, video_seg, sigma, sample_sigmas, pdd_sigmas):
+        """One image-model head pass, using the PDD bank when the checkpoint has one."""
+        shift, scale = self.adaln_proj(t_emb)
+        a, b, row = video_seg
+        h = (self.norm(x[a:b]) * (1.0 + scale[row].to(scale.dtype))
+             + shift[row].to(shift.dtype)).to(torch.float32)
+        if self.pdd_steps == 1:
+            return self.video_out(h)
+        return _pdd_head(self.video_out, h, pdd_sigmas, sigma, sample_sigmas,
+                         self.pdd_steps)
+
+
+def _pdd_head(head, h, grid, sigma, sample_sigmas, steps):
+    """Evaluate a PDD head bank for the interval ``[sigma, sigma_next]``.
+
+    The first row block is a full head; the later blocks are offsets distilled on
+    the checkpoint's decreasing sigma grid. A step consumes the heads of every
+    grid interval it spans, weighted by ``dt`` (ComfyUI's ``_pdd_head``).
+    """
+    grid = [float(value) for value in grid]
+    if sample_sigmas is None:
+        raise ValueError("MiniMax H3 PDD heads need the sampler's sigma schedule.")
+    schedule = torch.as_tensor(sample_sigmas, dtype=torch.float32).flatten()
+    sigma = float(sigma)
+    i = int((schedule - sigma).abs().argmin())
+    sigma_next = float(schedule[min(i + 1, schedule.shape[0] - 1)])
+    start = min(range(steps + 1), key=lambda k: abs(grid[k] - sigma))
+    stop = min(range(steps + 1), key=lambda k: abs(grid[k] - sigma_next))
+    start = min(start, steps - 1)
+    stop = max(stop, start + 1)
+
+    dt = [grid[k] - grid[k + 1] for k in range(start, stop)]
+    total = sum(dt)
+    weights = (torch.tensor(dt, dtype=h.dtype, device=h.device) / total
+               if total else torch.full((len(dt),), 1.0 / len(dt), dtype=h.dtype,
+                                        device=h.device))
+    weight = head.weight.reshape(steps, -1, head.weight.shape[1])
+    bias = head.bias.reshape(steps, -1)
+    first = max(start, 1)
+    merged_weight = weight[0] + torch.einsum(
+        "n,noi->oi", weights[first - start:], weight[first:stop])
+    merged_bias = bias[0] + torch.einsum(
+        "n,no->o", weights[first - start:], bias[first:stop])
+    return F.linear(h, merged_weight, merged_bias)
 
 
 class MiniMaxH3DiT(nn.Module):
@@ -235,7 +342,7 @@ class MiniMaxH3DiT(nn.Module):
                  latents_dim=24, audio_latents_dim=32, patch_size=(1, 2, 2), text_dim=5120,
                  time_embed_dim=8, adaln_curve_size=1025, rope_inv_freq_len=16,
                  norm_eps=1e-5, qk_norm_eps=1e-5, final_norm_eps=1e-5,
-                 sigma_shift_video=12.0, sigma_shift_audio=3.0):
+                 sigma_shift_video=12.0, sigma_shift_audio=3.0, pdd_steps=1):
         super().__init__()
         self.hidden_size = hidden_size
         self.patch_size = tuple(patch_size)
@@ -247,7 +354,10 @@ class MiniMaxH3DiT(nn.Module):
         video_patch_dim = latents_dim * math.prod(self.patch_size)
 
         self.video_patch_proj = nn.Linear(video_patch_dim, hidden_size, bias=True)
-        self.audio_patch_proj = nn.Linear(audio_latents_dim, hidden_size, bias=True)
+        self.audio_patch_proj = (
+            nn.Linear(audio_latents_dim, hidden_size, bias=True)
+            if audio_latents_dim is not None else None
+        )
         self.condition_proj = nn.Linear(text_dim, hidden_size, bias=True)
 
         self.rope = nn.Module()
@@ -263,7 +373,8 @@ class MiniMaxH3DiT(nn.Module):
             for _ in range(num_layers)
         ])
         self.final_layer = _FinalLayer(hidden_size, time_embed_dim, video_patch_dim,
-                                       audio_latents_dim, final_norm_eps, apply_silu=False)
+                                       audio_latents_dim, final_norm_eps, apply_silu=False,
+                                       pdd_steps=pdd_steps)
 
         self._block_storage = None
         self._block_compute = None
@@ -366,6 +477,85 @@ class MiniMaxH3DiT(nn.Module):
         audio_out = unpack_audio(a)
         return video_out, audio_out
 
+    def forward_image(self, video_x, context, layout, sigma, sample_sigmas,
+                      pdd_sigmas, ref_latents=(), seed=0):
+        """One MiniMax-H3-Image forward (no audio stream).
+
+        ``video_x`` is the target latent ``[1,24,1,H,W]``; ``layout`` comes from
+        :func:`engine.h3_layout.build_image_packed_sequence` and ``ref_latents``
+        are the encoded reference latents in the same order as its
+        ``ref_indices``. Reference rows are conditioned at the clean end of the
+        schedule (with the checkpoint's 0.999 noise augmentation), while text and
+        target rows share the current sigma. The image checkpoint's velocity has
+        the opposite sign from the video model, so the result is negated.
+        """
+        device = video_x.device
+        dtype = context.dtype
+        position_ids, token_tags, video_indices, text_indices, ref_indices = layout
+
+        video_rows = patchify_video(video_x.to(torch.float32), self.patch_size)
+        video_embed = self.video_patch_proj(video_rows).to(dtype)
+        text_embed = self.token_refiner(
+            self.condition_proj(context.to(_linear_dtype(self.condition_proj))))
+
+        seq_len = position_ids.shape[0]
+        x = torch.empty(seq_len, self.hidden_size, dtype=dtype, device=device)
+        x[text_indices] = text_embed
+        for index, latent in zip(ref_indices, ref_latents):
+            rows = patchify_video(latent.to(torch.float32), self.patch_size)
+            if VISUAL_COND_TIMESTEP < 1.0:
+                # ComfyUI restarts the same CPU RNG stream for every reference.
+                generator = torch.Generator("cpu").manual_seed(int(seed))
+                noise = torch.randn(rows.shape, generator=generator, dtype=torch.float32)
+                rows = (VISUAL_COND_TIMESTEP * rows
+                        + (1.0 - VISUAL_COND_TIMESTEP) * noise.to(rows.device))
+            x[index] = self.video_patch_proj(rows).to(dtype)
+        x[video_indices] = video_embed
+
+        t_v = 1.0 - float(sigma)
+        t_ref = max(t_v, VISUAL_COND_TIMESTEP)
+        unique_t = [t_v] if t_ref == t_v else [t_v, t_ref]
+        t_row = {value: index for index, value in enumerate(unique_t)}
+        t_emb = self._curve_embed(torch.tensor(unique_t, dtype=torch.float32, device=device))
+
+        text_tag = (int(token_tags[text_indices[0]].item())
+                    if text_indices.numel() else TEXT_TAG)
+        mod_segments = [
+            (int(text_indices[0]), int(text_indices[-1]) + 1,
+             t_row[t_v] * 3 + text_tag),
+        ]
+        for index in ref_indices:
+            if index.numel():
+                mod_segments.append((int(index[0]), int(index[-1]) + 1,
+                                     t_row[t_ref] * 3 + VIDEO_TAG))
+        mod_segments.append((int(video_indices[0]), int(video_indices[-1]) + 1,
+                             t_row[t_v] * 3 + VIDEO_TAG))
+
+        rope = self._rope_freqs(position_ids)
+        rope_pair = (rope.cos(), rope.sin())
+
+        for index, block in enumerate(self.blocks):
+            streamed = self._block_compute is not None and index >= self._resident_count
+            if streamed:
+                block.to(device=self._block_compute)
+            x = block(x, t_emb, mod_segments, rope_pair)
+            if streamed:
+                block.to(device=self._block_storage)
+
+        video_seg = (int(video_indices[0]), int(video_indices[-1]) + 1, t_row[t_v])
+        v = self.final_layer.forward_image(
+            x, t_emb, video_seg, sigma, sample_sigmas, pdd_sigmas)
+        lat_t, lat_h, lat_w = video_x.shape[2], video_x.shape[3] // 2, video_x.shape[4] // 2
+        return -unpatchify_video(v, lat_t, lat_h, lat_w, self.latents_dim, self.patch_size)
+
+
+class MiniMaxH3ImageDiT(MiniMaxH3DiT):
+    """MiniMax-H3-Image: the H3 DiT without the audio stream, one latent frame."""
+
+    def __init__(self, pdd_steps=1, **kwargs):
+        kwargs.pop("audio_latents_dim", None)
+        super().__init__(audio_latents_dim=None, pdd_steps=pdd_steps, **kwargs)
+
 
 # Submodules kept in float32 in the released mixed-precision checkpoint.
 _FP32_MODULES = ("video_patch_proj", "audio_patch_proj", "final_layer.video_out",
@@ -401,10 +591,11 @@ def _materialize_meta(module):
 
 
 def load_dit(path, device="cpu", dtype=torch.bfloat16, model=None, tick=None,
-             fp8="auto"):
+             fp8="auto", model_cls=MiniMaxH3DiT, model_kwargs=None):
     """Load a MiniMax H3 DiT checkpoint (ComfyUI layout, int8/convrot aware).
 
-    Builds a full :class:`MiniMaxH3DiT` unless ``model`` is given. The key map is
+    Builds a full :class:`MiniMaxH3DiT` unless a ``model_cls``/prebuilt ``model``
+    is given (`MiniMaxH3ImageDiT` for the image checkpoint). The key map is
     near-identity (ComfyUI names match this module's), so loading is a per-tensor
     :func:`engine.moss_text._dequant` copy. fp32 islands are preserved.
 
@@ -426,6 +617,11 @@ def load_dit(path, device="cpu", dtype=torch.bfloat16, model=None, tick=None,
                             to_fp8, _want_fp8)
     from .safetensors_io import open_safetensors
 
+    kwargs = dict(model_kwargs or {})
+
+    def factory():
+        return model_cls(**kwargs)
+
     # Quantize during load only when the block linears can actually hold fp8 and
     # the caller has not asked for full precision. A CPU-only build (dtype fp32)
     # keeps `to_fp8` from converting the fp32 weights, so it must stay dense.
@@ -435,7 +631,7 @@ def load_dit(path, device="cpu", dtype=torch.bfloat16, model=None, tick=None,
     if not quantize:
         if model is None:
             with skip_random_init():
-                model = build_on_dtype(dtype, MiniMaxH3DiT)
+                model = build_on_dtype(dtype, factory)
         # Pin the fp32 islands so the dequantized weights land at checkpoint
         # precision.
         for name, module in model.named_modules():
@@ -466,7 +662,7 @@ def load_dit(path, device="cpu", dtype=torch.bfloat16, model=None, tick=None,
         return model.to(device=device), missing
 
     # Low-memory path: meta build, dense fp32 islands, blocks kept in fp8.
-    with build_on_meta(dtype, MiniMaxH3DiT) as model:
+    with build_on_meta(dtype, factory) as model:
         pass
     for name, module in model.named_modules():
         if any(name == m or name.startswith(m + ".") for m in _FP32_MODULES) \

@@ -174,6 +174,10 @@ _FAMILY_SLOTS = {
         ("text", "Text encoder", "text_encoders"),
         ("vae", "VAE", "vaes"),
     ),
+    "h3_image": (
+        ("text", "Text encoder", "text_encoders"),
+        ("vae", "VAE", "vaes"),
+    ),
     # Fibo 2.0 loads as one diffusers-format directory (or repo id), so it has no
     # per-component slots -- the model's own path is the whole pipeline.
     "fibo": (),
@@ -200,6 +204,7 @@ _MODEL_KIND_GROUP = {
     "krea2": "Krea 2",
     "moss_image": "MOSS Image",
     "h3": "MiniMax H3",
+    "h3_image": "MiniMax H3 Image",
     "fibo": "Fibo 2.0",
     "sd15": "Stable Diffusion",
     "sdxl": "Stable Diffusion",

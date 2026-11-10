@@ -30,6 +30,29 @@ import torch.nn.functional as F
 IMAGENET_MEAN = (0.485, 0.456, 0.406)
 IMAGENET_STD = (0.229, 0.224, 0.225)
 
+# MiniMax-H3-Image's latent normalization. The Comfy-Org image VAE checkpoint
+# omits these buffers (ComfyUI keeps them as code constants), so they are baked
+# in here to match that implementation exactly.
+IMAGE_LATENTS_MEAN = (
+    0.858090341091156, -0.9606591463088989, 1.0661640167236328, -0.5090325474739075,
+    -0.2727581858634949, -1.3675414323806763, -0.2553254961967468, -0.26907554268836975,
+    -0.5376840829849243, -0.0464097298681736, 0.6657370328903198, 0.19690127670764923,
+    -0.5460608005523682, -0.4035342037677765, -0.23683024942874908, 0.25928452610969543,
+    -0.30133944749832153, 0.211341992020607, -1.1206848621368408, 0.3581933379173279,
+    -0.04225143790245056, 0.2604829967021942, 0.22864092886447906, 0.7056031823158264,
+)
+IMAGE_LATENTS_STD = (
+    1.2223774194717407, 1.2767263650894165, 1.68317747116088865, 1.7549455165863037,
+    1.5636216402053833, 2.194143533706665, 0.96531379222869875, 1.05698859691619875,
+    0.841948926448822, 0.7729952931404114, 1.8955937623977661, 0.946841835975647,
+    0.7996809482574463, 0.44988900423049925, 0.7197399735450745, 0.69362932443618775,
+    2.961095094680786, 2.7694199085235595, 3.0496184825897215, 2.1088054180145265,
+    3.276226282119751, 3.1627357006073, 2.28168129920959475, 2.6127843856811525,
+)
+# The image VAE conditions on a posterior sample; ComfyUI reuses a fixed seed so
+# the same reference image gives the same latent on every run.
+IMAGE_ENCODE_SEED = 42
+
 
 class _CausalConv3d(nn.Conv3d):
     """3D conv with reflect spatial padding and causal (zero, front) temporal padding."""
@@ -247,14 +270,16 @@ class _ViTDecoder3d(nn.Module):
     def __init__(self, in_channels=24, out_channels=3, patch_size=16, patch_size_t=4,
                  num_layers=36, num_attention_heads=32, attention_head_dim=64,
                  num_register_tokens=4, ffn_mult=4, rope_theta=100.0, rope_dim_ratio=0.75,
-                 norm_eps=1e-5):
+                 norm_eps=1e-5, num_axes=3):
         super().__init__()
         dim = num_attention_heads * attention_head_dim
         self.patch_size = patch_size
         self.patch_size_t = patch_size_t
         self.out_channels = out_channels
         self.num_register_tokens = num_register_tokens
-        self.rope = _RotaryPosEmbed(int(attention_head_dim * rope_dim_ratio), theta=rope_theta)
+        self.num_axes = num_axes
+        self.rope = _RotaryPosEmbed(int(attention_head_dim * rope_dim_ratio),
+                                    theta=rope_theta, num_axes=num_axes)
         self.proj_in = nn.Linear(in_channels, dim)
         self.register_tokens = nn.Parameter(torch.zeros(1, num_register_tokens, dim))
         # ComfyUI's checkpoint appends a *learned* mask token where diffusers used
@@ -278,10 +303,10 @@ class _ViTDecoder3d(nn.Module):
         x = torch.cat([x, reg, cls], dim=1)
 
         grids = [2.0 * (torch.arange(0.5, size, dtype=torch.float32, device=x.device) / size) - 1.0
-                 for size in (t, h, w)]
-        position_ids = torch.stack(torch.meshgrid(*grids, indexing="ij"), dim=-1).flatten(0, 2)
+                 for size in ((t, h, w) if self.num_axes == 3 else (h, w))]
+        position_ids = torch.stack(torch.meshgrid(*grids, indexing="ij"), dim=-1).flatten(0, self.num_axes - 1)
         position_ids = position_ids.unsqueeze(0).expand(b, -1, -1)
-        suffix = position_ids.new_zeros((b, self.num_register_tokens + 1, 3))
+        suffix = position_ids.new_zeros((b, self.num_register_tokens + 1, self.num_axes))
         position_ids = torch.cat([position_ids, suffix], dim=1)
         rotary_emb = self.rope(position_ids)
 
@@ -306,13 +331,14 @@ class MiniMaxH3VideoVAE(nn.Module):
                  decoder_num_layers=36, decoder_num_attention_heads=32,
                  decoder_attention_head_dim=64, decoder_num_register_tokens=4,
                  decoder_ffn_mult=4, decoder_rope_theta=100.0, decoder_rope_dim_ratio=0.75,
-                 decoder_norm_eps=1e-5, clip_length=17, token_drop=3,
+                 decoder_norm_eps=1e-5, decoder_num_axes=3, clip_length=17, token_drop=3,
                  latents_mean=None, latents_std=None, tile_size=256, tile_overlap_min=64):
         super().__init__()
         self.spatial_compression_ratio = math.prod(spatial_downsample_factors)
         self.temporal_compression_ratio = math.prod(temporal_downsample_factors)
         self.clip_length = clip_length
         self.token_drop = token_drop
+        self.image_decoder = decoder_num_axes == 2
 
         self.encoder = _Encoder3d(
             in_channels=in_channels, out_channels=2 * latent_channels,
@@ -323,16 +349,20 @@ class MiniMaxH3VideoVAE(nn.Module):
             spatial_padding_mode=spatial_padding_mode,
         )
         self.quant_conv = nn.Conv3d(2 * latent_channels, 2 * latent_channels, kernel_size=1)
-        self.post_quant_conv = nn.Conv3d(latent_channels, latent_channels, kernel_size=1)
+        self.post_quant_conv = (
+            nn.Conv2d(latent_channels, latent_channels, kernel_size=1)
+            if self.image_decoder else
+            nn.Conv3d(latent_channels, latent_channels, kernel_size=1)
+        )
         self.decoder = _ViTDecoder3d(
             in_channels=latent_channels, out_channels=out_channels,
             patch_size=self.spatial_compression_ratio,
-            patch_size_t=self.temporal_compression_ratio,
+            patch_size_t=1 if self.image_decoder else self.temporal_compression_ratio,
             num_layers=decoder_num_layers, num_attention_heads=decoder_num_attention_heads,
             attention_head_dim=decoder_attention_head_dim,
             num_register_tokens=decoder_num_register_tokens, ffn_mult=decoder_ffn_mult,
             rope_theta=decoder_rope_theta, rope_dim_ratio=decoder_rope_dim_ratio,
-            norm_eps=decoder_norm_eps,
+            norm_eps=decoder_norm_eps, num_axes=decoder_num_axes,
         )
 
         self.frame_pre_padding = (-clip_length) % self.temporal_compression_ratio
@@ -420,16 +450,22 @@ class MiniMaxH3VideoVAE(nn.Module):
         ratio = self.spatial_compression_ratio
         return self._stitch_tiles(rows, [o // ratio for o in y_ov], [o // ratio for o in x_ov])
 
+    def _post_quant(self, z):
+        """Apply ``post_quant_conv`` (Conv2d for the image VAE, Conv3d otherwise)."""
+        if self.post_quant_conv.weight.ndim == 4:
+            return self.post_quant_conv(z.squeeze(2)).unsqueeze(2)
+        return self.post_quant_conv(z)
+
     def _decode_clip(self, z):
         if not self.use_tiling:
-            return self.decoder(self.post_quant_conv(z))
+            return self.decoder(self._post_quant(z))
         ratio = self.spatial_compression_ratio
         height, width = z.shape[-2] * ratio, z.shape[-1] * ratio
         y_idx, y_len, y_ov = self._split_tiles(height, self.tile_sample_min_height,
                                                self.tile_sample_min_overlap_height)
         x_idx, x_len, x_ov = self._split_tiles(width, self.tile_sample_min_width,
                                                self.tile_sample_min_overlap_width)
-        rows = [[self.decoder(self.post_quant_conv(
+        rows = [[self.decoder(self._post_quant(
                     z[..., i // ratio:i // ratio + il // ratio, j // ratio:j // ratio + jl // ratio]))
                  for j, jl in zip(x_idx, x_len)] for i, il in zip(y_idx, y_len)]
         return self._stitch_tiles(rows, y_ov, x_ov)
@@ -447,6 +483,12 @@ class MiniMaxH3VideoVAE(nn.Module):
         frame ``frame_pre_padding``); longer latents decode as a clip.
         """
         z = z * self.latents_std.view(1, -1, 1, 1, 1).to(z) + self.latents_mean.view(1, -1, 1, 1, 1).to(z)
+        if self.image_decoder:
+            if z.shape[2] != 1:
+                raise ValueError(
+                    "The image VAE decodes single-frame latents only, got "
+                    f"{z.shape[2]} latent frames.")
+            return self._to_pixels(self._decode_clip(z))
         if z.shape[2] == 1:
             group = z.repeat(1, 1, self.tokens_chunk_size, 1, 1)
             clip = self._decode_clip(group)
@@ -513,6 +555,52 @@ class MiniMaxH3VideoVAE(nn.Module):
             / self.latents_std.view(1, -1, 1, 1, 1).to(mean)
 
 
+class MiniMaxH3ImageVAE(MiniMaxH3VideoVAE):
+    """MiniMax-H3-Image: the H3 encoder with a 24-layer 2D ViT decoder.
+
+    The decoder uses half-head 2D rotary and decodes a single latent frame per
+    token, so it shares the causal CNN encoder and the 24-channel latent space
+    with the video VAE.
+    """
+
+    def __init__(self, **kwargs):
+        kwargs.setdefault("decoder_num_layers", 24)
+        kwargs.setdefault("decoder_num_attention_heads", 16)
+        kwargs.setdefault("decoder_attention_head_dim", 64)
+        kwargs.setdefault("decoder_rope_dim_ratio", 0.5)
+        kwargs.setdefault("decoder_num_axes", 2)
+        kwargs.setdefault("latents_mean", IMAGE_LATENTS_MEAN)
+        kwargs.setdefault("latents_std", IMAGE_LATENTS_STD)
+        super().__init__(**kwargs)
+
+    def _normalize_reference(self, pixels):
+        """``[-1, 1]`` RGB to the ImageNet space the H3 encoder was trained on."""
+        pixels = pixels.to(torch.float32)
+        normalized = (pixels.mul(0.5).add(0.5) - self.pixel_mean.to(pixels)) \
+            / self.pixel_std.to(pixels)
+        return normalized.to(self.encoder.conv_in.weight.dtype)
+
+    def encode_image(self, pixels, device=None):
+        """Encode one reference image (``[-1, 1]`` pixels) to normalized latents.
+
+        The image VAE conditions on a posterior sample rather than the mean; the
+        fixed :data:`IMAGE_ENCODE_SEED` matches ComfyUI's reference recipe.
+        """
+        if pixels.ndim == 4:
+            pixels = pixels.unsqueeze(2)
+        if device is not None:
+            pixels = pixels.to(device)
+        moments = self._encode_clip(self._normalize_reference(pixels))
+        mean, logvar = moments.float().chunk(2, dim=1)
+        noise = torch.randn(
+            mean.shape, generator=torch.Generator().manual_seed(IMAGE_ENCODE_SEED)
+        ).to(mean.device)
+        latents = torch.addcmul(
+            mean, torch.exp(0.5 * logvar.clamp(-30.0, 20.0)), noise)
+        return (latents - self.latents_mean.view(1, -1, 1, 1, 1).to(latents)) \
+            / self.latents_std.view(1, -1, 1, 1, 1).to(latents)
+
+
 def to_pixels(vae, latents):
     """Convenience: decode normalized latents straight to ``[0, 1]`` pixels."""
     return vae.decode(latents)
@@ -553,13 +641,19 @@ def _dest_names(key):
     return [(key, None)]
 
 
-def load_vae(path, device="cpu", dtype=torch.bfloat16, model=None, tick=None):
-    """Load a MiniMax H3 video VAE checkpoint (ComfyUI layout, int8/convrot aware)."""
+def load_vae(path, device="cpu", dtype=torch.bfloat16, model=None, tick=None,
+             model_cls=MiniMaxH3VideoVAE):
+    """Load a MiniMax H3 VAE checkpoint (ComfyUI layout, int8/convrot aware).
+
+    ``model_cls`` selects the video VAE or :class:`MiniMaxH3ImageVAE`; the key
+    mapping is shared (the image checkpoint is the same encoder with a 2D
+    decoder).
+    """
     from .moss_text import _dequant
     from .safetensors_io import open_safetensors
 
     if model is None:
-        model = MiniMaxH3VideoVAE()
+        model = model_cls()
     model = model.to(dtype=dtype)
     handle = open_safetensors(path)
     names = set(handle.keys())
@@ -605,7 +699,7 @@ def load_vae(path, device="cpu", dtype=torch.bfloat16, model=None, tick=None):
             pass
     missing = [n for n in list(params) + list(buffers)
                if n not in loaded and not n.endswith("rope.inv_freq")
-               and n not in ("pixel_mean", "pixel_std")]
+               and n not in ("pixel_mean", "pixel_std", "latents_mean", "latents_std")]
     if tick is not None:
         tick(1.0)
     return model.to(device=device), missing

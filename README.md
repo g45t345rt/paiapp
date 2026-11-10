@@ -94,6 +94,7 @@ Generation runs through the model family you pick in the Generate panel:
 | Krea 2 | Turbo DiT, includes AnyPaint masked editing |
 | MOSS Image | Instruction-tuned image model with JSON layout prompts |
 | MiniMax H3 | Qwen3-VL-32B text encoder with video VAE |
+| MiniMax H3 Image | 6-step PDD image DiT with reference-image editing |
 | Fibo 2.0 | Bria Fibo 2.0 |
 | Stable Diffusion | SD 1.x / 2.x / SDXL, including Pony/Illustrious-style finetunes |
 

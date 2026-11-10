@@ -68,6 +68,13 @@ _H3_COMPONENTS = {
     "text": ("text_encoders", "qwen3vl_32b_minimax_h3_int8_convrot.safetensors"),
     "vae": ("vae", "minimax_h3_video_vae_int8_convrot.safetensors"),
 }
+# MiniMax-H3-Image shares the H3 text encoder; its DiT and 2D-ViT image VAE are
+# different files (the Comfy-Org single-file repackage).
+_H3_IMAGE_COMPONENTS = {
+    "dit": ("diffusion_models", "minimax_h3_image_pruned_int8_convrot.safetensors"),
+    "text": ("text_encoders", "qwen3vl_32b_minimax_h3_int8_convrot.safetensors"),
+    "vae": ("vae", "minimax_h3_image_vae_fp16.safetensors"),
+}
 # Fibo 2.0 is loaded as a whole diffusers-format directory (or a repo id), not as
 # separate component files, so its single "model" slot points at a folder rather
 # than a transformer file (see :mod:`engine.fibo`).
@@ -96,6 +103,7 @@ MODEL_GROUPS = (
     ("Krea 2", "krea2"),
     ("MOSS Image", "moss_image"),
     ("MiniMax H3", "h3"),
+    ("MiniMax H3 Image", "h3_image"),
     ("Fibo 2.0", "fibo"),
     ("Stable Diffusion", "stable_diffusion"),
 )
@@ -135,6 +143,11 @@ def moss_components():
 def h3_components():
     """Default MiniMax H3 component files, keyed by ``H3_DEFAULTS`` slot."""
     return {key: component_path(parts) for key, parts in _H3_COMPONENTS.items()}
+
+
+def h3_image_components():
+    """Default MiniMax H3 Image component files, keyed by ``H3_IMAGE_DEFAULTS``."""
+    return {key: component_path(parts) for key, parts in _H3_IMAGE_COMPONENTS.items()}
 
 
 def _model_settings():
@@ -513,6 +526,11 @@ def classify_model(path, in_checkpoints=False):
         return "Krea 2", "krea2"
     if "moss" in name:
         return "MOSS Image", "moss_image"
+    # MiniMax-H3-Image's DiT is a single-file ComfyUI repackage too, but it is a
+    # different architecture (no audio stream) from the H3 video DiT below.
+    if ("minimax_h3_image" in name or "minimax-h3-image" in name) and not (
+        "vae" in name or "text_encoder" in name or "text-encoder" in name):
+        return "MiniMax H3 Image", "h3_image"
     # Only the H3 DiT (FL2VA / Ref2VA) is a generation model; the Qwen3-VL-32B
     # text encoder and the video VAE share the "minimax_h3" token and must not
     # be read as models, so require a checkpoint marker.
@@ -648,6 +666,7 @@ _FAMILY_BASE_SLOT = {
     "krea2": "dit",
     "moss_image": "dit",
     "h3": "dit",
+    "h3_image": "dit",
     "fibo": "model",
     "stable_diffusion": "checkpoint",
 }
@@ -778,6 +797,11 @@ def _h3_defaults():
     return {"dit": files["dit"], "text": files["text"], "vae": files["vae"]}
 
 
+def _h3_image_defaults():
+    files = _family_files("h3_image", _H3_IMAGE_COMPONENTS)
+    return {"dit": files["dit"], "text": files["text"], "vae": files["vae"]}
+
+
 def _fibo_defaults():
     files = _family_files("fibo", _FIBO_COMPONENTS)
     return {"model": files["model"]}
@@ -790,6 +814,7 @@ ZIMAGE_DEFAULTS = _zimage_defaults()
 KREA2_DEFAULTS = _krea2_defaults()
 MOSS_DEFAULTS = _moss_defaults()
 H3_DEFAULTS = _h3_defaults()
+H3_IMAGE_DEFAULTS = _h3_image_defaults()
 FIBO_DEFAULTS = _fibo_defaults()
 
 
@@ -809,6 +834,8 @@ def reload():
     MOSS_DEFAULTS.update(_moss_defaults())
     H3_DEFAULTS.clear()
     H3_DEFAULTS.update(_h3_defaults())
+    H3_IMAGE_DEFAULTS.clear()
+    H3_IMAGE_DEFAULTS.update(_h3_image_defaults())
     FIBO_DEFAULTS.clear()
     FIBO_DEFAULTS.update(_fibo_defaults())
 
@@ -893,6 +920,14 @@ def family_defaults(family, path=None):
         return {
             "steps": 50, "cfg": 1.0, "sampler": "euler", "scheduler": "simple",
             "width": 1024, "height": 1024,
+        }
+    if family == "h3_image":
+        # MiniMax-H3-Image is distilled to a fixed 6-step PDD grid with no CFG.
+        # 2048x2048 is the released model's default minimum generation area
+        # (~4 MP); the effective working range goes up to ~16 MP.
+        return {
+            "steps": 6, "cfg": 1.0, "sampler": "euler", "scheduler": "simple",
+            "width": 2048, "height": 2048,
         }
     if family == "fibo":
         # Fibo 2.0 Dev is the full, non-distilled base model: the reference

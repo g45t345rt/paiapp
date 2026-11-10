@@ -18,6 +18,11 @@ progress)`` entry point:
 * ``moss_image`` -- MOSS Image: a 5B single-stream DiT (:mod:`engine.moss_image`),
   the Qwen3.5-9B text encoder (:mod:`engine.moss_text`) and the FLUX.2 VAE
   (:mod:`engine.moss_vae`); flow-matching Euler at shift 5.
+* ``h3`` -- MiniMax H3's single-file video DiT and video VAE with the streamed
+  Qwen3-VL-32B encoder (:mod:`engine.h3`, :mod:`engine.h3_text`).
+* ``h3_image`` -- MiniMax-H3-Image: the no-audio DiT with a 6-step PDD head bank
+  and the 2D-ViT image VAE; reference-image editing via the Qwen reference list
+  (:mod:`engine.h3`, :mod:`engine.h3_vae`).
 
 The family is selected with ``config["family"]`` (default ``anima``).
 """
@@ -62,15 +67,25 @@ from .latent import (
 )
 from .lora import apply_lora, is_dedistill, usage
 from .loaded_models import record
-from .h3 import load_dit as load_h3_dit
-from .h3_layout import build_still_packed_sequence as h3_still_layout
+from .h3 import (
+    MiniMaxH3ImageDiT,
+    image_config as h3_image_config,
+    load_dit as load_h3_dit,
+)
+from .h3_layout import (
+    build_image_packed_sequence as h3_image_layout,
+    build_still_packed_sequence as h3_still_layout,
+)
 from .h3_sampler import (
     AUDIO_SHIFT as H3_AUDIO_SHIFT,
     VIDEO_SHIFT as H3_VIDEO_SHIFT,
     MiniMaxH3Scheduler,
 )
 from .h3_text import load_text_encoder as load_h3_text
-from .h3_vae import load_vae as load_h3_vae
+from .h3_vae import (
+    MiniMaxH3ImageVAE,
+    load_vae as load_h3_vae,
+)
 from .moss_image import load_moss_image
 from .moss_text import MossTextEncoder
 from .moss_vae import (
@@ -179,6 +194,10 @@ _h3 = None
 _h3_key = None
 _h3_error = None
 
+_h3_image = None
+_h3_image_key = None
+_h3_image_error = None
+
 _fibo = None
 _fibo_key = None
 _fibo_error = None
@@ -194,6 +213,7 @@ _SLOTS = {
     "krea2": ("_krea2", "_krea2_key", "_krea2_error"),
     "moss": ("_moss", "_moss_key", "_moss_error"),
     "h3": ("_h3", "_h3_key", "_h3_error"),
+    "h3_image": ("_h3_image", "_h3_image_key", "_h3_image_error"),
     "fibo": ("_fibo", "_fibo_key", "_fibo_error"),
 }
 
@@ -2241,6 +2261,165 @@ def _generate_h3(prompt, cfg, image=None, progress=None, cancel=None, mask=None,
         return pil
 
 
+def _h3_image_ref_latent(vae, image, device):
+    """Encode one reference image to an H3-Image latent (max edge 1024 px)."""
+    image = image.convert("RGB")
+    max_edge = 1024
+    scale = min(1.0, max_edge / max(image.size))
+    width = max(32, -(-int(round(image.width * scale)) // 32) * 32)
+    height = max(32, -(-int(round(image.height * scale)) // 32) * 32)
+    if image.size != (width, height):
+        image = image.resize((width, height), Image.LANCZOS)
+    pixels = torch.from_numpy(
+        np.array(image, dtype=np.float32).copy()
+    ).permute(2, 0, 1).unsqueeze(0).unsqueeze(2)
+    pixels = (pixels * 2.0 - 1.0).to(device=device, dtype=torch.float32)
+    with torch.inference_mode():
+        latent = vae.encode_image(pixels)
+    return latent.to(device=device, dtype=DIT_DTYPE)
+
+
+def _load_h3_image(path, vae_path=None, loras=(), progress=None, fp8="auto",
+                   cancel=None):
+    """Load and cache the MiniMax-H3-Image DiT + image VAE.
+
+    The Qwen3-VL-32B encoder is streamed per generation, exactly as for the H3
+    video family, so a preloaded DiT stays resident.
+    """
+    global _h3_image, _h3_image_key, _h3_image_error
+    loras = list(loras)
+    pdd_steps, pdd_sigmas = h3_image_config(path)
+    key = (path, vae_path, fp8, tuple(loras), pdd_steps, tuple(pdd_sigmas))
+    if _h3_image is not None and _h3_image_key == key:
+        return _h3_image
+    _h3_image = None
+    _h3_image_error = None
+    _h3_image_key = key
+    try:
+        _stage(cancel, progress, 0.4, "loading transformer")
+        dit, missing = load_h3_dit(
+            path, device="cpu", dtype=DIT_DTYPE, fp8=fp8,
+            model_cls=MiniMaxH3ImageDiT,
+            model_kwargs={"pdd_steps": pdd_steps},
+        )
+        if missing:
+            raise RuntimeError(f"transformer weights missing: {missing[:4]}")
+
+        _stage(cancel, progress, 0.8, "loading vae")
+        vae, vae_missing = load_h3_vae(
+            vae_path or paths.H3_IMAGE_DEFAULTS["vae"], device=DEVICE,
+            dtype=VAE_DTYPE, model_cls=MiniMaxH3ImageVAE,
+        )
+        if len(vae_missing) > 8:
+            raise RuntimeError(f"VAE weights missing ({len(vae_missing)}): {vae_missing[:4]}")
+
+        place_dit(dit, DEVICE, fp8=fp8)
+        _apply_loras(dit, loras, progress, 0.9, cancel)
+        _h3_image = {
+            "dit": dit, "vae": vae,
+            "pdd_steps": pdd_steps, "pdd_sigmas": pdd_sigmas,
+        }
+    except Cancelled:
+        _h3_image_key = None
+        raise
+    except Exception as exc:
+        _h3_image_error = exc
+    return _h3_image
+
+
+def _generate_h3_image(prompt, cfg, image=None, progress=None, cancel=None,
+                       mask=None, regions_list=None, ref_images=None, preview=None):
+    """MiniMax-H3-Image text-to-image / reference-image editing.
+
+    The target is one latent frame denoised on the checkpoint's PDD sigma grid
+    (6 steps, guidance 1). ``image`` and ``ref_images`` are encoded by the image
+    VAE and packed as reference rows; the model edits from them. A mask is not
+    part of the architecture and is ignored.
+    """
+    requested_width = int(cfg["width"])
+    requested_height = int(cfg["height"])
+    width = max(32, -(-requested_width // 32) * 32)
+    height = max(32, -(-requested_height // 32) * 32)
+    lh, lw = height // 16, width // 16
+
+    references = []
+    if image is not None:
+        references.append(image)
+    references.extend(item for item in (ref_images or []) if item is not None)
+    references = references[:16]
+
+    with _lock:
+        context = _h3_text_encode(
+            cfg.get("text") or paths.H3_IMAGE_DEFAULTS["text"], prompt, progress,
+            base=0.0, span=0.15, cancel=cancel,
+        )
+        _check(cancel)
+
+        base = _load_h3_image(
+            cfg.get("dit") or paths.H3_IMAGE_DEFAULTS["dit"],
+            cfg.get("vae"), _cfg_loras(cfg), progress, cfg.get("fp8", "auto"),
+            cancel,
+        )
+        if _h3_image_error is not None:
+            raise RuntimeError(f"MiniMax H3 Image load failed: {_h3_image_error}")
+        if base is None:
+            raise RuntimeError("MiniMax H3 Image load failed.")
+        dit, vae = base["dit"], base["vae"]
+        pdd_steps, pdd_sigmas = base["pdd_steps"], base["pdd_sigmas"]
+
+        context = context.to(DEVICE, DIT_DTYPE)
+        num_text_tokens = int(context.shape[0])
+
+        _stage(cancel, progress, 0.15, "encoding references")
+        ref_latents = [
+            _h3_image_ref_latent(vae, item, DEVICE) for item in references
+        ]
+        _check(cancel)
+        ref_shapes = [
+            (int(latent.shape[3]), int(latent.shape[4])) for latent in ref_latents
+        ]
+        raw_layout = h3_image_layout(num_text_tokens, lh, lw, ref_shapes)
+        layout = (
+            raw_layout[0].to(DEVICE), raw_layout[1].to(DEVICE),
+            raw_layout[2].to(DEVICE), raw_layout[3].to(DEVICE),
+            [index.to(DEVICE) for index in raw_layout[4]],
+        )
+
+        generator = torch.manual_seed(int(cfg["seed"]))
+        latent = torch.randn(1, 24, 1, lh, lw, generator=generator).to(DEVICE)
+
+        sched = MiniMaxH3Scheduler()
+        sched.set_timesteps(pdd_steps, device=DEVICE, sigmas=pdd_sigmas)
+        total = max(1, len(sched.timesteps))
+        emit = _make_preview(cfg, preview, key="h3", out_size=(width, height))
+
+        _report(progress, 0.15, "sampling", 0.0)
+        for index, timestep in enumerate(sched.timesteps):
+            _check(cancel)
+            sigma = float(1.0 - timestep)
+            velocity = dit.forward_image(
+                latent.to(DIT_DTYPE), context, layout, sigma, sched.sigmas,
+                pdd_sigmas, ref_latents=ref_latents, seed=int(cfg["seed"]),
+            )
+            latent = sched.step(velocity.float(), timestep, latent)
+            _report(progress, 0.15 + 0.7 * ((index + 1) / total),
+                    "sampling", (index + 1) / total)
+            if emit is not None:
+                emit(index, latent, total)
+            if cancel is not None and cancel.keep_requested:
+                break
+
+        _report(progress, 0.9, "decoding")
+        with torch.inference_mode():
+            pixels = vae.decode(latent.to(VAE_DTYPE))
+        out = pixels[0, :, 0].float().clamp(0.0, 1.0)[
+            :, :requested_height, :requested_width]
+        arr = (out.permute(1, 2, 0).cpu().numpy() * 255.0).round().astype("uint8")
+        pil = Image.fromarray(arr, "RGB")
+        _report(progress, 1.0, "done")
+        return pil
+
+
 def _load_fibo(source, progress=None, cancel=None):
     """Load and cache the Fibo 2.0 diffusers pipeline (see :mod:`engine.fibo`)."""
     global _fibo, _fibo_key, _fibo_error
@@ -2418,6 +2597,10 @@ def generate(prompt, config=None, image=None, progress=None, cancel=None, mask=N
             _reject_reference(family, reference)
             return _generate_h3(prompt, cfg, image, progress, cancel, mask,
                                 regions_list, preview)
+        if family == "h3_image":
+            _reject_reference(family, reference)
+            return _generate_h3_image(prompt, cfg, image, progress, cancel, mask,
+                                      regions_list, ref_images, preview)
         if family == "fibo":
             _reject_reference(family, reference)
             return _generate_fibo(prompt, cfg, image, progress, cancel, mask,
@@ -2532,6 +2715,14 @@ def _preload_family(family, cfg, progress, cancel=None):
         if _h3_error is not None:
             raise RuntimeError(f"MiniMax H3 load failed: {_h3_error}")
         return "MiniMax H3"
+    if family == "h3_image":
+        _load_h3_image(
+            cfg.get("dit") or paths.H3_IMAGE_DEFAULTS["dit"],
+            cfg.get("vae"), _cfg_loras(cfg), progress, cfg.get("fp8", "auto"), cancel,
+        )
+        if _h3_image_error is not None:
+            raise RuntimeError(f"MiniMax H3 Image load failed: {_h3_image_error}")
+        return "MiniMax H3 Image"
     if family == "fibo":
         _load_fibo(cfg.get("model") or paths.FIBO_DEFAULTS["model"], progress, cancel)
         if _fibo_error is not None:

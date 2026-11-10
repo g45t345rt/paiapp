@@ -61,7 +61,7 @@ Apache-2.0 / MIT projects. Keep the original notices when redistributing.
 | `engine/krea2.py` | Krea 2 / HF Diffusers via `comfy/ldm/krea2` | Apache-2.0 |
 | `engine/qwen_image.py` | Qwen-Image via ComfyUI / HF Diffusers | Apache-2.0 |
 | `engine/qwen_vae21.py` | Alibaba Wan Team VAE via `comfy/ldm/wan/vae2_2` | Apache-2.0 |
-| `engine/h3_layout.py`, `engine/h3_sampler.py`, `engine/h3_vae.py` | Diffusers MiniMax H3 | Apache-2.0 |
+| `engine/h3.py`, `engine/h3_layout.py`, `engine/h3_sampler.py`, `engine/h3_vae.py` | MiniMax H3 / H3-Image via ComfyUI + Diffusers | Apache-2.0 |
 | `engine/moss_image.py`, `engine/moss_text.py`, `engine/qwen_text.py` | HF Diffusers reference implementations | Apache-2.0 |
 | `engine/gguf.py` | `city96/ComfyUI-GGUF` | Apache-2.0 |
 | `engine/gguf.py` (legacy/quants) | `WeeLLM` `io/ggufs/gguf_dequant.py` | MIT |
