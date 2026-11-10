@@ -1917,7 +1917,22 @@ class PaintApp:
             view.clear_layout()
             view.set_source_providers(self._content_bounds, self._region_composite)
             view.set_symmetry(self.symmetry_guide())
-        view.render()
+        # A live brush/eraser/mask stroke paints between mouse moves; hand the
+        # view the document rectangle it changed so only that is recomposited
+        # instead of the whole viewport (the large-canvas paint lag). The
+        # exploded view lays layers out in a grid that the patch cannot model, so
+        # it is not patched; the off-canvas preview is, because its provider
+        # applies the same off-canvas veil to the patched rectangle, so the
+        # patched frame still matches a full overview render.
+        live = False
+        dirty = None
+        drawing = getattr(self, "drawing", None)
+        if (drawing is not None and getattr(drawing, "_stroke", None) is not None
+                and layout is None):
+            live = True
+            dirty = getattr(drawing, "_paint_dirty", None)
+            drawing._paint_dirty = None
+        view.render(live=live, dirty=dirty)
 
     def _content_bounds(self):
         """Full content bounds ``(origin, size)`` for the view's scroll region."""
@@ -1933,7 +1948,7 @@ class PaintApp:
             return (left, top), (right - left, bottom - top)
         return (0, 0), self.current.size
 
-    def _region_composite(self, region, scale=1.0):
+    def _region_composite(self, region, scale=1.0, draft=False, anchor=None):
         """Flatten one document ``region`` for viewport-only rendering.
 
         Passes the active layer index so the canvas can reuse its cached
@@ -1941,14 +1956,19 @@ class PaintApp:
         :meth:`Canvas._flatten_cached`, shared by both composite paths). ``scale``
         is the requested pixels per document pixel; a zoomed-out view passes a
         value below 1 so the flatten is bounded by the viewport's pixels.
+        ``draft``/``anchor`` drive the live stroke patch (see
+        :meth:`CanvasView._live_composite`).
         """
         if self.current is None:
             return None
         if self.show_offscreen:
             return self.current.composite_overview(
-                self.offscreen_opacity, region, scale, self.active
+                self.offscreen_opacity, region, scale, self.active,
+                draft=draft, anchor=anchor,
             )
-        return self.current.composite_region(region, self.active, scale)
+        return self.current.composite_region(
+            region, self.active, scale, draft=draft, anchor=anchor
+        )
 
     def toggle_offscreen(self):
         """Show or hide layer content that lies outside the canvas."""
@@ -1997,8 +2017,13 @@ class PaintApp:
             return (0, 0), (0, 0)
         return layout.origin, layout.size
 
-    def _exploded_region_composite(self, region, scale=1.0):
-        """Flatten one exploded-layout ``region`` for viewport-only rendering."""
+    def _exploded_region_composite(self, region, scale=1.0, draft=False,
+                                   anchor=None):
+        """Flatten one exploded-layout ``region`` for viewport-only rendering.
+
+        ``draft``/``anchor`` are accepted so the provider matches the view's
+        call shape; the exploded grid is not patched, so they are ignored.
+        """
         layout = self._ensure_exploded_layout()
         if layout is None or self.current is None:
             return None

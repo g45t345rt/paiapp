@@ -18,6 +18,12 @@ import numpy as np
 
 from PIL import Image, ImageChops, ImageDraw, ImageFilter
 
+
+def _union_rect(a, b):
+    """The bounding ``(x0, y0, x1, y1)`` rectangle covering ``a`` and ``b``."""
+    return (min(a[0], b[0]), min(a[1], b[1]), max(a[2], b[2]), max(a[3], b[3]))
+
+
 # RGB blend operators available for the brush and the colour eraser. ``normal``
 # is handled separately because it needs no channel maths.
 BLEND_MODES = {
@@ -770,6 +776,12 @@ class Stroke:
         # Union of the rectangles stamped since the last commit, so commit can
         # rebuild just that region. ``None`` means nothing changed.
         self._dirty = None
+        # The rectangles the stroke has touched since the live preview last read
+        # them, in the layer's own pixel space. The view uses it to recomposite
+        # only the new dabs instead of the whole viewport (see
+        # ``CanvasView._live_composite``); reading clears it so a long stroke does
+        # not grow the patch back to its whole bounding box.
+        self._render_dirty = None
 
     def begin(self, x, y):
         self.last = (x, y)
@@ -1114,6 +1126,7 @@ class Stroke:
         self.layer.begin_write().alpha_composite(patch, (cx, cy))
         # The picked-up colour is what the next dab drags forward.
         buf.alpha_composite(patch, (cx, cy))
+        self._note_dirty((cx, cy, cx + size, cy + size))
         self.layer.invalidate_filters()
 
     def _stamp(self, x, y, angle=0.0):
@@ -1167,8 +1180,20 @@ class Stroke:
             return
         self._commit_rect(rect)
 
+    def _note_dirty(self, rect):
+        """Union ``rect`` (layer pixels) into the pending render dirty box."""
+        self._render_dirty = (rect if self._render_dirty is None
+                              else _union_rect(self._render_dirty, rect))
+
+    def take_render_dirty(self):
+        """The rectangle touched since the last read, then clear it."""
+        rect = self._render_dirty
+        self._render_dirty = None
+        return rect
+
     def _commit_rect(self, rect):
         """Recomposite ``rect`` from the stroke snapshot through the coverage."""
+        self._note_dirty(rect)
         cov = self.coverage.crop(rect)
         if self._grain_on and self.grain_mode == "canvas":
             cov = self._grain_coverage(cov, rect)

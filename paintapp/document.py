@@ -188,7 +188,8 @@ def _draft_spec(spec):
     return draft
 
 
-def _paste_layer(base, layer, left, top, clip=None, scale=1.0, offset=None):
+def _paste_layer(base, layer, left, top, clip=None, scale=1.0, offset=None,
+                 anchor=None):
     """Alpha-composite one layer into ``base``, whose top-left is document
     ``(left, top)``, cropping the layer to the overlap first.
 
@@ -202,6 +203,12 @@ def _paste_layer(base, layer, left, top, clip=None, scale=1.0, offset=None):
     before compositing, so the work tracks the viewport's pixels rather than the
     document rectangle it covers.
 
+    ``anchor`` is an optional document ``(x, y)`` whose scaled position is the
+    rounding grid the layer is placed on; it defaults to the buffer's own
+    ``(left, top)``. Passing a shared anchor lets a sub-region composited on its
+    own (the live stroke patch, see ``CanvasView._live_composite``) land on
+    exactly the same pixels as the full-region composite.
+
     ``clip`` is an optional region-sized ``L`` image (the clip base's alpha);
     where it is given the layer's own alpha is multiplied by it, so the layer
     only shows through the base's opaque pixels.
@@ -211,6 +218,7 @@ def _paste_layer(base, layer, left, top, clip=None, scale=1.0, offset=None):
     layout position here so the same compositing code lays a layer out in a cell
     without changing the document.
     """
+    ax, ay = (left, top) if anchor is None else anchor
     ox, oy = offset if offset is not None else layer.offset
     lw, lh = layer.size
     region_w = base.width / scale
@@ -233,10 +241,34 @@ def _paste_layer(base, layer, left, top, clip=None, scale=1.0, offset=None):
     # re-multiplied at full size on every dab. ``ix0``/``iy0`` are already
     # relative to the region's top-left.
     sub = layer.composited_region(box)
-    dest = (int(round(ix0 * scale)), int(round(iy0 * scale)))
+    # A fully transparent overlap contributes nothing, so skip the downscale and
+    # the blend below rather than resampling full-size transparent pixels. A new,
+    # unpainted layer is blank, and at low zoom that wasted resize dominated the
+    # zoomed-out repaint. ``getbbox`` on an alpha image bounds the visible pixels
+    # (transparent pixels are ignored whatever their RGB), and it exits as soon as
+    # it meets an opaque pixel, so a content layer pays almost nothing while a
+    # blank one only pays a single scan. The band check keeps a mode without an
+    # alpha channel (an opaque RGB layer) from being mistaken for blank.
+    if "A" in sub.getbands() and sub.getbbox() is None:
+        return
+    if anchor is None:
+        dest = (int(round(ix0 * scale)), int(round(iy0 * scale)))
+    else:
+        dest = (
+            int(round((left + ix0 - ax) * scale)) - int(round((left - ax) * scale)),
+            int(round((top + iy0 - ay) * scale)) - int(round((top - ay) * scale)),
+        )
     if scale != 1.0:
-        width = max(1, int(round(sub.width * scale)))
-        height = max(1, int(round(sub.height * scale)))
+        if anchor is None:
+            width = max(1, int(round(sub.width * scale)))
+            height = max(1, int(round(sub.height * scale)))
+        else:
+            # Size the resample to the anchored grid so the patch's pixels line
+            # up with the ones the frame already drew (and the base's size).
+            width = max(1, int(round((left + ix1 - ax) * scale))
+                        - int(round((left + ix0 - ax) * scale)))
+            height = max(1, int(round((top + iy1 - ay) * scale))
+                         - int(round((top + iy0 - ay) * scale)))
         sub = sub.resize((width, height), Image.BOX)
     # The overlay must be RGBA to composite: a layer's own image can be a
     # non-alpha mode (e.g. an RGB result stored by a tool), and PIL's
@@ -1788,7 +1820,7 @@ class Canvas:
             units.append(("group", group, members))
         return units
 
-    def _flatten(self, layers, region, plain=False, scale=1.0):
+    def _flatten(self, layers, region, plain=False, scale=1.0, anchor=None):
         """Composite ``layers`` over ``region`` into a straight-alpha RGBA image.
 
         This is the document-level flatten: it honours layer groups as units
@@ -1798,15 +1830,27 @@ class Canvas:
         into a group's members. ``scale`` is the pixels-per-document-pixel of the
         returned buffer; a zoomed-out view passes ``scale < 1`` so the flatten is
         bounded by the viewport's pixels.
+
+        ``anchor`` is the document ``(x, y)`` whose scaled position is pixel
+        ``(0, 0)`` of a shared rounding grid; it defaults to the region's own
+        top-left. A live stroke recomposites a small dirty rectangle of an
+        already-rendered frame and passes that frame's anchor so the patch lands
+        on exactly the pixels the full-region composite would have produced.
         """
         left, top, right, bottom = (
             int(region[0]), int(region[1]), int(region[2]), int(region[3])
         )
         width = max(0, right - left)
         height = max(0, bottom - top)
+        has_anchor = anchor is not None
+        ax, ay = (left, top) if anchor is None else anchor
+        paste_anchor = (ax, ay) if has_anchor else None
+        bx0 = int(round((left - ax) * scale))
+        by0 = int(round((top - ay) * scale))
+        bx1 = int(round((right - ax) * scale))
+        by1 = int(round((bottom - ay) * scale))
         base = Image.new(
-            "RGBA", (int(round(width * scale)), int(round(height * scale))),
-            (0, 0, 0, 0),
+            "RGBA", (max(0, bx1 - bx0), max(0, by1 - by0)), (0, 0, 0, 0)
         )
         # Resolve each clipped layer's clip base: the nearest layer below it
         # that is not itself clipped. A clipped layer with no such base (or a
@@ -1828,9 +1872,10 @@ class Canvas:
                     if clip_base is None or not clip_base.visible:
                         continue
                     clip = self._layer_alpha_region(
-                        clip_base, left, top, width, height, scale
+                        clip_base, left, top, width, height, scale, paste_anchor
                     )
-                _paste_layer(base, unit, left, top, clip, scale)
+                _paste_layer(base, unit, left, top, clip, scale,
+                             anchor=paste_anchor)
             else:
                 if unit.filters:
                     # A group filter acts on the members' combined pixels, so
@@ -1844,29 +1889,34 @@ class Canvas:
                     sub = filters.apply_chain(sub, unit.filters)
                     if scale != 1.0:
                         sub = sub.resize(
-                            (max(1, int(round(width * scale))),
-                             max(1, int(round(height * scale)))),
-                            Image.BOX,
+                            (max(1, bx1 - bx0), max(1, by1 - by0)), Image.BOX
                         )
                 else:
                     sub = self._flatten(
-                        members, (left, top, right, bottom), plain=True, scale=scale
+                        members, (left, top, right, bottom), plain=True,
+                        scale=scale, anchor=paste_anchor,
                     )
                 if unit.opacity < 1.0:
                     sub = _with_opacity(sub, unit.opacity)
-                base.alpha_composite(sub)
+                base.alpha_composite(sub, dest=(0, 0))
         return base
 
-    def _layer_alpha_region(self, layer, left, top, width, height, scale=1.0):
+    def _layer_alpha_region(self, layer, left, top, width, height, scale=1.0,
+                            anchor=None):
         """A region-sized ``L`` image of ``layer``'s alpha at its own offset."""
         image = layer.composited_image()
         ox, oy = layer.offset
         box = (left - ox, top - oy, left - ox + width, top - oy + height)
         alpha = image.crop(box).getchannel("A")
         if scale != 1.0:
+            ax, ay = (left, top) if anchor is None else anchor
             alpha = alpha.resize(
-                (max(1, int(round(width * scale))),
-                 max(1, int(round(height * scale)))),
+                (
+                    max(1, int(round((left + width - ax) * scale))
+                        - int(round((left - ax) * scale))),
+                    max(1, int(round((top + height - ay) * scale))
+                        - int(round((top - ay) * scale))),
+                ),
                 Image.BOX,
             )
         return alpha
@@ -1896,7 +1946,7 @@ class Canvas:
         return (left, top, right, bottom)
 
     def composite_overview(self, offscreen_opacity=0.35, region=None, scale=1.0,
-                           active_index=None):
+                           active_index=None, draft=False, anchor=None):
         """Flatten visible layers over a buffer covering all off-canvas content.
 
         Returns ``(image, origin)`` where ``origin`` is the document coordinate
@@ -1932,9 +1982,13 @@ class Canvas:
             bottom = min(content[3], rb)
             if right <= left or bottom <= top:
                 return Image.new("RGBA", (0, 0), (0, 0, 0, 0)), (rl, rt)
-        base = self._flatten_cached(
-            (left, top, right, bottom), active_index, scale
-        )
+        if draft:
+            base = self._flatten(self.layers, (left, top, right, bottom),
+                                 scale=scale, anchor=anchor)
+        else:
+            base = self._flatten_cached(
+                (left, top, right, bottom), active_index, scale
+            )
         if offscreen_opacity < 1.0 and (left < 0 or top < 0
                                         or right > self.width
                                         or bottom > self.height):
@@ -1973,7 +2027,8 @@ class Canvas:
             _paste_layer(base, layer, left, top)
         return base
 
-    def composite_region(self, region, active_index=None, scale=1.0):
+    def composite_region(self, region, active_index=None, scale=1.0,
+                         draft=False, anchor=None):
         """Flatten visible layers over the part of ``region`` inside the canvas.
 
         Returns ``(image, origin)`` for the view's viewport-only rendering; the
@@ -1986,7 +2041,12 @@ class Canvas:
         When ``active_index`` is given and the stack has no groups or clipped
         layers, the layers below and above the active one are cached and reused,
         so a stroke (which only changes the active layer) recomposites a single
-        layer over the cached backdrop rather than every layer.
+        layer over the cached backdrop rather than every layer. ``draft`` asks for
+        the direct ``_flatten`` (skipping that cache and forcing the per-layer
+        ``scale`` path) which the live stroke patch uses so a small dirty
+        rectangle recomposited on its own lines up with the frame already on
+        screen; ``anchor`` is that frame's rounding grid (see
+        :meth:`_flatten`).
         """
         rl, rt, rr, rb = (int(region[0]), int(region[1]),
                           int(region[2]), int(region[3]))
@@ -2000,6 +2060,11 @@ class Canvas:
             # zoom can dwarf the canvas (and trip Pillow's bomb guard downstream).
             return Image.new("RGBA", (0, 0), (0, 0, 0, 0)), (rl, rt)
         bounds = (left, top, right, bottom)
+        if draft:
+            return (
+                self._flatten(self.layers, bounds, scale=scale, anchor=anchor),
+                (left, top),
+            )
         return self._flatten_cached(bounds, active_index, scale), (left, top)
 
     def composite_layout(self, layout, region, scale=1.0):
@@ -2088,6 +2153,14 @@ class Canvas:
         rl, rt, rr, rb = (
             int(bounds[0]), int(bounds[1]), int(bounds[2]), int(bounds[3])
         )
+        if scale != 1.0:
+            # The document-anchored backdrop cache composites at full resolution
+            # and resamples once, which costs the whole document rectangle at a
+            # zoomed-out scale. A live stroke patches a small dirty rectangle of
+            # the frame already on screen, so the frame and every patch must use
+            # the same per-layer ``scale`` path (``_flatten``) to line up exactly;
+            # the cache is only worth its content-sized buffers at ``scale == 1``.
+            return self._flatten(self.layers, bounds, scale=scale)
         cacheable = (
             active_index is not None
             and 0 <= active_index < len(self.layers)

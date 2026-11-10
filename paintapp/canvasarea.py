@@ -1234,6 +1234,9 @@ class CanvasView(tk.Canvas):
         # supplies the full content bounds for the scroll region.
         self._content_provider = None
         self._region_provider = None
+        # The frame cached for a live stroke: a display composite of the viewport
+        # that a moving brush patches in place (see :meth:`_live_composite`).
+        self._live_draft = None
         self._content_origin = (0, 0)
         self._content_size = (doc.width, doc.height)
         self._render_deferred = False
@@ -1486,8 +1489,16 @@ class CanvasView(tk.Canvas):
         return (0, 0, self.doc.width, self.doc.height)
 
     # ------------------------------------------------------------------ render
-    def render(self, composite=None, origin=None, top_left=None, pad=0):
+    def render(self, composite=None, origin=None, top_left=None, pad=0,
+               live=False, dirty=None):
         self._rendering = True
+        # A live stroke (``live``) hands over the document rectangle the brush
+        # just changed (``dirty``); the frame already on screen is patched over
+        # that rectangle instead of being re-flattened whole, so painting a large
+        # canvas costs the dab rather than the document (see :meth:`_live_composite`).
+        if not live or self.transformed or self._layout is not None \
+                or composite is not None:
+            self._live_draft = None
         # Render the visible viewport (plus ``pad`` device pixels of margin, so
         # a pan within the margin needs no re-raster). ``top_left`` is the
         # document pixel that should sit at the viewport's top-left; it defaults
@@ -1537,7 +1548,12 @@ class CanvasView(tk.Canvas):
                     math.ceil(window[0] + render_size[0] / self.zoom),
                     math.ceil(window[1] + render_size[1] / self.zoom),
                 )
-                composite, origin = self._flatten(region, source_scale)
+                if live:
+                    composite, origin = self._live_composite(
+                        region, source_scale, dirty, render_size
+                    )
+                else:
+                    composite, origin = self._flatten(region, source_scale)
             if origin is None:
                 origin = (0, 0)
             self._source = composite
@@ -1603,6 +1619,105 @@ class CanvasView(tk.Canvas):
         self._rendering = False
         self._pending_anchor = None
         self._rendered_view_size = (self.winfo_width(), self.winfo_height())
+
+    def _live_composite(self, region, scale, dirty, render_size):
+        """The composite for a live stroke, patched over its dirty rectangle.
+
+        The first live frame flattens the viewport once (the same cost as a
+        normal repaint) and is kept. Every later frame recomposites just the
+        document rectangle the brush touched since and pastes it into a copy of
+        that frame, so a fast stroke on a large canvas costs the dab's pixels
+        instead of the whole viewport. At 100% zoom the patch is pixel-identical
+        to a full re-flatten; when zoomed out the per-layer resample makes the
+        patch a hair off at its edge, so it stands in as a draft and the release
+        repaints the frame whole.
+
+        A frame is only reused while the camera, zoom and provider are unchanged;
+        anything else (a pan, a zoom, a layer change) rebuilds it. When the stack
+        has a group, a clip or a filtered active layer - none of which the
+        per-pixel patch models exactly - the frame is re-flattened each time,
+        which is still correct (just the old cost).
+        """
+        frame = self._live_draft
+        key = (scale, region, tuple(self._frame_size), tuple(render_size))
+        provider = self._region_provider
+        # Compare providers by value, not identity: ``PaintApp.render`` installs
+        # a fresh ``self._region_composite`` bound method on every frame, and a
+        # bound method is a new object on each attribute access (``a.m is a.m``
+        # is False), so identity would discard the cached frame on every paint
+        # event and re-flatten the whole viewport - the large-canvas paint lag.
+        # Two bound methods of the same instance and function compare equal, while
+        # a switch to the exploded view's provider does not, so equality reuses
+        # the frame only while the same compositor is in effect.
+        if (frame is None or frame["key"] != key
+                or frame["provider"] != provider or frame.get("stale")):
+            composite, origin = self._flatten(region, scale)
+            frame = {
+                "key": key,
+                "provider": provider,
+                "source": composite,
+                "origin": origin,
+                "anchor": origin,
+                "stale": not self._patch_supported(),
+            }
+            self._live_draft = frame
+            return composite, origin
+        if dirty is None or frame["stale"]:
+            return frame["source"], frame["origin"]
+        source = frame["source"]
+        origin = frame["origin"]
+        if source.width <= 0 or source.height <= 0:
+            return source, origin
+        dl, dt, dr, db = (int(dirty[0]), int(dirty[1]),
+                          int(dirty[2]), int(dirty[3]))
+        # Clamp the dirty rectangle to the frame's document extent.
+        fl, ft = origin
+        fr = fl + source.width / scale
+        fb = ft + source.height / scale
+        dl = max(dl, fl)
+        dt = max(dt, ft)
+        dr = min(dr, fr)
+        db = min(db, fb)
+        if dl >= dr or dt >= db:
+            return source, origin
+        sub, sub_origin = self._flatten(
+            (dl, dt, dr, db), scale, draft=True, anchor=frame["anchor"]
+        )
+        if sub.width <= 0 or sub.height <= 0:
+            return source, origin
+        dx = int(round((sub_origin[0] - origin[0]) * scale))
+        dy = int(round((sub_origin[1] - origin[1]) * scale))
+        patched = source.copy()
+        patched.paste(sub, (dx, dy))
+        frame["source"] = patched
+        self._source = patched
+        return patched, origin
+
+    def _patch_supported(self):
+        """True when the live stroke may patch the frame instead of re-flattening.
+
+        Groups (a group filter reads neighbouring pixels) and clipped layers are
+        handled by :meth:`Canvas._flatten`'s specialised paths, and a filtered
+        active layer bleeds past the dab, so none of them can be patched from a
+        small rectangle. A zoomed-out frame also flattens each layer with its own
+        resample of a cropped region, so a patched rectangle can differ from a
+        full re-flatten by a hair at its edge; the live patch is therefore a
+        draft at ``scale < 1`` and the release repaints the frame whole.
+        """
+        doc = self.doc
+        if doc is None or self._layout is not None:
+            return False
+        layers = getattr(doc, "layers", None)
+        if not layers:
+            return False
+        if any(getattr(layer, "group", None) is not None for layer in layers):
+            return False
+        if any(getattr(layer, "clip", False) for layer in layers):
+            return False
+        active = getattr(doc, "active", 0)
+        if 0 <= active < len(layers) and layers[active].filters:
+            return False
+        return True
 
     def _place_base(self, cx, cy):
         """Create or re-point the base image item at canvas ``(cx, cy)`` (NW)."""
@@ -1726,15 +1841,16 @@ class CanvasView(tk.Canvas):
             return self._content_provider()
         return (0, 0), (self.doc.width, self.doc.height)
 
-    def _flatten(self, region, scale=1.0):
+    def _flatten(self, region, scale=1.0, draft=False, anchor=None):
         """Flatten ``region`` (document pixels) via the app's provider.
 
-        ``scale`` is the requested pixels per document pixel. Falls back to a
-        full-document composite when no provider is installed, so a bare view
-        (e.g. in tests) still renders.
+        ``scale`` is the requested pixels per document pixel. ``draft``/``anchor``
+        are forwarded to the provider for the live stroke patch (see
+        :meth:`_live_composite`). Falls back to a full-document composite when no
+        provider is installed, so a bare view (e.g. in tests) still renders.
         """
         if self._region_provider is not None:
-            return self._region_provider(region, scale)
+            return self._region_provider(region, scale, draft=draft, anchor=anchor)
         return self.doc.composite_transparent(), (0, 0)
 
     def _color_managed(self, image):

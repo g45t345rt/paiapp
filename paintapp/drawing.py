@@ -3699,6 +3699,10 @@ class DrawingController:
         # pairs (see ``symmetry``); the first entry is the identity mapping, so a
         # stroke without a guide is just this one-element list.
         self._strokes = []
+        # The document rectangle the active stroke changed since the last render,
+        # handed to the view so it patches the frame instead of re-flattening the
+        # whole viewport (see ``CanvasView._live_composite``).
+        self._paint_dirty = None
         self._smooth_x = None
         self._smooth_y = None
         # Stabiliser state: the last raw pointer sample (for the velocity style)
@@ -4470,6 +4474,7 @@ class DrawingController:
         tools = self.app.tools
         mode = self._stroke_mode()
         self._begin_stroke()
+        self._paint_dirty = None
         self._smooth_x = self._smooth_y = None
         self._raw_x = self._raw_y = None
         self._stable_history = []
@@ -4489,6 +4494,7 @@ class DrawingController:
         for stroke, _mapping, (px, py) in self._strokes:
             stroke.begin(px - ox, py - oy)
         self._stroke = self._strokes[0][0]
+        self._accumulate_paint_dirty(layer)
         self._smooth_x, self._smooth_y = x, y
         self._paint_time = None
         self._paint_pos = (x, y)
@@ -4669,6 +4675,37 @@ class DrawingController:
         for stroke, mapping, _start in self._strokes:
             px, py = mapping(sx, sy)
             stroke.move_to(px - ox, py - oy, speed=speed)
+        self._accumulate_paint_dirty(layer)
+
+    def _accumulate_paint_dirty(self, layer):
+        """Fold the new dabs' document rectangle into the pending live patch."""
+        rect = self._paint_dirty_rect(layer)
+        if rect is None:
+            return
+        self._paint_dirty = (
+            rect if self._paint_dirty is None
+            else brush._union_rect(self._paint_dirty, rect)
+        )
+
+    def _paint_dirty_rect(self, layer):
+        """The document rectangle the active strokes touched since the last read.
+
+        Each stroke tracks the box its dabs have touched since the preview last
+        read it (see ``brush.Stroke.take_render_dirty``); reading clears it, so a
+        live frame patches only the new dabs rather than the whole stroke. The
+        boxes are shifted by the layer's offset into document coordinates for the
+        view's live patch.
+        """
+        bounds = None
+        for stroke, _mapping, _start in self._strokes:
+            rect = stroke.take_render_dirty()
+            if rect is None:
+                continue
+            bounds = rect if bounds is None else brush._union_rect(bounds, rect)
+        if bounds is None:
+            return None
+        ox, oy = layer.offset
+        return (bounds[0] + ox, bounds[1] + oy, bounds[2] + ox, bounds[3] + oy)
 
     # ------------------------------------------------------------------- fill
     def fill_at(self, x, y):
