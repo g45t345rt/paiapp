@@ -253,9 +253,11 @@ def download_file(repo, filename, dest_dir, name=None, progress=None, cancel=Non
     The bytes are written to ``<name>.part`` and renamed on success, so an
     interrupted or cancelled download never leaves a half file where the engine
     would scan it. ``name`` overrides the on-disk file name (a rename); without
-    it the repo file's own base name is used. ``progress(frac, label)`` is called
-    as data arrives (``frac`` is 0..1, or 0.0 when the server gives no length) and
-    ``cancel`` is a :class:`~engine.cancel.CancelToken` checked between chunks.
+    it the repo file's own base name is used. ``progress(frac, label, read,
+    total)`` is called as data arrives (``frac`` is 0..1, or 0.0 when the server
+    gives no length; ``read`` and ``total`` are byte counts, ``total`` 0 when
+    unknown) and ``cancel`` is a :class:`~engine.cancel.CancelToken` checked
+    between chunks.
     """
     if cancel is None:
         cancel = CancelToken()
@@ -277,9 +279,9 @@ def download_file(repo, filename, dest_dir, name=None, progress=None, cancel=Non
                     handle.write(chunk)
                     read += len(chunk)
                     if progress is not None:
-                        progress(read / total if total else 0.0, name)
+                        progress(read / total if total else 0.0, name, read, total)
         if progress is not None:
-            progress(1.0, name)
+            progress(1.0, name, read, total)
         os.replace(part, target)
     except Cancelled:
         _discard(part)

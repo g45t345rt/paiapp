@@ -27,6 +27,7 @@ back to Tk through a small ``after`` poller, so nothing blocks the UI.
 import os
 import queue
 import threading
+import time
 import tkinter as tk
 from tkinter import filedialog, ttk
 
@@ -755,17 +756,36 @@ class _DownloadWindow:
         return self.saved
 
     def _work(self):
-        total = len(self.jobs)
+        job_count = len(self.jobs)
+        speed = {"time": None, "read": 0, "value": 0.0}
 
-        def progress(frac, label):
-            self._queue.put(("progress", frac, label))
+        def progress(frac, label, read=0, total=0, index=0, rate=0.0):
+            self._queue.put(("progress", frac, label, read, total, index, rate))
 
         try:
             for index, (item, name) in enumerate(self.jobs):
                 self._cancel.throw_if_cancelled()
+                speed.update(time=None, read=0, value=0.0)
 
-                def on_file(frac, label, base=index):
-                    progress((base + frac) / total, label)
+                def on_file(frac, label, read=0, total=0, base=index):
+                    now = time.monotonic()
+                    if speed["time"] is None:
+                        speed["time"] = now
+                        speed["read"] = read
+                    else:
+                        elapsed = now - speed["time"]
+                        if elapsed >= 0.2:
+                            instant = max(0.0, (read - speed["read"]) / elapsed)
+                            speed["value"] = (
+                                instant if not speed["value"]
+                                else speed["value"] * 0.6 + instant * 0.4
+                            )
+                            speed["time"] = now
+                            speed["read"] = read
+                    progress(
+                        (base + frac) / job_count, label, read, total, base,
+                        speed["value"],
+                    )
 
                 path = engine_hub.download_file(
                     self.repo, item["path"], self.dest_dir, name=name,
@@ -801,12 +821,20 @@ class _DownloadWindow:
                 break
             kind = message[0]
             if kind == "progress":
-                frac, label = message[1], message[2]
+                frac, label, read, size, index, rate = message[1:7]
+                if not size:
+                    item = self.jobs[index][0]
+                    size = item.get("size") or 0
                 self.bar.config(value=max(0.0, min(1.0, frac)) * 100)
                 self.name.config(text=label)
-                self.detail.config(
-                    text=f"{len(self.saved) + 1} of {len(self.jobs)}"
-                )
+                detail = f"{index + 1} of {len(self.jobs)}"
+                if size:
+                    detail += f"  \u00b7  {human_size(read)} / {human_size(size)}"
+                elif read:
+                    detail += f"  \u00b7  {human_size(read)}"
+                if rate:
+                    detail += f"  \u00b7  {human_size(rate)}/s"
+                self.detail.config(text=detail)
             elif kind == "done":
                 self._finish("Finished.")
                 return
