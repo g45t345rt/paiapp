@@ -236,6 +236,13 @@ class TransformGizmo:
         # (see :meth:`_gpu_textures`).
         self._gpu = None
         self._gpu_tried = False
+        # Interactive drag throttling state: the caller may skip the expensive
+        # per-event resample/overlay work (``apply=False``) while the pointer
+        # keeps moving, and paint overlays in a cheap non-antialiased *draft*
+        # while it does. Either leaves the committed frame stale, so a release
+        # lands the final, full-quality resample (see :meth:`finish`).
+        self._pending_apply = False
+        self._draft_used = False
 
     # -------------------------------------------------------------- lifecycle
     def begin(self, app, view):
@@ -299,6 +306,8 @@ class TransformGizmo:
 
     def clear(self):
         self.active = False
+        if self.layer is not None:
+            self.layer._transform_draft = False
         self.layer = None
         self.source = None
         self.source_mask = None
@@ -451,6 +460,11 @@ class TransformGizmo:
         self._start_matrix = None
         self._drag_image = None
         self._drag_mask = None
+        self._pending_apply = False
+        self._draft_used = False
+        if self.layer is not None:
+            # A draft frame's cheap overlay render must not outlive the drag.
+            self.layer._transform_draft = False
 
     # ------------------------------------------------------------------- gpu
     def _release_textures(self):
@@ -647,8 +661,16 @@ class TransformGizmo:
         elif handle in EDGES:
             self._pivot_local = self._center_local()
 
-    def update(self, x, y, uniform=False):
-        """Apply a drag to the transform and re-sample the layer. True if moved."""
+    def update(self, x, y, uniform=False, apply_pixels=True, draft=False):
+        """Apply a drag to the transform and re-sample the layer. True if moved.
+
+        ``apply_pixels=False`` skips the resample and overlay work for this event
+        while still updating :attr:`matrix` (so the gizmo frame follows the
+        pointer at full rate); the caller repaints less often during a drag and a
+        release lands the final frame. ``draft=True`` paints the overlays without
+        anti-aliasing, which is far cheaper over a large or scaled buffer; the
+        release restores it (see :meth:`finish`).
+        """
         if not self.active or self._handle is None:
             return False
         base = self._start_matrix
@@ -709,7 +731,14 @@ class TransformGizmo:
             else:
                 shear = about(shearing(0.0, (local[1] - pl[1]) / height), cx, cy)
             self.matrix = mul(base, shear)
-        self._apply_pixels()
+        if apply_pixels:
+            self._apply_pixels(draft=draft)
+            self._pending_apply = False
+            self._draft_used = draft
+        else:
+            # The matrix (and so the gizmo frame) is current, but the pixels are
+            # not: remember to land them on release.
+            self._pending_apply = True
         return True
 
     def finish(self):
@@ -718,6 +747,10 @@ class TransformGizmo:
         # have produced.
         if self._handle == "move" and self.active and not self._is_link:
             self._bake_move()
+        elif self.active and (self._pending_apply or self._draft_used):
+            # A throttled drag skipped its last resample, or painted a draft
+            # (non-antialiased overlays): land the exact, full-quality frame.
+            self._apply_pixels(draft=False)
         self._end_drag()
 
     @property
@@ -748,7 +781,7 @@ class TransformGizmo:
         self._apply_pixels()
         self.layer._content_delta = (0, 0)
 
-    def _apply_pixels(self):
+    def _apply_pixels(self, draft=False):
         """Re-sample the layer through :attr:`matrix`, into its own buffer.
 
         The GPU does the resample when it can (see :meth:`_gpu_textures`): the
@@ -773,6 +806,10 @@ class TransformGizmo:
         # session's original placement, so a path/vector/text/pose travels with
         # the transformed pixels instead of staying pinned to the page.
         self._apply_overlays(mul(self.matrix, invert(self._base_matrix)))
+        # Mark the layer so the *render* paints its overlays without the costly
+        # anti-aliased re-raster while the drag is live (see ``document``); a
+        # release resamples with ``draft=False`` and clears it again.
+        self.layer._transform_draft = draft
 
     def _resample_base(self):
         """Re-sample the base pixels and mask through :attr:`matrix`."""
@@ -881,7 +918,7 @@ class SelectionGizmo(TransformGizmo):
     def cancel_drag(self, app):
         self._end_drag()
 
-    def _apply_pixels(self):
+    def _apply_pixels(self, draft=False):
         # A selection has no layer pixels to resample; its mask and outline are
         # the transformed state, so there is nothing for the GPU path to do.
         if self.on_change is not None and self.source_selection is not None:

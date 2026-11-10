@@ -174,6 +174,20 @@ def _affine_bounds(matrix, size):
     return (min(xs), min(ys), max(xs), max(ys))
 
 
+def _draft_spec(spec):
+    """A shallow copy of ``spec`` with anti-aliasing off, for a drag preview.
+
+    The supersampled re-raster behind a stroke or path's anti-aliasing is what
+    makes re-drawing a document-space overlay over a large or scaled buffer
+    expensive. A live drag draws the copy instead (the original spec is left
+    untouched, so the committed frame - and the saved document - keep their
+    anti-aliasing setting).
+    """
+    draft = dict(spec)
+    draft["antialias"] = False
+    return draft
+
+
 def _paste_layer(base, layer, left, top, clip=None, scale=1.0, offset=None):
     """Alpha-composite one layer into ``base``, whose top-left is document
     ``(left, top)``, cropping the layer to the overlap first.
@@ -835,6 +849,12 @@ class Layer:
 
     def _composited_region_at(self, box, offset):
         """``composited_region`` for this layer's own content drawn at ``offset``."""
+        # A live transform drag flags the layer and takes the cheap draft path
+        # below; a committed render keeps this exact composition (a path's
+        # anti-aliasing scales with the render window, so drawing it into a
+        # smaller crop would change the pixels).
+        if getattr(self, "_transform_draft", False):
+            return self._composited_region_draft(box, offset)
         image = self.filtered_image()
         if self.texts:
             image = self._text_overlay(image, offset)
@@ -845,6 +865,42 @@ class Layer:
         if self.paths:
             image = self._path_overlay(image, offset)
         sub = image.crop(box)
+        if self.mask is not None:
+            sub.putalpha(
+                ImageChops.multiply(sub.getchannel("A"), self.mask.crop(box))
+            )
+        return sub
+
+    def _composited_region_draft(self, box, offset):
+        """The interactive-drag variant of :meth:`_composited_region_at`.
+
+        Overlays are drawn straight into the cropped region, without the costly
+        anti-aliased re-raster (``_draft_spec``) and without over-drawing the
+        layer's full - possibly scaled-up - buffer first. With anti-aliasing off
+        a path paints through ``ImageDraw``, which clips to the region (a
+        boundary pixel or two may differ from the committed render). The release
+        repaints it the full-quality way (see :meth:`_composited_region_at`).
+        """
+        sub = self.filtered_image().crop(box)
+        if sub.mode != "RGBA":
+            sub = sub.convert("RGBA")
+        # The crop shifts every overlay paste by its origin: an overlay that
+        # landed at ``point - offset`` in the full buffer lands at
+        # ``point - offset - box_origin`` in the crop, so add the origin back.
+        ox = offset[0] + box[0]
+        oy = offset[1] + box[1]
+        for spec in self.texts:
+            sub = textrender.paste(sub, spec, (ox, oy))
+        for spec in self.fills:
+            sub = vector.paste_fill(sub, _draft_spec(spec), (ox, oy))
+        for spec in self.strokes:
+            sub = vector.paste(sub, _draft_spec(spec), (ox, oy))
+        if self.poses:
+            poses.sync_scene(self.poses, self.pose_scene)
+            for spec in self.poses:
+                sub = poses.paste(sub, spec, (ox, oy))
+        for spec in self.paths:
+            sub = path.paste(sub, _draft_spec(spec), (ox, oy))
         if self.mask is not None:
             sub.putalpha(
                 ImageChops.multiply(sub.getchannel("A"), self.mask.crop(box))

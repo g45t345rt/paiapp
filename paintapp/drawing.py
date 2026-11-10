@@ -3677,6 +3677,11 @@ class DrawingController:
         self.gizmo = TransformGizmo()
         self.sel_gizmo = SelectionGizmo()
         self._transform_pushed = False
+        # Timestamp of the last transform drag frame, so a drag throttles the
+        # expensive resample/overlay repaint instead of doing it on every motion
+        # event; the gizmo frame still follows each event, and a release lands
+        # the final, full-quality frame (see ``_transform_drag``).
+        self._transform_render_at = 0.0
         self._sel_transform_dragged = False
         self._move_layers = []
         self._move_origin = None
@@ -9429,6 +9434,15 @@ class DrawingController:
         "move": "fleur",
     }
 
+    # Minimum seconds between transform drag repaints. A scale/rotate drag
+    # resamples the layer and re-rasterises its document-space overlays, which on
+    # a large or scaled layer costs far more than one motion event's interval, so
+    # doing it per event leaves the drag laggy and unresponsive. The gizmo frame
+    # still tracks every event; only the expensive pixel/overlay work is rate
+    # limited, and a release paints the exact final frame (see
+    # ``TransformGizmo.finish``).
+    TRANSFORM_RENDER_INTERVAL = 0.05
+
     def _transform_ready(self):
         return self.gizmo.active and self.gizmo.layer is self.app.active_layer()
 
@@ -9542,6 +9556,9 @@ class DrawingController:
             return
         self.gizmo.start(handle, x, y)
         self._transform_pushed = False
+        # Paint the first drag frame at once rather than inheriting the previous
+        # session's throttle timestamp.
+        self._transform_render_at = 0.0
 
     def _transform_drag(self, event, x, y):
         if not self._transform_ready() or not self.gizmo.dragging:
@@ -9550,9 +9567,18 @@ class DrawingController:
             self.app._push_undo("Transform")
             self._transform_pushed = True
         uniform = bool(event.state & 0x1)
-        if self.gizmo.update(x, y, uniform):
+        # Moving the rotation origin touches no pixels, and the first event of
+        # any drag must paint immediately; otherwise rate-limit the resample and
+        # overlay work so a fast drag is not stalled by a frame it cannot keep
+        # up with. The gizmo frame is refreshed every event regardless.
+        pivot = self.gizmo.moving_pivot
+        now = time.monotonic()
+        apply = pivot or (now - self._transform_render_at >= self.TRANSFORM_RENDER_INTERVAL)
+        if self.gizmo.update(x, y, uniform, apply_pixels=apply, draft=True):
             event.widget.set_gizmo(self.gizmo.geometry())
-            self.app.render()
+            if apply:
+                self._transform_render_at = now
+                self.app.render()
 
     def _transform_release(self):
         if not self.gizmo.active:
