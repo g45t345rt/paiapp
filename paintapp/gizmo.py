@@ -39,6 +39,10 @@ import numpy as np
 from PIL import Image
 
 from . import gpuimage
+from . import path
+from . import poses
+from . import textrender
+from . import vector
 
 IDENTITY = (1.0, 0.0, 0.0, 1.0, 0.0, 0.0)
 
@@ -201,6 +205,14 @@ class TransformGizmo:
         self.source_mask = None
         self.canvas_size = (1, 1)
         self.matrix = IDENTITY
+        # The session's starting placement: the document-space delta of a drag is
+        # ``matrix . inverse(_base_matrix)``, which is what the live document-space
+        # overlays (paths, vector items, text, poses) are mapped through so they
+        # travel with the transformed pixels instead of staying pinned.
+        self._base_matrix = IDENTITY
+        # The overlays' geometry as captured at session start, so every drag can
+        # re-derive them from the original rather than accumulating error.
+        self._overlay_backup = None
         self._handle = None
         self._press = None
         self._press_local = None
@@ -260,10 +272,16 @@ class TransformGizmo:
                 layer.transform if layer.transform is not None else IDENTITY,
             )
             self.matrix = mul(content_to_doc, translation(box[0], box[1]))
+            self._overlay_backup = None
         else:
-            box = layer.image.getbbox()
+            # Document-space overlays (paths, vector items, text, poses) travel
+            # with a transform like they do with a move; capture their geometry
+            # now so every drag re-derives them from the original.
+            self._overlay_backup = self._capture_overlays(layer)
+            box = self._content_box(layer)
             if box is None:
                 self.layer = None
+                self._overlay_backup = None
                 return False
             self.source = layer.image.crop(box)
             self.source_mask = (
@@ -273,6 +291,7 @@ class TransformGizmo:
             ox, oy = layer.offset
             self.matrix = (1.0, 0.0, 0.0, 1.0,
                            float(box[0] + ox), float(box[1] + oy))
+        self._base_matrix = self.matrix
         self.rot_pivot_local = None
         self._end_drag()
         self.active = True
@@ -286,11 +305,120 @@ class TransformGizmo:
         self._is_link = False
         self._link_box = (0, 0, 0, 0)
         self._drag_transform = None
+        self._overlay_backup = None
+        self._base_matrix = IDENTITY
         self._release_textures()
         self._end_drag()
         if self.view is not None:
             self.view.set_gizmo(None)
         self.view = None
+
+    # -------------------------------------------------------------- overlays
+    def _capture_overlays(self, layer):
+        """Snapshot a layer's document-space overlay geometry, or ``None``.
+
+        A link's overlays belong to its master and are placed by the master's
+        render, so a link captures nothing.
+        """
+        if layer.is_link:
+            return None
+        backup = {}
+        if layer.paths:
+            backup["paths"] = [(spec, path.clone(spec)) for spec in layer.paths]
+        items = list(getattr(layer, "strokes", [])) + list(
+            getattr(layer, "fills", []))
+        if items:
+            backup["vector"] = [
+                (spec, vector.item_snapshot(spec)) for spec in items
+            ]
+        if layer.texts:
+            backup["texts"] = [(spec, dict(spec)) for spec in layer.texts]
+        scene = getattr(layer, "pose_scene", None)
+        if layer.poses and isinstance(scene, dict):
+            backup["poses"] = (scene, dict(scene))
+        return backup or None
+
+    def _content_box(self, layer):
+        """The layer's content bounds in its own pixel space, overlays included.
+
+        The base pixels' ink box alone would leave a vector/text/pose-only layer
+        with no frame (and clip an overlay that spills past the pixels), so the
+        union with every overlay's document bounds (shifted into buffer space)
+        frames the whole thing.
+        """
+        boxes = []
+        base = layer.image.getbbox()
+        if base is not None:
+            boxes.append(base)
+        ox, oy = layer.offset
+
+        def add(box):
+            if not box:
+                return
+            left, top, right, bottom = box
+            if right > left and bottom > top:
+                boxes.append((left - ox, top - oy, right - ox, bottom - oy))
+
+        for spec in layer.paths:
+            add(path.bounds(spec))
+        for spec in getattr(layer, "strokes", []):
+            add(vector.bounds(spec))
+        for spec in getattr(layer, "fills", []):
+            add(vector.fill_bounds(spec))
+        for spec in layer.texts:
+            points = textrender.corners(spec)
+            if points:
+                xs = [point[0] for point in points]
+                ys = [point[1] for point in points]
+                add((min(xs), min(ys), max(xs), max(ys)))
+        if layer.poses:
+            scene = getattr(layer, "pose_scene", None)
+            if isinstance(scene, dict):
+                poses.sync_scene(layer.poses, scene)
+            for spec in layer.poses:
+                add(poses.bounds(spec))
+        if not boxes:
+            return None
+        return (
+            min(box[0] for box in boxes),
+            min(box[1] for box in boxes),
+            max(box[2] for box in boxes),
+            max(box[3] for box in boxes),
+        )
+
+    def _apply_overlays(self, delta):
+        """Map every captured overlay through the document-space ``delta``.
+
+        Each spec is restored from its session-start snapshot first, so repeated
+        drag events re-derive it from the original rather than accumulating the
+        transform (and a release leaves exactly the last dragged state).
+        """
+        backup = self._overlay_backup
+        if not backup or self.layer is None:
+            return
+        layer = self.layer
+        if "paths" in backup:
+            for spec, snapshot in backup["paths"]:
+                path.apply_geometry(spec, path.to_path(snapshot))
+                path.transform(spec, delta)
+            layer.invalidate_paths()
+        if "vector" in backup:
+            for spec, snapshot in backup["vector"]:
+                vector.item_restore(spec, snapshot)
+                vector.item_transform(spec, delta)
+            layer.invalidate_vectors()
+        if "texts" in backup:
+            for spec, snapshot in backup["texts"]:
+                spec.clear()
+                spec.update(snapshot)
+                textrender.transform(spec, delta)
+            layer.invalidate_texts()
+        if "poses" in backup:
+            scene, snapshot = backup["poses"]
+            scene.clear()
+            scene.update(snapshot)
+            poses.transform_scene(scene, delta)
+            layer.invalidate_poses()
 
     def cancel_drag(self, app):
         """Revert the in-progress drag and drop its undo entry."""
@@ -305,6 +433,11 @@ class TransformGizmo:
                 self.layer.set_image(self._drag_image)
                 self.layer.mask = self._drag_mask
                 self.layer.offset = self._drag_offset
+                self.layer._content_delta = (0, 0)
+                # Put the overlays back where the restored pixels show them: the
+                # drag-start placement, i.e. the total delta up to ``start``.
+                self._apply_overlays(
+                    mul(self._start_matrix, invert(self._base_matrix)))
                 app._drop_undo()
         self._end_drag()
 
@@ -533,8 +666,21 @@ class TransformGizmo:
             return True
         if handle == "move":
             px, py = self._press
-            self.matrix = mul(translation(x - px, y - py), base)
-        elif handle == "rot":
+            dx = x - px
+            dy = y - py
+            self.matrix = mul(translation(dx, dy), base)
+            # A pure translation is deferred like the Move tool: slide the layer
+            # placement (offset) with the matching ``_content_delta`` instead of
+            # re-sampling the whole buffer every event, which is the cost that
+            # made dragging a transform lag. The single resample happens once on
+            # release (see :meth:`_bake_move`). A link records its own transform,
+            # so it keeps the per-event path.
+            if self._is_link:
+                self._apply_pixels()
+            else:
+                self._apply_move(dx, dy)
+            return True
+        if handle == "rot":
             cx, cy = self._pivot_doc
             delta = math.atan2(y - cy, x - cx) - self._angle0
             if uniform:
@@ -567,6 +713,11 @@ class TransformGizmo:
         return True
 
     def finish(self):
+        # A move drag deferred its resample (see :meth:`_apply_move`); commit it
+        # once here so the released state matches what a per-event resample would
+        # have produced.
+        if self._handle == "move" and self.active and not self._is_link:
+            self._bake_move()
         self._end_drag()
 
     @property
@@ -579,6 +730,24 @@ class TransformGizmo:
         return self._handle == "pivot"
 
     # ----------------------------------------------------------------- render
+    def _apply_move(self, dx, dy):
+        """Slide the layer for a pure translation, without re-sampling.
+
+        The Move tool's trick: shift ``offset`` and set the matching
+        ``_content_delta`` so ``content_offset`` is unchanged. The layer's own
+        image (and every overlay's cached raster, keyed on the image token and
+        the content offset) then stays warm for the whole drag - only the
+        placement slides - so dragging a large layer is as cheap as a move.
+        """
+        ox, oy = self._drag_offset
+        self.layer.offset = (ox + dx, oy + dy)
+        self.layer._content_delta = (dx, dy)
+
+    def _bake_move(self):
+        """Commit a deferred move: one resample, then clear the drag delta."""
+        self._apply_pixels()
+        self.layer._content_delta = (0, 0)
+
     def _apply_pixels(self):
         """Re-sample the layer through :attr:`matrix`, into its own buffer.
 
@@ -599,6 +768,14 @@ class TransformGizmo:
             )
             self.layer.set_transform(content_matrix)
             return
+        self._resample_base()
+        # Carry the document-space overlays through the same gesture, from the
+        # session's original placement, so a path/vector/text/pose travels with
+        # the transformed pixels instead of staying pinned to the page.
+        self._apply_overlays(mul(self.matrix, invert(self._base_matrix)))
+
+    def _resample_base(self):
+        """Re-sample the base pixels and mask through :attr:`matrix`."""
         # Render into a buffer big enough to hold the transformed content as well
         # as the canvas, then record where that buffer sits in document space via
         # ``layer.offset``. This keeps pixels scaled or moved past the canvas edge

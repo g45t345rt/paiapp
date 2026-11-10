@@ -9420,14 +9420,13 @@ class DrawingController:
         if view is None:
             self.gizmo.clear()
             return
-        # Fold any editable text into pixels first: the gizmo resamples the base
-        # image, so text objects would otherwise drift away from their pixels.
         layer = self.app.active_layer()
         if layer is None:
             self.gizmo.clear()
             return
-        if layer.texts:
-            layer.rasterize_texts()
+        # Editable overlays (text, paths, vector items, poses) are kept live:
+        # the gizmo carries their geometry through the transform too, so they no
+        # longer have to be folded into pixels to stay aligned.
         if not self.gizmo.begin(self.app, view):
             # The active layer has nothing transformable (empty, hidden or a
             # locked master): drop the previous session so its frame does not
@@ -9529,6 +9528,8 @@ class DrawingController:
             self.app.set_result("Transformed layer.")
         self.gizmo.finish()
         self._transform_pushed = False
+        # A deferred move bakes only on release, so repaint the committed state.
+        self.app.render()
 
     def _selection_transform_press(self, event):
         if not self.sel_gizmo.active:

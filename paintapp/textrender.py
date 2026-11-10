@@ -390,6 +390,40 @@ def to_local(spec, x, y):
     return (rx, ry)
 
 
+def transform(spec, matrix):
+    """Map a text object through an affine ``matrix`` (in place).
+
+    The anchor moves as a point, the block's rotation picks up the matrix's
+    rotation, and the font size (with the pixel-valued tracking and wrap width)
+    scales by :func:`matrix_scale`-style ``sqrt(|det|)``. This is exact for a
+    similarity (translate/rotate/uniform-scale) transform; a skew or non-uniform
+    scale is approximated by that single scalar, since a text block has one size.
+    """
+    a, b, c, d, e, f = matrix
+    x = float(spec.get("x", 0.0) or 0.0)
+    y = float(spec.get("y", 0.0) or 0.0)
+    spec["x"] = a * x + c * y + e
+    spec["y"] = b * x + d * y + f
+    det = abs(a * d - b * c)
+    scale = math.sqrt(det) if det > 0.0 else 1.0
+    if abs(scale - 1.0) > 1e-9:
+        try:
+            spec["size"] = max(
+                1, int(round(int(spec.get("size", DEFAULT_SIZE)) * scale)))
+        except (TypeError, ValueError):
+            pass
+        for key in ("letter_spacing", "width"):
+            try:
+                value = float(spec.get(key, 0.0) or 0.0)
+            except (TypeError, ValueError):
+                continue
+            if value:
+                spec[key] = value * scale
+    spec["rotation"] = (float(spec.get("rotation", 0.0) or 0.0)
+                        + math.degrees(math.atan2(b, a)))
+    return spec
+
+
 def local_rect(spec):
     """The text block's rectangle in local space, as ``(x0, y0, x1, y1)``."""
     font = load_font(spec)

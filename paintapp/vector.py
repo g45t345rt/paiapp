@@ -1186,6 +1186,48 @@ def item_scale(spec, sx, sy, cx, cy):
             else scale(spec, sx, sy, cx, cy))
 
 
+def matrix_scale(matrix):
+    """The geometric-mean scale of an affine ``(a, b, c, d, e, f)`` matrix.
+
+    A stroke width is a scalar, so a non-uniform transform cannot be represented
+    exactly; ``sqrt(|det|)`` is the area-preserving scale used to keep a line's
+    weight proportional (matching the vector group-scale behaviour).
+    """
+    a, b, c, d, _e, _f = matrix
+    det = abs(a * d - b * c)
+    return math.sqrt(det) if det > 0.0 else 1.0
+
+
+def _matrix_points(container, matrix, keys=("points", "handles_in", "handles_out")):
+    a, b, c, d, e, f = matrix
+    for key in keys:
+        for point in container.get(key) or []:
+            x = point[0]
+            y = point[1]
+            point[0] = a * x + c * y + e
+            point[1] = b * x + d * y + f
+
+
+def transform(spec, matrix):
+    """Map a stroke's anchors and handles through an affine ``matrix`` (in place)."""
+    _matrix_points(spec, matrix)
+    factor = matrix_scale(matrix)
+    if abs(factor - 1.0) > 1e-9:
+        scale_width(spec, factor)
+    return spec
+
+
+def transform_fill(spec, matrix):
+    """Map every contour point and handle of a fill through ``matrix`` (in place)."""
+    for contour in spec.get("contours") or []:
+        _matrix_points(contour, matrix)
+    return spec
+
+
+def item_transform(spec, matrix):
+    return transform_fill(spec, matrix) if is_fill(spec) else transform(spec, matrix)
+
+
 def item_snapshot(spec):
     """A restorable copy of the item's geometry (for a transform gesture)."""
     if is_fill(spec):

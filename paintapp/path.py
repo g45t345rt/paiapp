@@ -493,6 +493,53 @@ def translate(spec, dx, dy):
     return spec
 
 
+def matrix_scale(matrix):
+    """The geometric-mean scale of an affine ``(a, b, c, d, e, f)`` matrix.
+
+    A stroke width is a scalar, so a non-uniform transform cannot be represented
+    exactly; ``sqrt(|det|)`` is the area-preserving scale that keeps a line's
+    weight proportional as the shape grows or shrinks.
+    """
+    a, b, c, d, _e, _f = matrix
+    det = abs(a * d - b * c)
+    return math.sqrt(det) if det > 0.0 else 1.0
+
+
+def transform(spec, matrix):
+    """Map ``spec``'s geometry through an affine ``matrix`` (in place).
+
+    Anchors and bezier control points are transformed as points, which maps the
+    curve exactly (the transformed curve is the curve through the transformed
+    controls). The scalar stroke ``width``/``outline`` are scaled by
+    :func:`matrix_scale`, since an affine with rotation or a non-uniform scale
+    cannot keep a single width through a plain point map.
+    """
+    a, b, c, d, e, f = matrix
+    for key in ("anchors", "handles_in", "handles_out"):
+        for point in spec.get(key) or []:
+            x = point[0]
+            y = point[1]
+            point[0] = a * x + c * y + e
+            point[1] = b * x + d * y + f
+    factor = matrix_scale(matrix)
+    if abs(factor - 1.0) > 1e-9:
+        try:
+            spec["width"] = max(
+                1, min(MAX_WIDTH, int(round(float(spec.get("width", 1)) * factor)))
+            )
+        except (TypeError, ValueError):
+            pass
+        try:
+            spec["outline"] = max(
+                0,
+                min(PATH_OUTLINE_MAX,
+                    int(round(float(spec.get("outline", 0) or 0) * factor))),
+            )
+        except (TypeError, ValueError):
+            pass
+    return spec
+
+
 # ------------------------------------------------------------------- rendering
 def _cap_quad(draw, fill, point, dx, dy, nx, ny):
     """Extend a stroke past ``point`` along ``(dx, dy)`` for a square cap."""

@@ -111,6 +111,8 @@ def test_move_commits_the_source_shifted():
     # A drag at whole-pixel offsets samples the source at its own texel centres,
     # so the resample must reproduce the pixels it moved exactly - the check
     # that catches a half-pixel error in the shader's coordinate convention.
+    # A move defers that resample to release (like the Move tool), so the pixels
+    # are untouched mid-drag and only shift when the drag finishes.
     layer = photo_layer()
     source = np.asarray(layer.image)
     app = FakeApp(layer, layer.size)
@@ -118,12 +120,17 @@ def test_move_commits_the_source_shifted():
     check("session starts", instance.begin(app, None), True)
     instance.start("move", 40.0, 30.0)
     instance.update(60.0, 40.0)
+    check("a move drag defers the resample",
+          np.array_equal(np.asarray(layer.image), source), True)
+    check("the drag delta is recorded", layer._content_delta, (20.0, 10.0))
+    instance.finish()
     moved = np.asarray(layer.image)
     check("buffer spans the moved content",
           layer.image.size, (source.shape[1] + 20, source.shape[0] + 10))
     check("buffer offset", layer.offset, (0, 0))
     check("the drag moved the pixels exactly",
           np.array_equal(moved[10:, 20:], source), True)
+    check("release clears the drag delta", layer._content_delta, (0, 0))
 
 
 def test_release_does_not_resample_again():
@@ -220,10 +227,10 @@ def test_source_is_uploaded_once_per_session():
         if not instance.begin(app, None):
             check("session for upload count", False, True)
             return
-        instance.start("move", 10.0, 10.0)
-        instance.update(20.0, 20.0)
-        instance.update(30.0, 25.0)
-        instance.update(40.0, 30.0)
+        instance.start("se", 320.0, 240.0)
+        instance.update(360.0, 270.0)
+        instance.update(400.0, 300.0)
+        instance.update(440.0, 330.0)
         instance.cancel_drag(app)
         uploaded = len(calls)
         instance.clear()

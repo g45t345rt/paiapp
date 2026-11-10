@@ -517,6 +517,31 @@ def clone_scene(scene):
     return dict(normalize_scene(scene))
 
 
+def transform_scene(scene, matrix):
+    """Map the shared scene through an affine ``matrix`` (in place).
+
+    The scene anchor moves as a point; the camera ``roll`` picks up the matrix's
+    rotation and ``zoom`` scales by ``sqrt(|det|)``. Because every figure is
+    projected as a similarity about the anchor, this reproduces a
+    translate/rotate/uniform-scale of the whole scene exactly. A skew or
+    non-uniform scale is approximated by that single scalar, since the camera has
+    one zoom.
+    """
+    a, b, c, d, e, f = matrix
+    x = float(scene.get("x", 0.0) or 0.0)
+    y = float(scene.get("y", 0.0) or 0.0)
+    scene["x"] = a * x + c * y + e
+    scene["y"] = b * x + d * y + f
+    scene["roll"] = (float(scene.get("roll", 0.0) or 0.0)
+                     + math.degrees(math.atan2(b, a)))
+    det = abs(a * d - b * c)
+    scale = math.sqrt(det) if det > 0.0 else 1.0
+    if abs(scale - 1.0) > 1e-9:
+        zoom = float(scene.get("zoom", DEFAULT_ZOOM) or DEFAULT_ZOOM) * scale
+        scene["zoom"] = max(MIN_ZOOM, min(MAX_ZOOM, zoom))
+    return scene
+
+
 def set_scene_zoom(scene, zoom, pivot=None):
     """Dolly the scene to ``zoom`` pixels per model unit (clamped to MIN/MAX_ZOOM).
 
