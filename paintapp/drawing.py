@@ -3765,6 +3765,12 @@ class DrawingController:
         # Whole-path move drag: the press point and the geometry captured there.
         self._path_move_origin = None
         self._path_move_start = None
+        # Timestamp of the last committed-path repaint, so an edit drag throttles
+        # its repaints while the handles and overlay still follow every event.
+        # ``_path_draft`` records that a drag painted a draft (non-antialiased)
+        # frame, so the release repaints it at full quality.
+        self._path_render_at = 0.0
+        self._path_draft = False
         self._guide_index = None
         self._guide_view = None
         self._guide_pushed = False
@@ -5561,6 +5567,10 @@ class DrawingController:
     # --------------------------------------------------------------- path
     PATH_CLOSE_HIT = 8
     PATH_HIT = 6
+    # Minimum seconds between repaints while dragging a committed path. A drag
+    # paints a draft (non-antialiased) frame, whose re-raster is cheap, so this
+    # only trims redundant work on layers with many path objects.
+    PATH_RENDER_INTERVAL = 0.05
 
     def _path_hit_anchor(self, path, x, y, hit):
         """Return the index of the anchor nearest ``(x, y)`` within ``hit``."""
@@ -5668,7 +5678,7 @@ class DrawingController:
         # A committed path is drawn from its spec, so the edit must be written
         # back and repainted; a pending path only needs the overlay refreshed.
         if self._path_edit is not None:
-            self._apply_path_live()
+            self._apply_path_live(throttle=True)
         self._update_path_preview(cursor=(x, y))
 
     def _begin_path_move(self, x, y):
@@ -5702,6 +5712,10 @@ class DrawingController:
             self._path.closed = True
             self.finish_path()
             return
+        # A drag paints draft (non-antialiased) frames, so land the final,
+        # full-quality frame now.
+        if self._path_draft:
+            self._apply_path_live()
         self._path_dragging = None
         self._clear_path_edit()
 
@@ -5713,6 +5727,7 @@ class DrawingController:
         self._path_close_pending = False
         self._path_move_origin = None
         self._path_move_start = None
+        self._path_draft = False
 
     def _path_right_click(self, event):
         """Delete the path anchor under a right-click."""
@@ -5801,8 +5816,16 @@ class DrawingController:
             return
         spec.update(self.app.tools.path_style())
 
-    def _apply_path_live(self):
-        """Write the edited geometry and style into the spec and repaint."""
+    def _apply_path_live(self, throttle=False):
+        """Write the edited geometry and style into the spec and repaint.
+
+        During a drag (``throttle=True``) geometry changes are written every
+        event, but the repaint is throttled and draws a *draft* frame with
+        anti-aliasing off: the antialiased re-raster supersamples the whole path
+        bounding box and averages it down, which costs hundreds of milliseconds
+        on a large path and would stall the drag. A release (``throttle=False``)
+        restores the tool's anti-aliasing and repaints the final, exact frame.
+        """
         edit = self._path_edit
         spec = self._path_edit_spec()
         if edit is None or spec is None or self._path is None:
@@ -5810,7 +5833,14 @@ class DrawingController:
         self._mark_path_dirty()
         pathspec.apply_geometry(spec, self._path)
         self._apply_path_style(spec)
+        if throttle:
+            spec["antialias"] = False
         edit["layer"].invalidate_paths()
+        now = time.monotonic()
+        if throttle and now - self._path_render_at < self.PATH_RENDER_INTERVAL:
+            return
+        self._path_render_at = now
+        self._path_draft = throttle
         self.app.render()
 
     @staticmethod
@@ -5855,6 +5885,10 @@ class DrawingController:
             "layer": layer, "index": index, "pushed": False,
             "original": pathspec.clone(spec),
         }
+        # A fresh session paints its first drag frame right away rather than
+        # inheriting the previous session's throttle timestamp.
+        self._path_render_at = 0.0
+        self._path_draft = False
         self.app._path_sel = (self.app.current.layers.index(layer), index)
         self._update_path_preview()
         self.app._refresh_layer_list()
@@ -9297,6 +9331,7 @@ class DrawingController:
             self._path = None
             self._path_edit = None
             self._path_view = None
+            self._path_draft = False
             self._update_path_preview()
             self.app._refresh_layer_list()
             self.app.render()
