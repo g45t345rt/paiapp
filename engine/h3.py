@@ -486,8 +486,8 @@ class MiniMaxH3DiT(nn.Module):
         are the encoded reference latents in the same order as its
         ``ref_indices``. Reference rows are conditioned at the clean end of the
         schedule (with the checkpoint's 0.999 noise augmentation), while text and
-        target rows share the current sigma. The image checkpoint's velocity has
-        the opposite sign from the video model, so the result is negated.
+        target rows share the current sigma. Like the video model, the returned
+        velocity is data-ward (``x0 = x_t + sigma * v``), so it is *not* negated.
         """
         device = video_x.device
         dtype = context.dtype
@@ -546,7 +546,7 @@ class MiniMaxH3DiT(nn.Module):
         v = self.final_layer.forward_image(
             x, t_emb, video_seg, sigma, sample_sigmas, pdd_sigmas)
         lat_t, lat_h, lat_w = video_x.shape[2], video_x.shape[3] // 2, video_x.shape[4] // 2
-        return -unpatchify_video(v, lat_t, lat_h, lat_w, self.latents_dim, self.patch_size)
+        return unpatchify_video(v, lat_t, lat_h, lat_w, self.latents_dim, self.patch_size)
 
 
 class MiniMaxH3ImageDiT(MiniMaxH3DiT):
