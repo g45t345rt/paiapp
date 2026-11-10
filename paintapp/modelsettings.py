@@ -238,6 +238,12 @@ _COMPONENT_DIRS = (
     ("upscale", ("upscale_models",)),
 )
 
+# Pool -> its engine folder, as a ``component_path`` parts tuple. A model's
+# component slot also offers the files sitting in the matching folder, not just
+# the curated pool entries, so a file downloaded (or copied) into the folder is
+# selectable without curating it first (see ``_pool_items``).
+_POOL_FOLDERS = dict(_COMPONENT_DIRS)
+
 # Folder basenames that name a component pool, for folders the engine does not
 # know by path (a ComfyUI-style layout, a renamed dir, etc.).
 _COMPONENT_FOLDER_NAMES = {
@@ -423,7 +429,7 @@ class ModelSettingsDialog:
 
         for _title, name in _POOL_CATEGORIES:
             category = engine_kinds.POOL_CATEGORY.get(name)
-            for item in self.pools.get(name, []):
+            for item in self._pool_items(name):
                 add(item.get("path"), category)
         for entry in self.entries:
             add(entry.get("path"), engine_kinds.MODEL)
@@ -1378,6 +1384,43 @@ class ModelSettingsDialog:
                     "label": item.get("label") or _stem(path), "path": path,
                 })
 
+    def _pool_items(self, name):
+        """A pool's curated items plus files sitting in its engine folder.
+
+        A file downloaded into the configured component folder is not always
+        curated into the pool -- a Hub download whose additions were not saved,
+        or a file copied in by hand. The slot file pickers still have to offer
+        it, so this lists the folder's component files too (path-de-duplicated,
+        with a curated label winning). Detection for these extra paths happens
+        in the same background pass as the pool (see ``_pending_detections``).
+        """
+        items = list(self.pools.get(name, []))
+        known = {
+            _path_key(item["path"]) for item in items if item.get("path")
+        }
+        parts = _POOL_FOLDERS.get(name)
+        if parts is None:
+            return items
+        folder = engine_paths.component_path(parts)
+        try:
+            entries = sorted(os.listdir(folder))
+        except OSError:
+            return items
+        for entry in entries:
+            if entry.startswith(".") or not entry.lower().endswith(
+                _COMPONENT_SUFFIXES
+            ):
+                continue
+            path = os.path.join(folder, entry)
+            if not os.path.isfile(path):
+                continue
+            key = _path_key(path)
+            if key in known:
+                continue
+            known.add(key)
+            items.append({"label": _stem(path), "path": path})
+        return items
+
     def _build_pools(self):
         """The scan bar plus the grouped add/remove/reorder pool lists."""
         holder = tk.Frame(self.table)
@@ -1679,13 +1722,15 @@ class ModelSettingsDialog:
         """A slot's file values, filtered to ``kind`` and labelled with each kind.
 
         Returns ``(choices, mapping)`` where ``mapping`` resolves a dropdown
-        value back to its file path. A file whose kind is unknown is listed only
+        value back to its file path. Files come from the pool plus the pool's
+        engine folder (see ``_pool_items``), so a downloaded-but-uncurated file
+        is still selectable. A file whose kind is unknown is listed only
         under "Any kind"; the assigned file is always kept so the row keeps
         showing what it stores even when the current kind filter hides it.
 
         While the background detection pass is still running no file has a kind
-        yet, so the filter is skipped and every pool file is listed; the rebuild
-        when the pass ends applies it.
+        yet, so the filter is skipped and every candidate file is listed; the
+        rebuild when the pass ends applies it.
         """
         if not self._kinds_ready:
             kind = None
@@ -1699,13 +1744,14 @@ class ModelSettingsDialog:
             mapping[display] = item.get("path", "")
             choices.append(display)
 
-        for item in self.pools.get(name, []):
+        items = self._pool_items(name)
+        for item in items:
             if kind and self._pool_item_kind(name, item) != kind:
                 continue
             add(item)
         if assigned and assigned not in mapping.values():
             assigned_item = None
-            for item in self.pools.get(name, []):
+            for item in items:
                 if item.get("path") == assigned:
                     assigned_item = item
                     break
