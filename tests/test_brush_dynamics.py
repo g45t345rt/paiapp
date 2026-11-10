@@ -131,20 +131,53 @@ def test_split_taper():
 
 
 def test_end_taper_applies_on_finish():
-    layer, stroke = paint(8, brush.Dynamics(taper=16))
-    before = ink_total(layer.image.getchannel("A"))
-    stroke.finish()
-    after = ink_total(layer.image.getchannel("A"))
-    check("finish fades the tip", after < before, True)
-    check("finish keeps the stroke", after > 0, True)
+    # Compare two finished strokes so the tail completion finish also does is
+    # held constant and only the taper differs.
+    tapered, taper_stroke = paint(8, brush.Dynamics(taper=16))
+    taper_stroke.finish()
+    plain, plain_stroke = paint(8, brush.Dynamics())
+    plain_stroke.finish()
+    check("finish fades the tip",
+          ink_total(tapered.image.getchannel("A"))
+          < ink_total(plain.image.getchannel("A")), True)
+    check("finish keeps the stroke",
+          ink_total(tapered.image.getchannel("A")) > 0, True)
 
 
-def test_finish_is_noop_without_taper():
+def test_finish_without_taper_does_not_fade():
+    # The smoothed path ends at the last sample's midpoint; finish extends it to
+    # the sample (adding ink) but, with no taper, must never remove any.
     layer, stroke = paint(8, brush.Dynamics())
     before = ink_total(layer.image.getchannel("A"))
     stroke.finish()
     after = ink_total(layer.image.getchannel("A"))
-    check("no taper means finish changes nothing", after, before)
+    check("no taper means finish does not fade", after >= before, True)
+
+
+def test_fast_stroke_curves_instead_of_chording():
+    # Two long samples meeting at a corner are joined by a quadratic bezier, so
+    # the painted path bows inside the corner instead of chording straight across
+    # it - the difference between a faceted fast stroke and a smooth one.
+    layer = make_layer()
+    stroke = brush.Stroke(
+        layer, "brush", size=4, hardness=100, flow=100, opacity=100,
+        spacing=10, antialias=True, tip="Round",
+    )
+    path = []
+    original = stroke._advance
+
+    def record(x, y, step):
+        path.append((x, y))
+        original(x, y, step)
+
+    stroke._advance = record
+    stroke.begin(0, 0)
+    stroke.move_to(40, 0)
+    stroke.move_to(40, 40)
+    # The straight chord from (20, 0) to (40, 20) is y = x - 20; the curve must
+    # dip well inside it.
+    check("fast stroke bows inside the corner",
+          any(y < (x - 20) - 3 for x, y in path), True)
 
 
 def test_preview_renders_a_stroke():

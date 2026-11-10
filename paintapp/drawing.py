@@ -4325,7 +4325,9 @@ class DrawingController:
         self._mask_invert = invert
         self._begin_paint(x, y)
         self._apply_cursor(event.widget)
-        self.app.render()
+        # Paint the first frame at once, dropping any repaint left queued by a
+        # previous stroke.
+        self.app.flush_live_render()
 
     def on_mask_alt_press(self, event):
         """Right-click: mask inverse paint, path-anchor delete, or context menu."""
@@ -4364,7 +4366,7 @@ class DrawingController:
             return
         x, y = self._doc_coords(event)
         self._continue_paint(x, y)
-        self.app.render()
+        self.app.schedule_live_render()
         self.last_x, self.last_y = x, y
         self.cursor_x, self.cursor_y = x, y
         self._apply_cursor(event.widget)
@@ -5245,8 +5247,13 @@ class DrawingController:
             return
         self._continue_paint(x1, y1, self._paint_speed(x1, y1, event))
         # Render the committed stroke live so the preview matches every brush
-        # setting (opacity, hardness, flow, spacing, blend, tip) exactly.
-        self.app.render()
+        # setting (opacity, hardness, flow, spacing, blend, tip) exactly. The
+        # dabs are stamped on every event above; the repaint is coalesced onto a
+        # timer (see ``PaintApp.schedule_live_render``) so the event loop keeps
+        # draining motion samples instead of stalling on a viewport render per
+        # event - which at a zoomed-out view drops the very samples that keep a
+        # fast stroke from chording straight across the hand's curve.
+        self.app.schedule_live_render()
         self.last_x, self.last_y = x1, y1
         self.cursor_x, self.cursor_y = x1, y1
         self._apply_cursor(view)
@@ -5314,7 +5321,8 @@ class DrawingController:
         self._stroke = None
         self._strokes = []
         self._end_move()
-        self.app.render()
+        # Paint the committed frame now, cancelling any live repaint still queued.
+        self.app.flush_live_render()
 
     # ------------------------------------------------------------------ select
     def _selection(self):

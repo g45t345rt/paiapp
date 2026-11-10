@@ -773,6 +773,11 @@ class Stroke:
         # layer and is updated in place as the stroke drags colour along.
         self._smudge_buf = layer.image.copy() if kind == "smudge" else None
         self.last = None
+        # Online path smoothing state (see ``move_to``): the previous raw sample
+        # and the last emitted curve point (a sample midpoint). ``None`` until
+        # the first move.
+        self._smooth_prev = None
+        self._smooth_last = None
         # Union of the rectangles stamped since the last commit, so commit can
         # rebuild just that region. ``None`` means nothing changed.
         self._dirty = None
@@ -788,6 +793,8 @@ class Stroke:
         self._origin = (x, y)
         self._arc = 0.0
         self._pending = 0.0
+        self._smooth_prev = (x, y)
+        self._smooth_last = (x, y)
         if self.dynamics.taper_out > 0:
             self._trail = [(x, y, 0.0)]
         if self.kind == "smudge":
@@ -807,16 +814,65 @@ class Stroke:
         return max(1.0, size * max(1.0, spacing) / 100.0)
 
     def move_to(self, x, y, speed=None):
+        """Feed the next pointer sample, curving the path between samples.
+
+        Joining raw samples with straight lines leaves a visible corner at every
+        sample, so a fast stroke - which delivers few samples across the same
+        path - comes out as a polygon while a slow one is smooth. Instead the
+        path is a quadratic bezier through the sample midpoints, each raw sample
+        acting as the control point: the standard online smoothing that rounds
+        the corners without lagging the pointer. ``_advance`` still stamps at the
+        distance-based spacing, and the speed is measured once per real sample so
+        the velocity dynamics are unchanged.
+        """
         if self.last is None:
             self.begin(x, y)
             return
+        if self._smooth_prev is None:
+            self._smooth_prev = self.last
+            self._smooth_last = self.last
+        prev_x, prev_y = self._smooth_prev
+        if math.hypot(x - prev_x, y - prev_y) < 1e-6:
+            return
+        step = self._step_for(math.hypot(x - prev_x, y - prev_y), speed)
+        start_x, start_y = self._smooth_last
+        mid_x = (prev_x + x) * 0.5
+        mid_y = (prev_y + y) * 0.5
+        self._curve_to(start_x, start_y, prev_x, prev_y, mid_x, mid_y, step)
+        self._smooth_last = (mid_x, mid_y)
+        self._smooth_prev = (x, y)
+        self.commit()
+
+    def _curve_to(self, sx, sy, cx, cy, ex, ey, step):
+        """Stamp dabs along the quadratic bezier ``start -> control -> end``.
+
+        Flattened into short straight pieces and handed to :meth:`_advance`,
+        which carries the dab spacing across them, so the curve is painted at the
+        same spacing as a straight segment.
+        """
+        chord = math.hypot(ex - sx, ey - sy)
+        segments = max(1, min(64, int(math.ceil(chord / 3.0))))
+        for i in range(1, segments + 1):
+            t = i / segments
+            inv = 1.0 - t
+            px = inv * inv * sx + 2.0 * inv * t * cx + t * t * ex
+            py = inv * inv * sy + 2.0 * inv * t * cy + t * t * ey
+            self._advance(px, py, step)
+
+    def _advance(self, x, y, step):
+        """Stamp dabs along the straight segment from ``self.last`` to ``(x, y)``.
+
+        Dab spacing is tied to distance travelled (carried in ``self._pending``)
+        so it stays a fixed fraction of the brush size however the path is
+        sampled. Speed is *not* updated here, so flattening a curve into many
+        sub-steps does not dilute the per-sample speed (see :meth:`move_to`).
+        """
         x0, y0 = self.last
         dx = x - x0
         dy = y - y0
         distance = math.hypot(dx, dy)
         if distance < 1e-6:
             return
-        step = self._step_for(distance, speed)
         if self.kind == "smudge":
             # Each dab picks colour up one sub-step behind the cursor, so the
             # colour trails and is dragged forward along the stroke instead of
@@ -865,7 +921,6 @@ class Stroke:
         if taper > 0:
             self._trim_trail()
         self.last = (x, y)
-        self.commit()
 
     def finish(self):
         """Fade the trailing end of the stroke out, then leave it committed.
@@ -876,6 +931,16 @@ class Stroke:
         the tip fades instead of stopping flat. Smudge writes straight to the
         layer and keeps no coverage, so it is left untouched.
         """
+        # The smoothed path ends at the last sample's midpoint; extend it to the
+        # last sample so the stroke reaches where the pointer actually stopped.
+        if (self.last is not None and self._smooth_prev is not None
+                and self._smooth_prev != self._smooth_last):
+            tail = math.hypot(self._smooth_prev[0] - self.last[0],
+                              self._smooth_prev[1] - self.last[1])
+            self._advance(self._smooth_prev[0], self._smooth_prev[1],
+                          self._step_for(tail, None))
+            self._smooth_last = self._smooth_prev
+            self.commit()
         taper = self.dynamics.taper_out
         if taper <= 0 or self.kind == "smudge" or self._arc <= 0:
             return

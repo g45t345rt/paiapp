@@ -89,6 +89,14 @@ _RESAMPLE_FILTERS = {
 # DPI assumed for a print page when the export dialog leaves the DPI field blank.
 _PRINT_FALLBACK_DPI = 300
 
+# Milliseconds between live-stroke repaints. The stroke dabs are stamped on every
+# motion event; only the viewport repaint is deferred to this timer, so the event
+# loop keeps collecting pointer samples instead of stalling on a render per
+# event. That stall is worst when zoomed out, where one sample already spans many
+# document pixels, so each coalesced-away sample chords straight across the curve
+# the hand made and the stroke looks like it skips (see PaintApp.schedule_live_render).
+_LIVE_STROKE_RENDER_MS = 5
+
 # Reference settings (Anima + Qwen) are a canvas-level concern: they must not
 # travel with the active layer, or selecting another layer would swap the
 # reference images. They are stripped from the per-layer generation settings.
@@ -537,6 +545,9 @@ class PaintApp:
         # The canvas currently receiving live denoising-step preview frames, or
         # ``None`` (see :meth:`_on_gen_preview`). Cleared when the run settles.
         self._live_preview_doc = None
+        # Pending live-stroke repaint timer id, or ``None`` when no stroke frame
+        # is queued (see :meth:`schedule_live_render`).
+        self._stroke_render_job = None
 
         # Open with a canvas ready to paint on; File > New / Add Canvas create
         # more, and an opened project/image replaces this default one.
@@ -1865,6 +1876,37 @@ class PaintApp:
 
     def composite(self):
         return self.current.composite() if self.current is not None else None
+
+    def schedule_live_render(self):
+        """Queue one live-stroke repaint, coalescing the events in between.
+
+        A stroke handler that repaints the viewport on every motion event stalls
+        the event loop, and the window manager then coalesces motion samples -
+        most damaging when zoomed out, where one sample already spans many
+        document pixels, so each dropped one chords straight across the curve the
+        hand made (the stroke "skips"). The dabs are still stamped in the handler;
+        deferring only the repaint keeps the loop draining samples, and the timer
+        also lands a trailing frame after the last event, so a stroke held still
+        mid-drag still catches up.
+        """
+        if self._stroke_render_job is not None:
+            return
+        self._stroke_render_job = self.root.after(
+            _LIVE_STROKE_RENDER_MS, self._run_live_render)
+
+    def _run_live_render(self):
+        self._stroke_render_job = None
+        self.render()
+
+    def flush_live_render(self):
+        """Repaint any deferred live frame at once (a stroke press or release)."""
+        if self._stroke_render_job is not None:
+            try:
+                self.root.after_cancel(self._stroke_render_job)
+            except tk.TclError:
+                pass
+            self._stroke_render_job = None
+        self.render()
 
     def render(self):
         if self.current is None:
