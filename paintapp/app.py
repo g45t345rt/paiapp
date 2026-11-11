@@ -2918,6 +2918,7 @@ class PaintApp:
         self._path_sel = None
         self._group_sel = None
         self._group_filter_sel = None
+        self.area.set_outline_group(None)
         self.drawing.commit_text()
         self.drawing.finish_path()
         self.layer_panel.set_opacity(self.active_layer().opacity)
@@ -4223,6 +4224,7 @@ class PaintApp:
         self._filter_sel = None
         self._text_sel = None
         self._path_sel = None
+        self.area.set_outline_group(group)
         self._sync_prompt()
 
     def _selected_group(self):

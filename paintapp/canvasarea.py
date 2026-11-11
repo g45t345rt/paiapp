@@ -2222,20 +2222,66 @@ class CanvasView(tk.Canvas):
             return
         layers = getattr(self.doc, "layers", None)
         index = getattr(self.doc, "active", -1)
-        if not layers or not (0 <= index < len(layers)):
+        if not layers:
             return
-        layer = layers[index]
-        ox, oy = layer.offset
-        width, height = layer.size
-        if width <= 0 or height <= 0:
+        group = getattr(self, "outline_group", None)
+        targets = [l for l in layers if group is not None and l.group is group]
+        if not targets:
+            if not (0 <= index < len(layers)):
+                return
+            targets = [layers[index]]
+        box = None
+        for layer in targets:
+            width, height = layer.size
+            if width <= 0 or height <= 0:
+                continue
+            bbox = self._layer_alpha_bbox(layer)
+            if bbox is None:
+                continue
+            ox, oy = layer.offset
+            rect = (ox + bbox[0], oy + bbox[1], ox + bbox[2], oy + bbox[3])
+            box = rect if box is None else (
+                min(box[0], rect[0]), min(box[1], rect[1]),
+                max(box[2], rect[2]), max(box[3], rect[3]),
+            )
+        if box is None:
             return
-        x0, y0 = self._doc_to_view(ox, oy)
-        x1, y1 = self._doc_to_view(ox + width, oy + height)
+        x0, y0 = self._doc_to_view(box[0], box[1])
+        x1, y1 = self._doc_to_view(box[2], box[3])
         accent = theme.color("accent") or "#3b82f6"
         self.create_rectangle(
             x0, y0, x1, y1, outline=accent, width=1, dash=(4, 3),
             tags="docborder",
         )
+
+    def _layer_alpha_bbox(self, layer):
+        """Bounding box of the layer's visible (alpha > 0) content, or ``None``.
+
+        Measured on :meth:`Layer.composited_image` so texts, vector strokes,
+        fills, paths, poses, filters and the mask all count, not only the raw
+        pixels. ``composited_image`` returns the same cached object while the
+        content is unchanged, so the bbox is cached against that identity and
+        the alpha scan only reruns after an edit.
+        """
+        try:
+            image = layer.composited_image()
+        except Exception:
+            return (0, 0) + tuple(layer.size)
+        cache = getattr(self, "_outline_bbox_cache", None)
+        if not isinstance(cache, dict):
+            cache = self._outline_bbox_cache = {}
+        key = getattr(layer, "uid", id(layer))
+        cached = cache.get(key)
+        if cached is not None and cached[0] is image:
+            return cached[1]
+        if "A" in image.getbands():
+            bbox = image.getchannel("A").getbbox()
+        else:
+            bbox = (0, 0) + image.size
+        if len(cache) > 256:
+            cache.clear()
+        cache[key] = (image, bbox)
+        return bbox
 
     def set_layer_outline(self, visible):
         """Show or hide the active-layer outline for this view."""
@@ -4496,6 +4542,12 @@ class CanvasArea(tk.Frame):
         """Show or hide the active-layer outline on every canvas tab."""
         for view in self._views:
             view.set_layer_outline(visible)
+
+    def set_outline_group(self, group):
+        """Outline ``group``'s members instead of the active layer (``None`` clears)."""
+        for view in self._views:
+            view.outline_group = group
+            view._draw_doc_border()
 
     def set_grid_size(self, size):
         """Set the grid cell size (document pixels) on every canvas tab."""
