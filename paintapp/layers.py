@@ -316,8 +316,15 @@ class LayerPanel(tk.Frame):
                  on_link_create=None, on_unlink=None, on_select_master=None,
                  on_link_reset_transform=None,
                  get_master_choices=None, on_move_to_canvas=None,
-                 get_canvas_choices=None):
+                 get_canvas_choices=None, on_group_duplicate=None,
+                 on_text_duplicate=None, on_text_toggle=None,
+                 on_path_duplicate=None, on_path_toggle=None):
         super().__init__(parent)
+        self._on_group_duplicate = on_group_duplicate
+        self._on_text_duplicate = on_text_duplicate
+        self._on_text_toggle = on_text_toggle
+        self._on_path_duplicate = on_path_duplicate
+        self._on_path_toggle = on_path_toggle
         self._on_add = on_add
         self._on_delete = on_delete
         self._on_duplicate = on_duplicate
@@ -478,7 +485,7 @@ class LayerPanel(tk.Frame):
             "folder-plus", ICON_GROUP, self._on_group_add, "Add group"
         )
         self.duplicate_btn, self.duplicate_tip = icon_button(
-            "copy", ICON_DUPLICATE, self._on_duplicate, "Duplicate layer"
+            "copy", ICON_DUPLICATE, self._handle_duplicate, "Duplicate layer"
         )
         self.delete_btn, self.delete_tip = icon_button(
             "trash", ICON_DELETE, self.delete_current, "Delete layer"
@@ -1386,10 +1393,12 @@ class LayerPanel(tk.Frame):
                           leading=FILTER_LEAD)
         for text_index, spec in enumerate(layer.texts):
             self._add_row(textrender.describe(spec), ("text", index, text_index),
-                          indent + 1, leading=TEXT_LEAD)
+                          indent + 1, leading=TEXT_LEAD,
+                          hidden=bool(spec.get("hidden")))
         for path_index, spec in enumerate(layer.paths):
             self._add_row(path.describe(spec), ("path", index, path_index),
-                          indent + 1, leading=PATH_LEAD)
+                          indent + 1, leading=PATH_LEAD,
+                          hidden=bool(spec.get("hidden")))
 
     def _insert_group_filter_rows(self, group):
         """Insert indented rows for a group's non-destructive filters.
@@ -1544,6 +1553,17 @@ class LayerPanel(tk.Frame):
             if entry[0] == "layer":
                 indices.add(entry[1])
         return sorted(indices)
+
+    def selected_groups(self):
+        """The groups whose header rows are selected, in row order."""
+        groups = []
+        for row in sorted(self._selected):
+            if not (0 <= row < len(self._rows)):
+                continue
+            entry = self._rows[row]
+            if entry[0] == "group" and entry[1] not in groups:
+                groups.append(entry[1])
+        return groups
 
     def layer_row_at(self, x_root, y_root):
         """The layer index of the row under ``(x_root, y_root)``, or ``None``.
@@ -1884,7 +1904,10 @@ class LayerPanel(tk.Frame):
         is, matching how its other aggregate states are shown.
         """
         if self._text_active() or self._path_active():
-            return None
+            spec = self._selected_object_spec()
+            if spec is None:
+                return None
+            return not spec.get("hidden", False)
         if self._group_active():
             return bool(self._selected_group.visible)
         if self._filter_active() or self._group_filter_active():
@@ -1904,8 +1927,9 @@ class LayerPanel(tk.Frame):
         is_group = self._selection_kind == "group" and self._selected_group is not None
         is_group_filter = self._group_filter_active()
         is_group_like = is_group or is_group_filter
-        duplicate_enabled = not (not has_layers or is_filter or is_item
-                                 or is_group_like)
+        duplicate_enabled = bool(has_layers or is_group) and not (
+            is_filter or is_group_filter
+        )
         self.duplicate_btn.config(
             state=tk.NORMAL if duplicate_enabled else tk.DISABLED
         )
@@ -1939,7 +1963,14 @@ class LayerPanel(tk.Frame):
                                   enabled=False)
             self.eye_tip.set_text("Show/hide layer")
         else:
-            target = "group" if self._group_active() else "layer"
+            if self._group_active():
+                target = "group"
+            elif is_text:
+                target = "text"
+            elif is_path:
+                target = "path"
+            else:
+                target = "layer"
             self.eye_btn.config(state=tk.NORMAL)
             self._set_button_icon(
                 self.eye_btn, "eye" if visible else "eye-off",
@@ -1948,7 +1979,14 @@ class LayerPanel(tk.Frame):
             self.eye_tip.set_text(
                 f"Hide {target}" if visible else f"Show {target}"
             )
-        self.duplicate_tip.set_text("Duplicate layer")
+        if is_group:
+            self.duplicate_tip.set_text("Duplicate group")
+        elif is_text:
+            self.duplicate_tip.set_text("Duplicate text")
+        elif is_path:
+            self.duplicate_tip.set_text("Duplicate path")
+        else:
+            self.duplicate_tip.set_text("Duplicate layer")
         if is_group_filter:
             self.delete_tip.set_text("Remove filter")
             self.up_tip.set_text("Move filter up")
@@ -2061,12 +2099,49 @@ class LayerPanel(tk.Frame):
         elif self._group_active():
             if self._on_group_toggle is not None:
                 self._on_group_toggle()
-        elif self._text_active() or self._path_active():
-            return
+        elif self._text_active():
+            if self._on_text_toggle is not None:
+                self._on_text_toggle()
+        elif self._path_active():
+            if self._on_path_toggle is not None:
+                self._on_path_toggle()
         elif self._filter_active() and self._on_filter_toggle is not None:
             self._on_filter_toggle()
         else:
             self._on_toggle()
+
+    def _selected_object_spec(self):
+        """The spec of the selected text or path row, or ``None``."""
+        if self._text_active():
+            layer_index, index = self._selected_text
+            attr = "texts"
+        elif self._path_active():
+            layer_index, index = self._selected_path
+            attr = "paths"
+        else:
+            return None
+        if not (0 <= layer_index < len(self._layers)):
+            return None
+        items = getattr(self._layers[layer_index], attr, None) or []
+        if not (0 <= index < len(items)):
+            return None
+        return items[index]
+
+    def _handle_duplicate(self):
+        """Duplicate whatever row is selected: group, text, path or layer(s)."""
+        if self._group_filter_active() or self._filter_active():
+            return
+        if self._group_active():
+            if self._on_group_duplicate is not None:
+                self._on_group_duplicate()
+        elif self._text_active():
+            if self._on_text_duplicate is not None:
+                self._on_text_duplicate()
+        elif self._path_active():
+            if self._on_path_duplicate is not None:
+                self._on_path_duplicate()
+        elif self._on_duplicate is not None:
+            self._on_duplicate()
 
     def _handle_lock(self):
         self._on_lock()
@@ -2173,6 +2248,7 @@ class LayerPanel(tk.Frame):
         menu = PopupMenu(self)
         if self._group_active():
             menu.add_command("Rename Group...", command=self._handle_rename)
+            menu.add_command("Duplicate Group", command=self._handle_duplicate)
             menu.add_command("Show/Hide Group", command=self._handle_toggle)
             collapse_label = (
                 "Expand Group" if self._selected_group.collapsed
@@ -2187,6 +2263,10 @@ class LayerPanel(tk.Frame):
             menu.add_separator()
             menu.add_command("Ungroup", command=self._on_group_ungroup)
             menu.add_command("Flatten Group", command=self._on_group_flatten)
+            menu.add_separator()
+            menu.add_command("Move Group Up", command=lambda: self._handle_move(1))
+            menu.add_command("Move Group Down",
+                             command=lambda: self._handle_move(-1))
             menu.add_separator()
             menu.add_command("Delete Group", command=self.delete_current)
             return menu
@@ -2205,19 +2285,31 @@ class LayerPanel(tk.Frame):
             return menu
         if self._text_active():
             menu.add_command("Edit Text...", command=self._handle_rename)
+            menu.add_command("Duplicate Text", command=self._handle_duplicate)
+            menu.add_command("Show/Hide Text", command=self._handle_toggle)
             menu.add_command(
                 "Rasterize Text", command=self._on_rasterize_text,
                 enabled=self._layer_has_texts,
             )
             menu.add_separator()
+            menu.add_command("Move Text Up", command=lambda: self._handle_move(1))
+            menu.add_command("Move Text Down",
+                             command=lambda: self._handle_move(-1))
+            menu.add_separator()
             menu.add_command("Remove Text", command=self.delete_current)
             return menu
         if self._path_active():
             menu.add_command("Edit Path", command=self._handle_rename)
+            menu.add_command("Duplicate Path", command=self._handle_duplicate)
+            menu.add_command("Show/Hide Path", command=self._handle_toggle)
             menu.add_command(
                 "Rasterize Path", command=self._on_rasterize_path,
                 enabled=self._layer_has_paths,
             )
+            menu.add_separator()
+            menu.add_command("Move Path Up", command=lambda: self._handle_move(1))
+            menu.add_command("Move Path Down",
+                             command=lambda: self._handle_move(-1))
             menu.add_separator()
             menu.add_command("Remove Path", command=self.delete_current)
             return menu

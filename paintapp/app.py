@@ -1027,6 +1027,11 @@ class PaintApp:
             get_master_choices=self.master_choices,
             on_move_to_canvas=self.move_layer_to_canvas,
             get_canvas_choices=self.canvas_move_choices,
+            on_group_duplicate=self.duplicate_selected_group,
+            on_text_duplicate=self.duplicate_selected_text,
+            on_text_toggle=self.toggle_selected_text_visible,
+            on_path_duplicate=self.duplicate_selected_path,
+            on_path_toggle=self.toggle_selected_path_visible,
         )
         self.layer_panel.pack(fill=tk.X)
 
@@ -4426,6 +4431,38 @@ class PaintApp:
         if members:
             self._move_block(members[0], delta, "Move group")
 
+    def duplicate_selected_group(self):
+        """Duplicate the selected group and all its members, just above it."""
+        group = self._selected_group()
+        if group is None:
+            self.set_result("Select a group first.")
+            return
+        members = [
+            index for index, layer in enumerate(self.layers)
+            if layer.group is group
+        ]
+        self._push_undo("Duplicate group")
+        name = f"{group.name} copy"
+        if members:
+            copies = [
+                self.layers[index].copy(name=f"{self.layers[index].name} copy")
+                for index in members
+            ]
+            insert_at = members[-1] + 1
+            self.layers[insert_at:insert_at] = copies
+            duplicate = self.current.new_group(name, copies)
+        else:
+            duplicate = self.current.add_group(name)
+        duplicate.visible = group.visible
+        duplicate.opacity = group.opacity
+        duplicate.collapsed = group.collapsed
+        duplicate.filters = [filters.clone(spec) for spec in group.filters]
+        self._group_sel = duplicate
+        self._group_filter_sel = None
+        self._refresh_layer_list()
+        self.render()
+        self.set_result(f"Duplicated group '{group.name}'.")
+
     # ------------------------------------------------------------------ filters
     def _on_filter_select(self, layer_index, filter_index):
         """Select a filter row in the layer panel and make its layer active."""
@@ -4762,6 +4799,47 @@ class PaintApp:
         self._refresh_layer_list()
         self.render()
 
+    def duplicate_selected_text(self):
+        """Copy the selected text object, placing the copy just above it."""
+        target = self._text_target()
+        if target is None:
+            self.set_result("Select a text object first.")
+            return
+        layer, index = target
+        if layer.is_locked():
+            self._active_layer_locked()
+            return
+        self.drawing.commit_text()
+        copy = textrender.clone(layer.texts[index])
+        if copy is None:
+            return
+        self._push_undo("Duplicate text")
+        layer.texts.insert(index + 1, copy)
+        layer.invalidate_texts()
+        self._text_sel = (self.layers.index(layer), index + 1)
+        self._refresh_layer_list()
+        self.render()
+        self.set_result(f"Duplicated text on '{layer.name}'.")
+
+    def toggle_selected_text_visible(self):
+        """Show or hide the selected text object without removing it."""
+        target = self._text_target()
+        if target is None:
+            self.set_result("Select a text object first.")
+            return
+        layer, index = target
+        self.drawing.commit_text()
+        self._push_undo("Toggle text visibility")
+        spec = layer.texts[index]
+        if spec.get("hidden"):
+            spec.pop("hidden", None)
+        else:
+            spec["hidden"] = True
+        layer.invalidate_texts()
+        self._text_sel = (self.layers.index(layer), index)
+        self._refresh_layer_list()
+        self.render()
+
     # --------------------------------------------------------------------- path
     def _on_path_select(self, layer_index, path_index):
         """Select a path row in the layer panel and make its layer active."""
@@ -4847,6 +4925,47 @@ class PaintApp:
         )
         layer.invalidate_paths()
         self._path_sel = (self.layers.index(layer), target_index)
+        self._refresh_layer_list()
+        self.render()
+
+    def duplicate_selected_path(self):
+        """Copy the selected path object, placing the copy just above it."""
+        target = self._path_target()
+        if target is None:
+            self.set_result("Select a path object first.")
+            return
+        layer, index = target
+        if layer.is_locked():
+            self._active_layer_locked()
+            return
+        self.drawing.finish_path()
+        copy = path.clone(layer.paths[index])
+        if copy is None:
+            return
+        self._push_undo("Duplicate path")
+        layer.paths.insert(index + 1, copy)
+        layer.invalidate_paths()
+        self._path_sel = (self.layers.index(layer), index + 1)
+        self._refresh_layer_list()
+        self.render()
+        self.set_result(f"Duplicated path on '{layer.name}'.")
+
+    def toggle_selected_path_visible(self):
+        """Show or hide the selected path object without removing it."""
+        target = self._path_target()
+        if target is None:
+            self.set_result("Select a path object first.")
+            return
+        layer, index = target
+        self.drawing.finish_path()
+        self._push_undo("Toggle path visibility")
+        spec = layer.paths[index]
+        if spec.get("hidden"):
+            spec.pop("hidden", None)
+        else:
+            spec["hidden"] = True
+        layer.invalidate_paths()
+        self._path_sel = (self.layers.index(layer), index)
         self._refresh_layer_list()
         self.render()
 

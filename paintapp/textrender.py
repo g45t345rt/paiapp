@@ -129,7 +129,7 @@ def normalize(spec):
         y = float(spec.get("y", 0.0))
     except (TypeError, ValueError):
         x = y = 0.0
-    return {
+    result = {
         "text": str(spec.get("text", "") or ""),
         "family": family,
         "size": size,
@@ -147,6 +147,11 @@ def normalize(spec):
         "x": x,
         "y": y,
     }
+    # Hidden objects stay on their layer but are skipped when drawn; the key
+    # is only written when set so visible specs keep their original shape.
+    if spec.get("hidden"):
+        result["hidden"] = True
+    return result
 
 
 def clone(spec):
@@ -882,7 +887,7 @@ def paste(image, spec, offset=(0, 0)):
     document offset, so an anchor in document space lands correctly in the layer
     buffer.
     """
-    if not spec.get("text", ""):
+    if not spec.get("text", "") or spec.get("hidden"):
         return image
     sprite, anchor_px = _compose_sprite(spec)
     ox, oy = offset

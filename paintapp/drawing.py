@@ -10062,7 +10062,17 @@ class DrawingController:
         if doc is None or layer is None:
             self._move_layers = []
             return
-        indices = self.app.layer_panel.selected_indices(len(doc.layers))
+        panel = self.app.layer_panel
+        indices = set(panel.selected_indices(len(doc.layers)))
+        # A selected group header moves every member of that group.
+        groups = panel.selected_groups()
+        if groups:
+            indices.update(
+                index for index, item in enumerate(doc.layers)
+                if item.group is not None
+                and any(item.group is group for group in groups)
+            )
+        indices = sorted(indices)
         if not indices:
             indices = [doc.layers.index(layer)]
         # The Move tool moves every selected layer at once, but never a locked

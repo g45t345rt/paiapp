@@ -206,7 +206,7 @@ def normalize(spec):
     except (TypeError, ValueError):
         opacity = 100
     opacity = max(1, min(100, opacity))
-    return {
+    result = {
         "anchors": anchors,
         "handles_in": handles_in,
         "handles_out": handles_out,
@@ -222,6 +222,11 @@ def normalize(spec):
         "cap": cap,
         "join": join,
     }
+    # Hidden paths stay on their layer but are skipped when drawn; the key is
+    # only written when set so visible specs keep their original shape.
+    if spec.get("hidden"):
+        result["hidden"] = True
+    return result
 
 
 def clone(spec):
@@ -680,7 +685,7 @@ def paste(image, spec, offset=(0, 0)):
     supersampled canvas, and any part outside ``image`` is clipped rather than
     raising. Returns the image (mutated in place).
     """
-    if not spec.get("anchors"):
+    if not spec.get("anchors") or spec.get("hidden"):
         return image
     if image.mode != "RGBA":
         image = image.convert("RGBA")
