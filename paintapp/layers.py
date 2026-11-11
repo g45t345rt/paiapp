@@ -1814,10 +1814,22 @@ class LayerPanel(tk.Frame):
             return None
         return self._layers[index]
 
+    def _context_layers(self):
+        """Every layer the layer actions target: the whole layer selection,
+        or just the owning layer for a filter, text or path row."""
+        if self._filter_active() or self._text_active() or self._path_active():
+            layer = self._context_layer()
+            return [layer] if layer is not None else []
+        return [
+            self._layers[i] for i in self.selected_indices(len(self._layers))
+            if 0 <= i < len(self._layers)
+        ]
+
     def _layer_has_filters(self):
-        """True when the target layer has filters and can be modified."""
-        layer = self._context_layer()
-        return bool(layer is not None and layer.filters and not layer.is_locked())
+        """True when any target layer has filters and can be modified."""
+        return any(
+            l.filters and not l.is_locked() for l in self._context_layers()
+        )
 
     def _group_has_filters(self):
         """True when the target group exists and has any filters."""
@@ -1831,14 +1843,16 @@ class LayerPanel(tk.Frame):
         return None
 
     def _layer_has_texts(self):
-        """True when the target layer has text objects and can be modified."""
-        layer = self._context_layer()
-        return bool(layer is not None and layer.texts and not layer.is_locked())
+        """True when any target layer has text objects and can be modified."""
+        return any(
+            l.texts and not l.is_locked() for l in self._context_layers()
+        )
 
     def _layer_has_paths(self):
-        """True when the target layer has path objects and can be modified."""
-        layer = self._context_layer()
-        return bool(layer is not None and layer.paths and not layer.is_locked())
+        """True when any target layer has path objects and can be modified."""
+        return any(
+            l.paths and not l.is_locked() for l in self._context_layers()
+        )
 
     def _clip_selected(self):
         if self._on_clip is not None:
@@ -1915,12 +1929,20 @@ class LayerPanel(tk.Frame):
             menu.add_separator()
             menu.add_command("Remove Filter", command=self.delete_current)
             return menu
+        # Rename and Select Master target one layer, so they are muted while
+        # several layers are selected; every other layer action applies to
+        # the whole selection.
+        single = len(self.selected_indices(len(self._layers))) <= 1
         # Layer actions
-        menu.add_command("Rename Layer...", command=self._handle_rename)
+        menu.add_command(
+            "Rename Layer...", command=self._handle_rename, enabled=single
+        )
         if include_primary:
             menu.add_command("Add Layer", command=self._on_add)
             menu.add_command("Duplicate Layer", command=self._on_duplicate)
-            menu.add_command("Merge Layers", command=self._handle_merge)
+            menu.add_command(
+                "Merge Layers", command=self._handle_merge, enabled=not single
+            )
             menu.add_command("Delete Layer", command=self.delete_current)
         menu.add_separator()
         # Visibility / state actions
@@ -1942,7 +1964,7 @@ class LayerPanel(tk.Frame):
         menu.add_command("Add to Assets", command=self._handle_add_to_assets)
         menu.add_separator()
         # Link Layer actions
-        self._add_link_menu(menu)
+        self._add_link_menu(menu, single)
         # Effects / rasterize actions
         menu.add_command(
             "Apply Filters", command=self._on_apply_filters,
@@ -1982,18 +2004,35 @@ class LayerPanel(tk.Frame):
             menu.add_cascade("Move to Group", move_menu)
         return menu
 
-    def _add_link_menu(self, menu):
-        """Add the Link Layer actions for the current layer selection."""
+    def _add_link_menu(self, menu, single=True):
+        """Add the Link Layer actions for the current layer selection.
+
+        ``single`` is False while several layers are selected: Convert, Remove
+        Master, Unlink and Reset Transform then apply to every eligible
+        selected layer, and Select Master (one destination) is muted.
+        """
         layer = self._context_layer()
-        is_link = bool(layer is not None and getattr(layer, "is_link", False))
-        is_master = bool(layer is not None and getattr(layer, "is_master", False))
+        targets = [layer] if single else self._context_layers()
+        any_link = any(getattr(l, "is_link", False) for l in targets)
+        any_master = any(getattr(l, "is_master", False) for l in targets)
+        any_plain = any(
+            not getattr(l, "is_link", False) and not getattr(l, "is_master", False)
+            for l in targets if l is not None
+        )
+        any_transform = any(
+            getattr(l, "is_link", False) and getattr(l, "transform", None) is not None
+            for l in targets
+        )
+        is_link = bool(
+            single and layer is not None and getattr(layer, "is_link", False)
+        )
         menu.add_command(
             "Convert to Master Layer", command=self._handle_master_convert,
-            enabled=bool(layer is not None and not is_link and not is_master),
+            enabled=any_plain,
         )
         menu.add_command(
             "Remove Master Layer", command=self._handle_master_remove,
-            enabled=is_master,
+            enabled=any_master,
         )
         choices = self._get_master_choices() if self._get_master_choices else []
         if choices:
@@ -2008,14 +2047,14 @@ class LayerPanel(tk.Frame):
                 "Create Link Layer", command=lambda: None, enabled=False
             )
         menu.add_command(
-            "Unlink Layer", command=self._handle_unlink, enabled=is_link
+            "Unlink Layer", command=self._handle_unlink, enabled=any_link
         )
         menu.add_command(
             "Select Master", command=self._handle_select_master, enabled=is_link
         )
         menu.add_command(
             "Reset Link Transform", command=self._handle_link_reset_transform,
-            enabled=bool(is_link and getattr(layer, "transform", None) is not None),
+            enabled=any_transform,
         )
         menu.add_separator()
 

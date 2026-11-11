@@ -1848,6 +1848,28 @@ class PaintApp:
             return None
         return self.current.active_layer()
 
+    def _multi_layer_selection(self):
+        """The selected layer indices when more than one layer is selected.
+
+        Returns ``None`` for a single (or empty) selection, so callers keep
+        their one-layer path, which acts on the active layer.
+        """
+        if self.current is None or not hasattr(self, "layer_panel"):
+            return None
+        indices = list(self.layer_panel.selected_indices(len(self.layers)))
+        return indices if len(indices) > 1 else None
+
+    def _layer_pixels_blocked(self, layer):
+        """True when ``layer``'s pixels cannot be edited (link, lock, hidden).
+
+        The silent per-layer counterpart of :meth:`_active_layer_locked`, used
+        by the multi-layer actions to skip layers instead of aborting.
+        """
+        return bool(
+            layer.is_link or layer.locked
+            or (not layer.visible and not self.show_exploded)
+        )
+
     def _active_layer_locked(self, mask=False):
         """True (and reports) when the active layer cannot be modified.
 
@@ -2581,6 +2603,24 @@ class PaintApp:
             self.set_result("There is no canvas to add an asset to.")
             return
         if index is None:
+            multi = self._multi_layer_selection()
+            if multi is not None:
+                self._push_undo("Add layers to assets")
+                asset = None
+                for i in multi:
+                    layer = self.layers[i]
+                    image = layer.composited_image()
+                    image = (
+                        image.copy() if image.mode == "RGBA"
+                        else image.convert("RGBA")
+                    )
+                    asset = self.current.add_asset(
+                        name=layer.name, image=image, source="layer",
+                    )
+                self._refresh_asset_list()
+                self._select_asset(asset)
+                self.set_result(f"Added {len(multi)} layers to the assets.")
+                return
             indices = (
                 self.layer_panel.selected_indices(len(self.layers))
                 if hasattr(self, "layer_panel") else []
@@ -3184,6 +3224,23 @@ class PaintApp:
         self.set_result(f"Rasterized poses on '{layer.name}'.")
 
     def duplicate_layer(self):
+        multi = self._multi_layer_selection()
+        if multi is not None:
+            self._push_undo("Duplicate layers")
+            # Insert from the top down so lower indices stay valid; each copy
+            # lands just above its source.
+            copies = []
+            for index in sorted(multi, reverse=True):
+                source = self.layers[index]
+                duplicate = source.copy(name=f"{source.name} copy")
+                self.layers.insert(index + 1, duplicate)
+                copies.append(duplicate)
+            selected = sorted(self.layers.index(c) for c in copies)
+            self.active = selected[-1]
+            self._refresh_layer_list(selected)
+            self.render()
+            self.set_result(f"Duplicated {len(copies)} layers.")
+            return
         indices = self.layer_panel.selected_indices(len(self.layers))
         index = indices[0] if len(indices) == 1 else self.active
         if not (0 <= index < len(self.layers)):
@@ -3248,6 +3305,22 @@ class PaintApp:
 
     def convert_to_master(self):
         """Promote the active layer to a master a link layer can point at."""
+        multi = self._multi_layer_selection()
+        if multi is not None:
+            targets = [
+                self.layers[i] for i in multi
+                if not self.layers[i].is_link and not self.layers[i].is_master
+            ]
+            if not targets:
+                self.set_result("No selected layer can become a master.")
+                return
+            self._push_undo("Convert to master")
+            for layer in targets:
+                layer.is_master = True
+                layer.master_id = self._next_master_id()
+            self._refresh_layer_list(multi)
+            self.set_result(f"{len(targets)} layer(s) are now masters.")
+            return
         layer = self.active_layer()
         if self.current is None or layer is None:
             self.set_result("There is no layer to convert.")
@@ -3272,6 +3345,14 @@ class PaintApp:
         With links present a dialog lists them so the user can confirm breaking
         each into an independent copy; otherwise a plain confirmation is shown.
         """
+        multi = self._multi_layer_selection()
+        if multi is not None:
+            self._remove_masters(
+                [self.layers[i] for i in multi
+                 if getattr(self.layers[i], "is_master", False)],
+                multi,
+            )
+            return
         layer = self.active_layer()
         if self.current is None or layer is None:
             self.set_result("There is no layer to remove as a master.")
@@ -3302,6 +3383,35 @@ class PaintApp:
         self._refresh_layer_list()
         self.render()
         self.set_result(f"Layer '{layer.name}' is no longer a master.")
+
+    def _remove_masters(self, masters, selected):
+        """Demote several masters behind one confirmation and undo step."""
+        if not masters:
+            self.set_result("No selected layer is a master.")
+            return
+        listing = []
+        for master in masters:
+            for canvas, link in self._links_to_master(master.master_id):
+                where = canvas.name if canvas is not self.current else "This canvas"
+                listing.append((where, f"{link.name}  (of {master.name})"))
+        names = ", ".join(m.name for m in masters)
+        if listing:
+            if not dialogs.ask_remove_master(self.root, names, listing):
+                return
+        elif not dialogs.ask_yes_no(
+            self.root,
+            "Remove Master Layer",
+            f"Remove master status from {len(masters)} layers?",
+        ):
+            return
+        self._push_undo("Remove master layers")
+        for master in masters:
+            self._unlink_links_to(master.master_id, master)
+            master.is_master = False
+            master.master_id = None
+        self._refresh_layer_list(selected)
+        self.render()
+        self.set_result(f"{len(masters)} layer(s) are no longer masters.")
 
     def master_choices(self):
         """Masters offered by the Link Layer picker: ``(label, layer)`` pairs."""
@@ -3339,6 +3449,23 @@ class PaintApp:
 
     def unlink_layer(self):
         """Break the active link layer into an independent copy of its master."""
+        multi = self._multi_layer_selection()
+        if multi is not None:
+            targets = [self.layers[i] for i in multi if self.layers[i].is_link]
+            if not targets:
+                self.set_result("No selected layer is a link layer.")
+                return
+            self._push_undo("Unlink layers")
+            for layer in targets:
+                layer.adopt_content(layer.content_source())
+                layer.link_id = None
+                layer.master = None
+            self._refresh_layer_list(multi)
+            self.render()
+            if self._transform_mode_active():
+                self.drawing.sync_transform()
+            self.set_result(f"Unlinked {len(targets)} layer(s).")
+            return
         layer = self.active_layer()
         if layer is None or not layer.is_link:
             self.set_result("The active layer is not a link layer.")
@@ -3367,6 +3494,25 @@ class PaintApp:
 
     def reset_link_transform(self):
         """Drop a link layer's per-instance transform (back to the master)."""
+        multi = self._multi_layer_selection()
+        if multi is not None:
+            targets = [
+                self.layers[i] for i in multi
+                if self.layers[i].is_link
+                and getattr(self.layers[i], "transform", None) is not None
+            ]
+            if not targets:
+                self.set_result("No selected link layer has a transform.")
+                return
+            self._push_undo("Reset link transform")
+            for layer in targets:
+                layer.clear_transform()
+            self._refresh_layer_list(multi)
+            self.render()
+            if self._transform_mode_active():
+                self.drawing.sync_transform()
+            self.set_result(f"Reset the transform on {len(targets)} layer(s).")
+            return
         layer = self.active_layer()
         if layer is None or not layer.is_link:
             self.set_result("The active layer is not a link layer.")
@@ -3496,9 +3642,42 @@ class PaintApp:
         """Move the active layer one block up (``1``) or down (``-1``).
 
         A layer in a group moves together with the rest of its group, so the
-        group's members always stay adjacent.
+        group's members always stay adjacent. With several layers selected,
+        every block holding a selected layer moves one step together; a block
+        already at the edge (or stuck behind one that is) stays put.
         """
+        multi = self._multi_layer_selection()
+        if multi is not None:
+            self._move_blocks(set(multi), delta, "Move layers")
+            return
         self._move_block(self.active, delta, "Move layer")
+
+    def _move_blocks(self, indices, delta, label):
+        """Move every block that holds one of ``indices`` one step by ``delta``."""
+        blocks = self._layer_blocks()
+        chosen = [any(i in indices for i in b[1]) for b in blocks]
+        order = list(range(len(blocks)))
+        moved = False
+        # Walk from the leading edge so a selected block only swaps with an
+        # unselected neighbour; runs of selected blocks move as one.
+        slots = range(len(order) - 2, -1, -1) if delta > 0 else range(1, len(order))
+        for slot in slots:
+            other = slot + delta
+            if chosen[order[slot]] and not chosen[order[other]]:
+                order[slot], order[other] = order[other], order[slot]
+                moved = True
+        if not moved:
+            return
+        selected_layers = [self.layers[i] for i in sorted(indices)]
+        active_layer = self.layers[self.active]
+        self._push_undo(label)
+        ordered = []
+        for slot in order:
+            ordered.extend(self.layers[i] for i in blocks[slot][1])
+        self.current.layers = ordered
+        self.active = ordered.index(active_layer)
+        self._refresh_layer_list(sorted(ordered.index(l) for l in selected_layers))
+        self.render()
 
     def _layer_blocks(self):
         """The layer stack as ordered blocks: a bare layer, or a group run.
@@ -3835,7 +4014,24 @@ class PaintApp:
             return
         indices = self.layer_panel.selected_indices(len(self.layers))
         if len(indices) > 1:
-            self.set_result("Select a single layer to isolate.")
+            keep = set(indices)
+            if all(
+                layer.visible == (i in keep)
+                for i, layer in enumerate(self.layers)
+            ):
+                self.set_result("The selected layers are already isolated.")
+                return
+            self._push_undo("Isolate layers")
+            if self._isolate_state is None:
+                self._isolate_state = self._capture_isolation()
+            for i, layer in enumerate(self.layers):
+                layer.visible = i in keep
+                group = getattr(layer, "group", None)
+                if i in keep and group is not None:
+                    group.visible = True
+            self._refresh_layer_list(sorted(keep))
+            self.render()
+            self.set_result(f"Isolated {len(keep)} layers.")
             return
         index = indices[0] if indices else self.active
         if not (0 <= index < len(self.layers)):
@@ -4620,6 +4816,14 @@ class PaintApp:
 
     def rasterize_selected_paths(self):
         """Fold the active layer's path objects into its pixels (destructive)."""
+        multi = self._multi_layer_selection()
+        if multi is not None:
+            self.drawing.finish_path()
+            self._bake_layers(
+                multi, lambda l: bool(l.paths), lambda l: l.rasterize_paths(),
+                "Rasterize paths", "paths", "_path_sel",
+            )
+            return
         layer = self.active_layer()
         if layer is None:
             self.set_result("There is no layer with paths.")
@@ -4664,6 +4868,33 @@ class PaintApp:
         self.render()
         self.set_result(f"Rasterized path on '{layer.name}'.")
 
+    def _bake_layers(self, indices, has_content, bake, label, noun, sel_attr):
+        """Run ``bake`` on every selected layer that ``has_content``.
+
+        Locked, hidden and link layers are skipped rather than aborting the
+        whole action; everything baked shares one undo step.
+        """
+        layers = [self.layers[i] for i in indices]
+        candidates = [l for l in layers if has_content(l)]
+        targets = [l for l in candidates if not self._layer_pixels_blocked(l)]
+        if not targets:
+            if candidates:
+                self.set_result(f"The selected layers with {noun} are locked.")
+            else:
+                self.set_result(f"No selected layer has {noun}.")
+            return
+        self._push_undo(label)
+        for layer in targets:
+            bake(layer)
+        setattr(self, sel_attr, None)
+        self._refresh_layer_list(indices)
+        self.render()
+        skipped = len(candidates) - len(targets)
+        message = f"{label} on {len(targets)} layer(s)."
+        if skipped:
+            message += f" Skipped {skipped} locked layer(s)."
+        self.set_result(message)
+
     def bake_filters(self):
         """Flatten the active layer's filter chain into its pixels (destructive).
 
@@ -4676,6 +4907,17 @@ class PaintApp:
         group = self._selected_group()
         if group is not None:
             self.apply_group_filters()
+            return
+        multi = self._multi_layer_selection()
+        if multi is not None:
+            def bake(layer):
+                layer.set_image(layer.filtered_image())
+                layer.filters = []
+                layer.invalidate_filters()
+            self._bake_layers(
+                multi, lambda l: bool(l.filters), bake,
+                "Apply filters", "filters", "_filter_sel",
+            )
             return
         layer = self.active_layer()
         if layer is None:
@@ -4853,6 +5095,14 @@ class PaintApp:
         pixels and the list is cleared, so later copy/cut/selection edits work
         on the flattened glyphs instead of live text.
         """
+        multi = self._multi_layer_selection()
+        if multi is not None:
+            self.drawing.commit_text()
+            self._bake_layers(
+                multi, lambda l: bool(l.texts), lambda l: l.rasterize_texts(),
+                "Rasterize texts", "text", "_text_sel",
+            )
+            return
         layer = self.active_layer()
         if layer is None:
             self.set_result("There is no layer with text.")
@@ -5230,6 +5480,29 @@ class PaintApp:
         self.set_result(f"Merged {len(indices)} layers into {target.name}.")
 
     def clear(self):
+        multi = self._multi_layer_selection()
+        if multi is not None:
+            layers = [self.layers[i] for i in multi]
+            if any(self._layer_pixels_blocked(l) for l in layers):
+                self.set_result("Cannot clear a hidden, locked or link layer.")
+                return
+            if not dialogs.ask_yes_no(
+                self.root, "Clear Layer", f"Clear {len(layers)} layers?",
+            ):
+                return
+            self.drawing.commit_text()
+            self.drawing.finish_path()
+            self._push_undo("Clear layers")
+            self.current.bake_offsets()
+            for layer in layers:
+                self._wipe_layer(layer)
+            self._filter_sel = None
+            self._text_sel = None
+            self._path_sel = None
+            self._refresh_layer_list(multi)
+            self.set_result("")
+            self.render()
+            return
         if self._active_layer_locked():
             return
         layer = self.active_layer()
@@ -5243,6 +5516,16 @@ class PaintApp:
         self.drawing.finish_path()
         self._push_undo("Clear layer")
         self.current.bake_offsets()
+        self._wipe_layer(layer)
+        self._filter_sel = None
+        self._text_sel = None
+        self._path_sel = None
+        self._refresh_layer_list()
+        self.set_result("")
+        self.render()
+
+    def _wipe_layer(self, layer):
+        """Erase ``layer``'s pixels and drop its filters and editable objects."""
         layer.begin_write()
         # Clear the whole buffer, not just the canvas rectangle: a layer moved
         # past the canvas edge can carry off-canvas pixels in a larger image
@@ -5260,12 +5543,6 @@ class PaintApp:
         layer.invalidate_paths()
         layer.invalidate_vectors()
         layer.invalidate_poses()
-        self._filter_sel = None
-        self._text_sel = None
-        self._path_sel = None
-        self._refresh_layer_list()
-        self.set_result("")
-        self.render()
 
     # ------------------------------------------------------------------ edit
     def _history(self):
