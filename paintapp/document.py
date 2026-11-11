@@ -174,6 +174,18 @@ def _affine_bounds(matrix, size):
     return (min(xs), min(ys), max(xs), max(ys))
 
 
+def _affine_to_pil(matrix):
+    """An affine 6-tuple as Pillow's ``Image.transform(AFFINE)`` data.
+
+    Both describe a mapping of ``(x, y)``, but the affine tuple stores the
+    translation last (``a, b, c, d, e, f``) while Pillow interleaves it
+    (``a, c, e, b, d, f``). Pillow reads the data as output-to-input, so pass
+    the *inverse* mapping when resampling a frame into another.
+    """
+    a, b, c, d, e, f = matrix
+    return (a, c, e, b, d, f)
+
+
 def _draft_spec(spec):
     """A shallow copy of ``spec`` with anti-aliasing off, for a drag preview.
 
@@ -325,6 +337,7 @@ def _mip_region(layer, left, top, ix0, iy0, ix1, iy1, scale, ax, ay, ox, oy):
         source._text_token, source._vector_token, source._poses_token,
         source._path_token, source._mask_token, tuple(layer.content_offset()),
         None if layer.transform is None else tuple(layer.transform), level,
+        layer._mask_token,
     )
     cache = getattr(layer, "_mip_cache", None)
     if cache is None or cache[0] != key:
@@ -622,6 +635,15 @@ class Layer:
         self._mask_token = 0
         self._composite_cache = None
         self._composite_key = None
+        # Cache of a link layer's composite with its own per-instance mask
+        # folded in (see :meth:`Layer._mask_instance`), keyed on the master's
+        # content tokens, this layer's transform/offset and its mask version.
+        self._instance_mask_cache = None
+        self._instance_mask_key = None
+        # Cache of that mask resampled to a buffer size it was not painted at
+        # (see :meth:`Layer._instance_mask_at`).
+        self._instance_mask_scale = None
+        self._instance_mask_scale_key = None
 
     @property
     def mask(self):
@@ -727,10 +749,14 @@ class Layer:
         layer keeps showing what it did, but now owns the pixels, mask, effect
         chain and editable objects. The layer's own transform and appearance
         (``offset``/``opacity``/``blend``/``visible``/``locked``/``group``) are
-        left untouched.
+        left untouched. A link's own per-instance mask is folded into the
+        adopted mask, so unlinking does not silently reveal masked-out pixels.
         """
+        instance_mask = self._mask if self.is_link else None
         self.set_image(other.image.copy())
         self.mask = other.mask.copy() if other.mask is not None else None
+        if instance_mask is not None:
+            self.mask = self._adopt_instance_mask(instance_mask)
         self.filters = [filters.clone(spec) for spec in other.filters]
         self.texts = [
             clone for clone in (textrender.clone(spec) for spec in other.texts)
@@ -768,6 +794,25 @@ class Layer:
         self.invalidate_poses()
         self.invalidate_paths()
 
+    def _adopt_instance_mask(self, instance_mask):
+        """``instance_mask`` (buffer frame) folded into this layer's mask.
+
+        The adopted pixels are the master's *content*, which the retained
+        transform still maps into the buffer frame, so the instance mask is
+        carried back through it before it multiplies the master's mask.
+        """
+        content_size = self.image.size
+        if self.transform is not None:
+            instance_mask = instance_mask.transform(
+                content_size, Image.AFFINE, _affine_to_pil(self.transform),
+                resample=Image.BICUBIC,
+            )
+        elif instance_mask.size != content_size:
+            instance_mask = instance_mask.resize(content_size, Image.BICUBIC)
+        if self.mask is None:
+            return instance_mask
+        return ImageChops.multiply(self.mask, instance_mask)
+
     @property
     def pixels_token(self):
         """A value that changes whenever this layer's pixels do.
@@ -782,6 +827,10 @@ class Layer:
             id(source.image), source._image_token, source._mask_token,
             source._text_token, source._vector_token, source._poses_token,
             source._path_token,
+            # A link's own mask shapes its composite on top of the master's, so
+            # its version belongs in the token (a no-op for a plain layer, whose
+            # mask is already the source's).
+            self._mask_token,
         )
 
     def content_offset(self):
@@ -857,7 +906,7 @@ class Layer:
         self._filter_key = key
         return result
 
-    def composited_image(self, include_mask=True):
+    def composited_image(self, include_mask=True, include_link_mask=True):
         """What the layer contributes to a composite: filtered pixels, texts, masked.
 
         The masked result is cached and reused while the base pixels, filter
@@ -870,11 +919,74 @@ class Layer:
         ``include_mask=False`` returns the same content without folding the mask
         into its alpha. The layer panel uses it for the row thumbnail, which
         shows the layer and its mask as two separate previews.
+
+        ``include_link_mask=False`` folds only the *source's* mask, leaving a
+        link's own per-instance mask out. Saving uses it for a link's fallback
+        PNG, whose mask is stored beside it and so must not be baked twice.
         """
         source = self.content_source()
         if self.transform is not None:
-            return self._transformed_image(source, self.transform, include_mask)
-        return source._composited_image_at(self.content_offset(), include_mask)
+            image = self._transformed_image(source, self.transform, include_mask)
+        else:
+            image = source._composited_image_at(self.content_offset(), include_mask)
+        if not include_mask or not include_link_mask:
+            return image
+        return self._mask_instance(image)
+
+    def _mask_instance(self, image):
+        """Fold a link layer's own per-instance mask into ``image`` (cached).
+
+        A plain layer's mask is already folded by
+        :meth:`_composited_image_at`; only a link keeps a mask the master knows
+        nothing about, so this is a no-op unless the layer is a resolved link
+        that carries one. The master's own mask stays folded underneath, so the
+        two multiply the way an instance mask does in other editors.
+        """
+        if not self.is_link or self._mask is None:
+            return image
+        key = (
+            self._content_tokens(),
+            None if self.transform is None else tuple(self.transform),
+            tuple(self.content_offset()),
+            self._mask_token,
+            image.size,
+        )
+        if self._instance_mask_cache is not None and self._instance_mask_key == key:
+            return self._instance_mask_cache
+        mask = self._instance_mask_at(image.size)
+        masked = image if "A" in image.getbands() else image.convert("RGBA")
+        masked = masked.copy()
+        masked.putalpha(ImageChops.multiply(masked.getchannel("A"), mask))
+        self._instance_mask_cache = masked
+        self._instance_mask_key = key
+        return masked
+
+    def _instance_mask_at(self, size):
+        """This layer's own mask as an ``"L"`` image of ``size``.
+
+        The mask lives in the layer's own buffer frame. A per-instance transform
+        applied after it was painted changes that frame, so a stale mask is
+        resampled (and cached) rather than raising on the alpha multiply.
+        """
+        mask = self._mask
+        if mask is None or mask.size == size:
+            return mask
+        key = (self._mask_token, size)
+        if self._instance_mask_scale_key == key:
+            return self._instance_mask_scale
+        scaled = mask.resize(size, Image.BICUBIC)
+        self._instance_mask_scale = scaled
+        self._instance_mask_scale_key = key
+        return scaled
+
+    def _content_tokens(self):
+        """The master's content versions a link's composite depends on."""
+        source = self.content_source()
+        return (
+            id(source), source._image_token, filters.chain_key(source.filters),
+            source._text_token, source._vector_token, source._poses_token,
+            source._path_token, source._mask_token,
+        )
 
     def _transformed_image(self, source, matrix, include_mask=True):
         """The source's composite resampled through ``matrix`` (cached).
@@ -965,12 +1077,22 @@ class Layer:
         re-multiplying the whole layer on every commit. Filters and text are
         still resolved through their full-image caches (so they are correct),
         then cropped. A link resolves the master's content at the link's offset;
-        with a per-instance transform, the content is resampled first.
+        with a per-instance transform, the content is resampled first. A link's
+        own per-instance mask, which the master knows nothing about, is folded in
+        here as well.
         """
         source = self.content_source()
         if self.transform is not None:
-            return self._transformed_image(source, self.transform).crop(box)
-        return source._composited_region_at(box, self.content_offset())
+            image = self._transformed_image(source, self.transform).crop(box)
+        else:
+            image = source._composited_region_at(box, self.content_offset())
+        if not self.is_link or self._mask is None:
+            return image
+        mask = self._instance_mask_at(self.size).crop(box)
+        image = image if "A" in image.getbands() else image.convert("RGBA")
+        image = image.copy()
+        image.putalpha(ImageChops.multiply(image.getchannel("A"), mask))
+        return image
 
     def _composited_region_at(self, box, offset):
         """``composited_region`` for this layer's own content drawn at ``offset``."""
@@ -1250,8 +1372,50 @@ class Layer:
         self._transform_key = None
 
     def clear_transform(self):
-        """Drop the per-instance transform (back to the master's own pixels)."""
+        """Drop the per-instance transform (back to the master's own pixels).
+
+        An instance mask lives in the layer's buffer frame, which the transform
+        defines, so it is carried back into the master's own frame with it.
+        """
+        previous = self.transform
         self.set_transform(None)
+        if previous is not None and self._mask is not None:
+            self.mask = self._mask.transform(
+                self.size, Image.AFFINE, _affine_to_pil(previous),
+                resample=Image.BICUBIC,
+            )
+
+    def crop_mask(self, box):
+        """Re-frame this layer's own mask for a canvas crop to ``box``.
+
+        ``box`` is the kept rectangle in document pixels, which is also the
+        frame the content is cropped in (the caller bakes offsets first). A
+        plain layer's mask is cropped by the caller alongside its pixels; a link
+        keeps its pixels and only moves its offset, so this keeps its own mask
+        aligned with the master content it shapes. With a per-instance transform
+        the crop happens in the content frame, so the mask is carried through
+        that transform and back.
+        """
+        mask = self._mask
+        if mask is None:
+            return
+        if self.transform is None:
+            self.mask = mask.crop(box)
+            return
+        matrix = self.transform
+        bounds = _affine_bounds(matrix, (box[2] - box[0], box[3] - box[1]))
+        size = (
+            max(1, math.ceil(bounds[2] - math.floor(bounds[0]))),
+            max(1, math.ceil(bounds[3] - math.floor(bounds[1]))),
+        )
+        frame = _affine_mul(
+            matrix,
+            _affine_mul(_affine_translate(box[0], box[1]),
+                        _affine_invert(matrix)),
+        )
+        self.mask = mask.transform(
+            size, Image.AFFINE, _affine_to_pil(frame), resample=Image.BICUBIC
+        )
 
 
 class Asset:
@@ -2415,6 +2579,8 @@ class Canvas:
 
         A link keys on its master's content tokens (via ``content_source``) so a
         change to the master invalidates every canvas that shows a link to it.
+        A link's own mask token rides along so masking one instance invalidates
+        only that canvas (a no-op for a plain layer, whose mask is the source's).
         """
         content = layer.content_source()
         group = getattr(layer, "group", None)
@@ -2427,6 +2593,7 @@ class Canvas:
             content._poses_token,
             content._path_token,
             content._mask_token,
+            layer._mask_token,
             tuple(layer.offset),
             tuple(getattr(layer, "_content_delta", (0, 0)) or (0, 0)),
             None if layer.transform is None else tuple(layer.transform),

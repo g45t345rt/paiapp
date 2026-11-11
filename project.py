@@ -208,9 +208,13 @@ def snapshot(app):
             )
             # A link layer has no pixels of its own; store what it currently
             # shows so the file still renders somewhere that does not know about
-            # links, and let the master's own PNG be the source of truth.
+            # links, and let the master's own PNG be the source of truth. Its
+            # own per-instance mask is stored beside it (below), so it is left
+            # out here rather than baked into the pixels twice.
             if getattr(layer, "is_link", False):
-                images[filename] = layer.composited_image().copy()
+                images[filename] = layer.composited_image(
+                    include_link_mask=False
+                ).copy()
             else:
                 images[filename] = layer.image.copy()
             mask_file = None
@@ -523,7 +527,12 @@ def apply(app, payload):
             layer.offset = placed_offset
             mask = masks.get((canvas_index, layer_index))
             if mask is not None:
-                layer.mask = _place_layer_mask(mask, layer.image.size, offset)
+                if layer_entry.get("link_id") is not None:
+                    # A link's mask is stored in its own buffer frame, which is
+                    # what it is composited in; placing it would shift it.
+                    layer.mask = mask
+                else:
+                    layer.mask = _place_layer_mask(mask, layer.image.size, offset)
             layer.visible = bool(layer_entry.get("visible", True))
             layer.locked = bool(layer_entry.get("locked", False))
             layer.opacity = float(layer_entry.get("opacity", 1.0))

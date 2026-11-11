@@ -1188,10 +1188,13 @@ class LayerPanel(tk.Frame):
 
         A group header is not an editable target, so while one is selected the
         mask controls stay disabled even though the active layer is unchanged.
+        A link layer keeps its own mask editable, but there is nothing to bake a
+        link's mask into (its pixels belong to the master), so Apply stays off.
         """
         self._mask_layer = layer
         has_layer = layer is not None
         has_mask = has_layer and getattr(layer, "mask", None) is not None
+        is_link = bool(has_layer and getattr(layer, "is_link", False))
         is_group = (
             self._selection_kind in ("group", "group_filter")
             and self._selected_group is not None
@@ -1200,8 +1203,11 @@ class LayerPanel(tk.Frame):
             state=tk.DISABLED if (not has_layer or has_mask or is_group) else tk.NORMAL
         )
         editable = has_mask and not is_group
-        for button in (self.mask_edit_btn, self.apply_mask_btn, self.delete_mask_btn):
+        for button in (self.mask_edit_btn, self.delete_mask_btn):
             button.config(state=tk.NORMAL if editable else tk.DISABLED)
+        self.apply_mask_btn.config(
+            state=tk.NORMAL if (editable and not is_link) else tk.DISABLED
+        )
 
     def set_mask_edit(self, enabled):
         """Reflect the app's mask-edit state without re-firing the callback."""

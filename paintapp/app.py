@@ -1442,10 +1442,12 @@ class PaintApp:
         doc.bake_offsets()
         for layer in doc.layers:
             # A link layer's pixels belong to its master, so only its offset
-            # moves with the new origin; its content is not cropped.
+            # moves with the new origin; its content is not cropped. Its own
+            # mask still follows the master content it shapes.
             if layer.is_link:
                 ox, oy = layer.offset
                 layer.offset = (ox - left, oy - top)
+                layer.crop_mask((left, top, right, bottom))
                 continue
             layer.set_image(layer.image.crop((left, top, right, bottom)))
             if layer.mask is not None:
@@ -1845,8 +1847,13 @@ class PaintApp:
             return None
         return self.current.active_layer()
 
-    def _active_layer_locked(self):
-        """True (and reports) when the active layer cannot be modified."""
+    def _active_layer_locked(self, mask=False):
+        """True (and reports) when the active layer cannot be modified.
+
+        ``mask=True`` asks about the layer's *mask* instead of its pixels: a
+        link layer owns no pixels, but its per-instance mask is its own, so mask
+        edits are allowed on it even though pixel edits are not.
+        """
         if self.current is None:
             self.set_result("There is no canvas. Add a canvas first.")
             return True
@@ -1854,7 +1861,7 @@ class PaintApp:
         if layer is None:
             self.set_result("There is no layer. Add a layer first.")
             return True
-        if layer.is_link:
+        if layer.is_link and not mask:
             self.set_result(
                 f"Layer '{layer.name}' is a link layer. Edit its master layer."
             )
@@ -1930,17 +1937,25 @@ class PaintApp:
         if hasattr(self, "layer_panel"):
             self.layer_panel.sync_previews()
         layer = self.active_layer()
-        if self.tools.inpaint_mask_edit and self.current is not None:
+        mask_origin = (0, 0)
+        if not self.tools.mask_overlay_show:
+            # Overlay hidden: paint the mask blind, showing the raw pixels.
+            preview = None
+        elif self.tools.inpaint_mask_edit and self.current is not None:
             # The overlay tints the dark side of the mask; the inpaint mask is
             # inverted from a layer mask, so tint the painted (255) region.
             mask = self.current.inpaint_mask
             preview = ImageChops.invert(mask) if mask is not None else None
         elif layer is not None and self.tools.mask_edit and layer.mask is not None:
             preview = layer.mask
+            # A layer mask lives in the layer's own buffer frame, which sits at
+            # its offset. Layers are normally baked to the canvas, but a link
+            # is not - and its mask must still land over the right pixels.
+            mask_origin = tuple(layer.offset)
         else:
             preview = None
         view.set_mask_overlay_color(rgba(self.tools.mask_overlay)[:3])
-        view.set_mask_preview(preview)
+        view.set_mask_preview(preview, mask_origin)
         self.drawing.sync_clone_source()
         # Hand the view providers that flatten only the region it needs, so a
         # repaint costs the viewport size rather than the whole canvas. In
@@ -4883,9 +4898,11 @@ class PaintApp:
         """Add a mask to the active layer from the selection (or fully visible).
 
         ``invert=True`` hides the selected region instead of revealing it (or
-        hides everything when there is no selection).
+        hides everything when there is no selection). A link layer accepts one
+        too: it masks that instance alone, on top of whatever the master's own
+        mask already does.
         """
-        if self._active_layer_locked():
+        if self._active_layer_locked(mask=True):
             return
         layer = self.active_layer()
         if layer.mask is not None:
@@ -4893,17 +4910,29 @@ class PaintApp:
             return
         self._push_undo("Add mask")
         self.current.bake_offsets()
-        selection = self.selection
-        if selection is not None and not selection.is_empty():
-            mask = selection.mask.copy()
-            if invert:
-                mask = mask.point(lambda value: 255 - value)
-        else:
-            mask = Image.new("L", layer.size, 0 if invert else 255)
-        layer.mask = mask
+        layer.mask = self._mask_from_selection(layer, invert)
         self._refresh_layer_list()
         self.render()
         self.set_result(f"Added mask to '{layer.name}'.")
+
+    def _mask_from_selection(self, layer, invert=False):
+        """A fresh layer-sized mask holding the selection, or reveal/hide-all.
+
+        The selection lives in document pixels while the mask lives in the
+        layer's own buffer frame, so the selection is placed at the layer's
+        offset. Layers are normally baked to the canvas first (see
+        ``bake_offsets``), which makes the two frames coincide; a link is not
+        baked, so this placement is what keeps its mask aligned.
+        """
+        selection = self.selection
+        if selection is None or selection.is_empty():
+            return Image.new("L", layer.size, 0 if invert else 255)
+        mask = Image.new("L", layer.size, 0)
+        ox, oy = layer.offset
+        mask.paste(selection.mask, (-ox, -oy))
+        if invert:
+            mask = mask.point(lambda value: 255 - value)
+        return mask
 
     def apply_layer_mask(self):
         """Bake the active layer's mask into its alpha channel and drop it."""
@@ -4913,6 +4942,11 @@ class PaintApp:
             return
         if layer.mask is None:
             self.set_result("The active layer has no mask.")
+            return
+        if layer.is_link:
+            self.set_result(
+                f"Layer '{layer.name}' is a link layer; unlink it to apply its mask."
+            )
             return
         if self._active_layer_locked():
             return
@@ -4948,8 +4982,7 @@ class PaintApp:
         if layer is None:
             enabled = False
         elif enabled:
-            if layer.is_locked():
-                self._active_layer_locked()
+            if self._active_layer_locked(mask=True):
                 enabled = False
             elif layer.mask is None:
                 self._push_undo("Add mask")
@@ -5065,6 +5098,8 @@ class PaintApp:
         elif action == "feather":
             radius = args[0] if args else 4
             (self.feather_inpaint_mask if inpaint else self.feather_layer_mask)(radius)
+        elif action == "overlay":
+            self.render()
 
     def _active_mask_layer(self):
         layer = self.active_layer()
@@ -5079,7 +5114,7 @@ class PaintApp:
     def invert_layer_mask(self):
         """Invert the active layer's mask so hidden and revealed areas swap."""
         layer = self._active_mask_layer()
-        if layer is None or self._active_layer_locked():
+        if layer is None or self._active_layer_locked(mask=True):
             return
         self._push_undo("Invert mask")
         layer.mask = ImageChops.invert(layer.mask)
@@ -5090,7 +5125,7 @@ class PaintApp:
     def reset_layer_mask(self):
         """Fill the active layer's mask with reveal-all, discarding its paint."""
         layer = self._active_mask_layer()
-        if layer is None or self._active_layer_locked():
+        if layer is None or self._active_layer_locked(mask=True):
             return
         self._push_undo("Reset mask")
         layer.mask = Image.new("L", layer.mask.size, 255)
@@ -5101,7 +5136,7 @@ class PaintApp:
     def feather_layer_mask(self, radius):
         """Blur the active layer's mask to soften its edges."""
         layer = self._active_mask_layer()
-        if layer is None or self._active_layer_locked():
+        if layer is None or self._active_layer_locked(mask=True):
             return
         radius = max(1, int(radius))
         self._push_undo("Feather mask")

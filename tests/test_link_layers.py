@@ -1,9 +1,9 @@
 """Unit tests for Link Layers (run: .venv\\Scripts\\python.exe tests\\test_link_layers.py).
 
-A Link Layer renders a *master* layer's content while keeping its own position
-and appearance, is read-only, survives save/load, and can be unlinked into an
-independent copy. These tests drive the document model and the ``PaintApp``
-actions directly (no Tk root) plus a project save/load round trip.
+A Link Layer renders a *master* layer's content while keeping its own position,
+appearance and per-instance mask, is read-only, survives save/load, and can be
+unlinked into an independent copy. These tests drive the document model and the
+``PaintApp`` actions directly (no Tk root) plus a project save/load round trip.
 """
 
 import os
@@ -52,22 +52,39 @@ def link_to(doc, master, index=None, offset=(0, 0)):
 
 
 def fake_app(doc):
-    return SimpleNamespace(
+    app = SimpleNamespace(
         current=doc,
         canvases=[doc],
         active=doc.active,
         root=None,
+        show_exploded=False,
+        selection=None,
+        guides_shared=False,
+        area=SimpleNamespace(current_view=lambda: None),
         active_layer=doc.active_layer,
         _push_undo=lambda *_a, **_k: None,
         _refresh_layer_list=lambda *_a, **_k: None,
         _group_sel=None,
         set_result=lambda *_a, **_k: None,
         render=lambda *_a, **_k: None,
+        set_mask_edit=lambda *_a, **_k: None,
+        _sync_gen_size=lambda *_a, **_k: None,
+        _update_title=lambda *_a, **_k: None,
+        _shift_pose_scene=lambda *_a, **_k: None,
         _activate_canvas=lambda *_a, **_k: None,
         _on_layer_select=lambda *_a, **_k: None,
         _transform_mode_active=lambda *_a, **_k: False,
         drawing=SimpleNamespace(sync_transform=lambda *_a, **_k: None),
     )
+    # The mask actions under test call these back through ``self``.
+    app._active_layer_locked = lambda mask=False: PaintApp._active_layer_locked(
+        app, mask=mask
+    )
+    app._active_mask_layer = lambda: PaintApp._active_mask_layer(app)
+    app._mask_from_selection = lambda layer, invert=False: (
+        PaintApp._mask_from_selection(app, layer, invert)
+    )
+    return app
 
 
 def make_project_app():
@@ -329,6 +346,221 @@ def test_save_load_round_trip():
     check("master re-resolved across canvases", new_link.master is new_master, True)
     check("transform persisted", new_link.transform, (2.0, 0.0, 0.0, 2.0, 0.0, 0.0))
     check("master counter restored", reloaded.master_counter, 1)
+
+
+def test_link_instance_mask_hides_only_that_instance():
+    doc = make_doc()
+    master = promote(doc)
+    master.draw.point((1, 1), fill=(255, 0, 0, 255))
+    master.visible = False
+    hidden = link_to(doc, master)
+    hidden.mask = Image.new("L", hidden.size, 255)
+    hidden.mask.putpixel((1, 1), 0)
+    shown = link_to(doc, master, offset=(2, 0))
+
+    flat = doc.composite_transparent()
+    check("masked instance hidden", flat.getpixel((1, 1))[3], 0)
+    check("unmasked instance visible", flat.getpixel((3, 1))[3], 255)
+    check("master pixels untouched", master.image.getpixel((1, 1))[:3], (255, 0, 0))
+    check("mask lives on the link", hidden.mask.getpixel((1, 1)), 0)
+
+
+def test_link_mask_does_not_touch_the_master():
+    doc = make_doc()
+    master = promote(doc)
+    master.draw.point((1, 1), fill=(255, 0, 0, 255))
+    link = link_to(doc, master)
+    link.mask = Image.new("L", link.size, 0)
+
+    check(
+        "link hidden", link.composited_image().getchannel("A").getpixel((1, 1)), 0
+    )
+    check(
+        "master still shows",
+        master.composited_image().getchannel("A").getpixel((1, 1)), 255,
+    )
+
+
+def test_link_mask_multiplies_the_master_mask():
+    doc = make_doc()
+    master = promote(doc)
+    master.draw.point((1, 1), fill=(255, 0, 0, 255))
+    master.visible = False
+    master.mask = Image.new("L", master.size, 255)
+    master.mask.putpixel((1, 1), 128)
+    link = link_to(doc, master)
+    link.mask = Image.new("L", link.size, 255)
+    link.mask.putpixel((1, 1), 128)
+
+    alpha = doc.composite_transparent().getpixel((1, 1))[3]
+    check("both masks folded", 0 < alpha < 128, True)
+
+
+def test_link_mask_change_invalidates_caches():
+    doc = make_doc()
+    master = promote(doc)
+    master.draw.point((1, 1), fill=(255, 0, 0, 255))
+    master.visible = False
+    link = link_to(doc, master)
+    check("visible before", link.composited_image().getchannel("A").getpixel((1, 1)), 255)
+    before = Canvas._layer_signature(link)
+
+    link.mask = Image.new("L", link.size, 0)
+
+    check("hidden after", link.composited_image().getchannel("A").getpixel((1, 1)), 0)
+    check("signature changed", Canvas._layer_signature(link) != before, True)
+    check("canvas follows", doc.composite_transparent().getpixel((1, 1))[3], 0)
+
+
+def test_link_mask_follows_a_transform():
+    doc = make_doc()
+    master = promote(doc)
+    master.draw.point((1, 1), fill=(255, 0, 0, 255))
+    master.visible = False
+    link = link_to(doc, master)
+    # Scale the instance by 2: content (1, 1) lands at (2, 2).
+    link.set_transform((2.0, 0.0, 0.0, 2.0, 0.0, 0.0))
+
+    check("unmasked scaled link shows", doc.composite_transparent().getpixel((2, 2))[3] > 0, True)
+
+    link.mask = Image.new("L", link.size, 0)
+    flat = doc.composite_transparent()
+    check("scaled link masked out", flat.getpixel((2, 2))[3], 0)
+    check("scaled link masked out elsewhere", flat.getpixel((0, 0))[3], 0)
+
+
+def test_unlink_folds_the_instance_mask():
+    doc = make_doc()
+    master = promote(doc)
+    master.draw.point((1, 1), fill=(255, 0, 0, 255))
+    master.visible = False
+    link = link_to(doc, master)
+    link.mask = Image.new("L", link.size, 255)
+    link.mask.putpixel((1, 1), 0)
+    doc.active = doc.layers.index(link)
+
+    PaintApp.unlink_layer(fake_app(doc))
+
+    check("mask kept", link.mask.getpixel((1, 1)), 0)
+    check("pixels kept", link.image.getpixel((1, 1))[:3], (255, 0, 0))
+    check("still hidden after unlink", doc.composite_transparent().getpixel((1, 1))[3], 0)
+
+
+def test_link_mask_survives_a_restore():
+    doc = make_doc()
+    master = promote(doc)
+    master.draw.point((1, 1), fill=(255, 0, 0, 255))
+    master.visible = False
+    link = link_to(doc, master)
+    link.mask = Image.new("L", link.size, 255)
+    link.mask.putpixel((1, 1), 0)
+
+    doc.restore(doc.snapshot())
+    restored = doc.layers[1]
+    PaintApp._relink_masters(SimpleNamespace(canvases=[doc]))
+
+    check("mask restored", restored.mask.getpixel((1, 1)), 0)
+    check("hidden after restore", doc.composite_transparent().getpixel((1, 1))[3], 0)
+
+
+def test_link_mask_save_load_round_trip():
+    app = make_project_app()
+    source = app._new_canvas("Source", (4, 4))
+    source.layers = []
+    master = source.add_layer(name="Master")
+    master.draw.point((1, 1), fill=(255, 0, 0, 255))
+    master.is_master = True
+    master.master_id = 1
+    target = app._new_canvas("Target", (4, 4))
+    target.layers = []
+    link = target.add_layer(name="Link")
+    link.link_id = 1
+    link.master = master
+    link.mask = Image.new("L", link.size, 255)
+    link.mask.putpixel((1, 1), 0)
+    app.master_counter = 1
+
+    with tempfile.TemporaryDirectory() as tmp:
+        path = os.path.join(tmp, "links.pai")
+        manifest = project.save(app, path)
+        payload = project.read(SimpleNamespace(canvases=[]), path)
+        reloaded = make_project_app()
+        project.apply(reloaded, payload)
+
+    entry = manifest["canvases"][1]["layers"][0]
+    check("mask file recorded", bool(entry["mask"]), True)
+
+    new_link = reloaded.canvases[1].layers[0]
+    check("mask restored", new_link.mask is not None, True)
+    check("mask pixel restored", new_link.mask.getpixel((1, 1)), 0)
+    check("link restored", new_link.link_id, 1)
+    check(
+        "hidden after reload",
+        reloaded.canvases[1].composite_transparent().getpixel((1, 1))[3], 0,
+    )
+
+
+def test_link_mask_actions_are_allowed_but_apply_is_not():
+    doc = make_doc()
+    master = promote(doc)
+    master.draw.point((1, 1), fill=(255, 0, 0, 255))
+    master.visible = False
+    link = link_to(doc, master)
+    doc.active = doc.layers.index(link)
+
+    fake = fake_app(doc)
+    fake.selection = None
+    check("mask edits allowed on a link", PaintApp._active_layer_locked(fake, mask=True), False)
+    check("pixel edits still refused", PaintApp._active_layer_locked(fake), True)
+
+    PaintApp.add_layer_mask(fake)
+    check("link gained a mask", link.mask is not None, True)
+    check("mask reveals all", link.mask.getpixel((1, 1)), 255)
+
+    PaintApp.invert_layer_mask(fake)
+    check("inverted to hide", link.mask.getpixel((1, 1)), 0)
+
+    PaintApp.delete_layer_mask(fake)
+    check("mask deleted", link.mask, None)
+
+    link.locked = True
+    check("a locked link refuses mask edits", PaintApp._active_layer_locked(fake, mask=True), True)
+
+
+def test_moved_link_mask_stays_aligned():
+    doc = make_doc()
+    master = promote(doc)
+    master.draw.point((1, 1), fill=(255, 0, 0, 255))
+    master.draw.point((0, 0), fill=(0, 255, 0, 255))
+    master.visible = False
+    link = link_to(doc, master, offset=(1, 1))
+    link.mask = Image.new("L", link.size, 255)
+    link.mask.putpixel((1, 1), 0)
+
+    # The mask is in the link's own buffer frame, which its offset places in the
+    # document: content (1, 1) shows at (2, 2), hidden by mask pixel (1, 1).
+    flat = doc.composite_transparent()
+    check("moved content hidden", flat.getpixel((2, 2))[3], 0)
+    check("unmasked content shows", flat.getpixel((1, 1))[3], 255)
+
+
+def test_link_mask_follows_a_canvas_crop():
+    doc = make_doc()
+    master = promote(doc)
+    master.draw.point((2, 2), fill=(255, 0, 0, 255))
+    master.visible = False
+    link = link_to(doc, master)
+    link.mask = Image.new("L", link.size, 255)
+    link.mask.putpixel((2, 2), 0)
+
+    check("hidden before crop", doc.composite_transparent().getpixel((2, 2))[3], 0)
+
+    PaintApp.crop_canvas(fake_app(doc), (1, 1, 4, 4))
+
+    check("canvas cropped", doc.size, (3, 3))
+    check("mask cropped with it", link.mask.size, (3, 3))
+    check("mask pixel kept", link.mask.getpixel((1, 1)), 0)
+    check("still hidden after crop", doc.composite_transparent().getpixel((1, 1))[3], 0)
 
 
 def main():

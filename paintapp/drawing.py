@@ -403,8 +403,8 @@ class ToolsPanel(tk.Frame):
         self.eraser_target = "transparent"
         self.eraser_color = "#ffffff"
         self.mask_value = 0
-        self.mask_erase = False
         self.mask_overlay = "#ff0000"
+        self.mask_overlay_show = True
         # Paint bucket settings (see ``fill`` for how they map to pixels).
         self.fill_tolerance = 32
         self.fill_contiguous = True
@@ -1020,6 +1020,17 @@ class ToolsPanel(tk.Frame):
         return row
 
     def _settings_for_brush(self):
+        self._brush_stamping_controls()
+
+    def _brush_stamping_controls(self, preview=True):
+        """Build the brush's stamping controls, shared by the Brush tool and the
+        mask tools.
+
+        A mask paints with the same brush a normal stroke uses, so the mask
+        panel shows these controls and the brush stays editable while the mask
+        is being painted. ``preview`` draws the sample strip; the mask panel
+        omits it because a mask paints a value, not a colour.
+        """
         self._brush_opacity_var = tk.IntVar(value=self.brush_opacity)
         self._brush_hardness_var = tk.IntVar(value=self.brush_hardness)
         self._brush_flow_var = tk.IntVar(value=self.brush_flow)
@@ -1050,9 +1061,10 @@ class ToolsPanel(tk.Frame):
         self._brush_pickup_var = tk.IntVar(value=self.brush_pickup)
         self._brush_wet_edge_var = tk.IntVar(value=self.brush_wet_edge)
 
-        self._brush_preview = BrushPreview(self.settings,
-                                           render=self._render_brush_preview)
-        self._brush_preview.pack(fill=tk.X, pady=(0, 4))
+        if preview:
+            self._brush_preview = BrushPreview(
+                self.settings, render=self._render_brush_preview)
+            self._brush_preview.pack(fill=tk.X, pady=(0, 4))
         tk.Label(self.settings, text="Size", anchor="w").pack(fill=tk.X)
         self._size_row(self.settings)
         self._slider_row(self.settings, "Opacity", self._brush_opacity_var,
@@ -2028,39 +2040,33 @@ class ToolsPanel(tk.Frame):
             self._on_crop_reset()
 
     def _settings_for_mask(self):
+        self.mask_value = 255 if self.mask_value >= 128 else 0
         self._mask_value_var = tk.IntVar(value=self.mask_value)
-        self._mask_erase_var = tk.BooleanVar(value=self.mask_erase)
         self._mask_feather_var = tk.IntVar(value=4)
 
-        # The mask paints with the active brush's stamping settings (hardness,
-        # flow, opacity, spacing, tip, pattern, grain, dynamics), so only the
-        # mask-specific controls live here; the rest are edited in the Brush
-        # tool and the Brushes panel.
+        # The paint value and overlay are mask-specific; everything that shapes
+        # the stroke comes from the brush, so the brush's stamping controls are
+        # shown below and stay editable while the mask is painted.
         tk.Label(
             self.settings,
-            text=("Paints with the active brush. Choose a preset in the "
-                  "Brushes panel; edit its stamping in the Brush tool."),
+            text=("Paints with the brush below. The paint value and overlay "
+                  "are mask-specific."),
             anchor="w", fg="#888888", wraplength=210, justify="left",
         ).pack(fill=tk.X, pady=(0, 4))
-        tk.Label(self.settings, text="Size", anchor="w").pack(fill=tk.X)
-        self._size_row(self.settings)
         value_row = tk.Frame(self.settings)
         value_row.pack(fill=tk.X, pady=(3, 0))
         tk.Label(value_row, text="Paint", width=9, anchor="w").pack(side=tk.LEFT)
-        for value, label in ((255, "Reveal"), (0, "Hide"), (128, "Soft")):
+        for value, label in ((255, "Reveal"), (0, "Hide")):
             tk.Radiobutton(
                 value_row, text=label, value=value, variable=self._mask_value_var,
                 command=self._sync_mask, indicatoron=False, width=6,
             ).pack(side=tk.LEFT, padx=(0, 2))
-        self._slider_row(self.settings, "Value", self._mask_value_var,
-                         0, 255, self._sync_mask)
-        self._check_row(self.settings, "Erase paint", self._mask_erase_var,
-                        self._sync_mask)
-        self._mask_overlay_btn = tk.Button(
-            self.settings, width=6, command=self._choose_mask_overlay,
-        )
-        self._color_row(self.settings, "Overlay", self._mask_overlay_btn)
+        self._mask_overlay_btn = self._color_row(
+            self.settings, "Overlay", self._choose_mask_overlay)
         self._apply_mask_swatch()
+        self._mask_show_var = tk.BooleanVar(value=self.mask_overlay_show)
+        self._check_row(self.settings, "Show overlay", self._mask_show_var,
+                        self._sync_mask_show)
         action_row = tk.Frame(self.settings)
         action_row.pack(fill=tk.X, pady=(4, 0))
         tk.Button(action_row, text="Swap", command=self._mask_swap).pack(
@@ -2078,6 +2084,9 @@ class ToolsPanel(tk.Frame):
         ).pack(side=tk.LEFT)
         tk.Button(feather_row, text="Blur", command=self._mask_feather).pack(
             side=tk.LEFT, padx=(4, 0))
+        tk.Label(self.settings, text="Brush", anchor="w",
+                 fg="#888888").pack(fill=tk.X, pady=(8, 0))
+        self._brush_stamping_controls(preview=False)
 
     def _apply_mask_swatch(self):
         button = getattr(self, "_mask_overlay_btn", None)
@@ -2085,8 +2094,13 @@ class ToolsPanel(tk.Frame):
             button.config(bg=self.mask_overlay, activebackground=self.mask_overlay)
 
     def _sync_mask(self, *_):
-        self.mask_value = max(0, min(255, self._int_var(self._mask_value_var, 0)))
-        self.mask_erase = bool(self._mask_erase_var.get())
+        self.mask_value = 255 if self._int_var(self._mask_value_var, 0) >= 128 else 0
+
+    def _sync_mask_show(self, *_):
+        """Toggle the mask overlay veil; the app repaints to show or hide it."""
+        self.mask_overlay_show = bool(self._mask_show_var.get())
+        if self._on_mask_action is not None:
+            self._on_mask_action("overlay")
 
     def _choose_mask_overlay(self):
         def preview(color):
@@ -3535,7 +3549,7 @@ class ToolsPanel(tk.Frame):
         "eraser_grain", "eraser_grain_scale", "eraser_grain_strength",
         "eraser_grain_mode", "eraser_jitter_hue", "eraser_jitter_sat",
         "eraser_jitter_val", "eraser_pickup",
-        "mask_value", "mask_erase", "mask_overlay",
+        "mask_value", "mask_overlay",
         "fill_tolerance", "fill_contiguous", "fill_antialias", "fill_gap",
         "fill_opacity", "fill_blend",
         "gradient_mode", "gradient_from", "gradient_to", "gradient_opacity",
@@ -4507,9 +4521,7 @@ class DrawingController:
         x, y = start
         size = tools.brush_size
         if mode == "mask":
-            value = tools.mask_value
-            if tools.mask_erase:
-                value = 0 if value >= 128 else 255
+            value = 255 if tools.mask_value >= 128 else 0
             if self._mask_invert:
                 value = 255 - value
             # Masks paint with the active brush's stamping settings so a mask

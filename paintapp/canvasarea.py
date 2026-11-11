@@ -1180,6 +1180,10 @@ class CanvasView(tk.Canvas):
         self._selection_image = None
         self._selection_label = None
         self._mask_preview = None
+        # Document position of the mask preview's top-left: the mask lives in a
+        # layer's own buffer frame, which sits at that layer's offset (a link is
+        # not baked to the canvas, so its mask is not document-aligned).
+        self._mask_origin = (0, 0)
         self._mask_overlay = (255, 0, 0)
         self._mask_image = None
         # A finished generation shown for review before it is applied, as an
@@ -1820,7 +1824,7 @@ class CanvasView(tk.Canvas):
         if self._mask_preview is None or self._layout is not None:
             return board
         crop, item = visible_crop(
-            self._mask_preview, (0, 0), self.zoom, window, size
+            self._mask_preview, self._mask_origin, self.zoom, window, size
         )
         if crop is None:
             return board
@@ -2363,9 +2367,14 @@ class CanvasView(tk.Canvas):
             )
 
     # ------------------------------------------------------------------ mask
-    def set_mask_preview(self, mask):
-        """Show ``mask`` (an ``"L"`` image) as a translucent veil, or hide it."""
+    def set_mask_preview(self, mask, origin=(0, 0)):
+        """Show ``mask`` (an ``"L"`` image) as a translucent veil, or hide it.
+
+        ``origin`` is the document position of the mask's top-left, so a mask in
+        a layer's own buffer frame (a link's) lands over the pixels it shapes.
+        """
         self._mask_preview = mask
+        self._mask_origin = tuple(origin)
         self._draw_mask_preview()
 
     def set_mask_overlay_color(self, rgb):
@@ -2399,7 +2408,7 @@ class CanvasView(tk.Canvas):
             top_left = (self.canvasx(0) / self.zoom, self.canvasy(0) / self.zoom)
             view_size = (view_w, view_h)
         mask, item = visible_crop(
-            self._mask_preview, (0, 0), self.zoom, top_left, view_size
+            self._mask_preview, self._mask_origin, self.zoom, top_left, view_size
         )
         if mask is None:
             return

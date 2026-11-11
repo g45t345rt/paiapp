@@ -232,6 +232,11 @@ class TransformGizmo:
         self._is_link = False
         self._link_box = (0, 0, 0, 0)
         self._drag_transform = None
+        # A masked link's own mask, held in the buffer frame of the transform
+        # the session started from, so every drag frame resamples it from the
+        # original instead of accumulating interpolation error.
+        self._link_mask = None
+        self._link_mask_matrix = IDENTITY
         # The resident GPU uploads of ``source``/``source_mask`` for the session
         # (see :meth:`_gpu_textures`).
         self._gpu = None
@@ -272,6 +277,13 @@ class TransformGizmo:
             self.source_mask = None
             self._is_link = True
             self._link_box = box
+            # A link's own instance mask rides along with the content: it is
+            # stored in the buffer frame the layer's transform defines, so the
+            # drag resamples it through the same frame change as the pixels.
+            self._link_mask = layer.mask
+            self._link_mask_matrix = (
+                layer.transform if layer.transform is not None else IDENTITY
+            )
             # Current content-to-document matrix: the link's stored transform
             # maps content into its buffer, and ``offset`` places that buffer.
             content_to_doc = mul(
@@ -313,6 +325,8 @@ class TransformGizmo:
         self.source_mask = None
         self._is_link = False
         self._link_box = (0, 0, 0, 0)
+        self._link_mask = None
+        self._link_mask_matrix = IDENTITY
         self._drag_transform = None
         self._overlay_backup = None
         self._base_matrix = IDENTITY
@@ -800,6 +814,17 @@ class TransformGizmo:
                 self.matrix, translation(-box[0], -box[1])
             )
             self.layer.set_transform(content_matrix)
+            if self._link_mask is not None:
+                # The instance mask lives in the buffer frame the transform
+                # defines. Map it from the frame the session started in into the
+                # new one, resampling from the original every frame.
+                new_matrix = self.layer.transform or IDENTITY
+                frame = mul(self._link_mask_matrix, invert(new_matrix))
+                self.layer.mask = self._link_mask.transform(
+                    self.layer.size, Image.AFFINE,
+                    (frame[0], frame[2], frame[4], frame[1], frame[3], frame[5]),
+                    resample=Image.BICUBIC,
+                )
             return
         self._resample_base()
         # Carry the document-space overlays through the same gesture, from the
