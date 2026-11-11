@@ -22,6 +22,21 @@ ROW_H = THUMB + 2 * ROW_PAD
 # thumbnails read as separate cells instead of one wide image.
 MASK_GAP = 2
 
+# Hairline rule drawn along the bottom of every row, in pixels, so neighbouring
+# layers, groups and their sub-rows read as separate entries. It is a seam
+# rather than a full border: ``DIVIDER_MIX`` is how far the rule leans from the
+# row's own fill toward the theme border.
+ROW_DIVIDER = 1
+DIVIDER_MIX = 0.6
+
+# Padding inside each row, above and below its content, in pixels, so an item
+# is inset on both sides and the divider lands in the middle of the space
+# between one row's content and the next's. A row is its content height plus a
+# pad on each side, and the rows are laid out on that same pitch, which the
+# scroll maths follows.
+ROW_GAP = 4
+ROW_PITCH = ROW_H + 2 * ROW_GAP
+
 
 def _uid(target):
     """Cache key of a layer or group: its stable ``uid``.
@@ -84,10 +99,26 @@ DRAG_SLOP = 6
 # thumbnail so the carried layer reads as something held, not as a second row.
 GHOST = 44
 
-# Glyphs that lead an indented filter or text row under its layer.
-FILTER_GLYPH = "\u2022 "
-TEXT_GLYPH = "T "
-PATH_GLYPH = "P "
+# Leading icons for a layer's indented object rows, in place of the old "T "/"P "
+# text prefixes. Each names a vendored Tabler outline icon (see
+# :mod:`paintapp.icons`), a text glyph fallback for when the rasteriser is
+# missing, a theme color token and a tooltip, and is drawn in the row's leading
+# preview cell. ``glyph`` keeps the object's initial so a text-only fallback
+# still reads.
+FILTER_LEAD = ("color-filter", "\u2022", "muted", "Filter")
+TEXT_LEAD = ("typography", "T", "muted", "Text")
+PATH_LEAD = ("vector-bezier", "P", "muted", "Path")
+
+# A group header's disclosure chevron, drawn as a small icon before the name in
+# place of the "\u25be"/"\u25b8" text glyph it used to lead with; the glyph stays
+# as the fallback. It sits beside the name rather than in the preview cell, which
+# the group's composited thumbnail occupies.
+GROUP_EXPANDED = ("chevron-down", "\u25be", "muted", "Collapse group")
+GROUP_COLLAPSED = ("chevron-right", "\u25b8", "muted", "Expand group")
+
+# A group header's type icon, a folder, drawn beside the chevron so a group reads
+# as a container the way the object rows read as a filter, text or path.
+GROUP_ICON = ("folder", "\u229e", "muted", "Group")
 
 # Compact glyphs for the primary action row. The full action set also lives in
 # the "more" menu and in the list's right-click menu, so these stay icon-only
@@ -179,6 +210,33 @@ def _gray(hex_color, factor=1.0):
     level = round(0.299 * red + 0.587 * green + 0.114 * blue)
     level = max(0, min(255, round(level * factor)))
     return f"#{level:02x}{level:02x}{level:02x}"
+
+
+def _divider_color(bg):
+    """A faint rule colour for a row filled with ``bg``.
+
+    The rule under each row blends the row's own fill toward the theme border,
+    so it reads as a subtle seam on the normal, selected and hidden fills alike
+    rather than a hard line that fights whatever colour the row currently shows.
+    A non-hex ``bg`` (a test double) falls back to the border colour.
+    """
+    border = theme.color("border")
+    if not isinstance(bg, str) or not bg.startswith("#") or len(bg) != 7:
+        return border
+    try:
+        red = int(bg[1:3], 16)
+        green = int(bg[3:5], 16)
+        blue = int(bg[5:7], 16)
+        bred = int(border[1:3], 16)
+        bgreen = int(border[3:5], 16)
+        bblue = int(border[5:7], 16)
+    except (ValueError, TypeError, IndexError):
+        return border
+    return "#%02x%02x%02x" % (
+        round(red + (bred - red) * DIVIDER_MIX),
+        round(green + (bgreen - green) * DIVIDER_MIX),
+        round(blue + (bblue - blue) * DIVIDER_MIX),
+    )
 
 
 class LayerPanel(tk.Frame):
@@ -359,6 +417,11 @@ class LayerPanel(tk.Frame):
         theme.subscribe(self._on_theme)
 
     def _build(self):
+        # A frame rule above and below the scrolling list, so the column of rows
+        # reads as a bounded region rather than bleeding into the panel.
+        list_border_top = tk.Frame(self, height=1, bd=0, highlightthickness=0)
+        list_border_top.pack(fill=tk.X)
+        theme.register(list_border_top, bg="border")
         list_frame = tk.Frame(self)
         list_frame.pack(fill=tk.X)
         scrollbar = ArrowScrollbar(list_frame)
@@ -386,6 +449,10 @@ class LayerPanel(tk.Frame):
         # policy), so Ctrl+wheel is what scrolls this list itself; it must reach
         # the row widgets embedded in the canvas, hence the recursive bind.
         self._bind_wheel(self.canvas)
+
+        list_border_bottom = tk.Frame(self, height=1, bd=0, highlightthickness=0)
+        list_border_bottom.pack(fill=tk.X)
+        theme.register(list_border_bottom, bg="border")
 
         buttons = tk.Frame(self)
         buttons.pack(fill=tk.X, pady=(4, 0))
@@ -528,6 +595,10 @@ class LayerPanel(tk.Frame):
                     hidden=not group.visible,
                     badges=self._group_badges(group, 0),
                     group=group,
+                    name_icons=[
+                        GROUP_COLLAPSED if group.collapsed else GROUP_EXPANDED,
+                        GROUP_ICON,
+                    ],
                 )
                 group_row[id(group)] = len(self._rows) - 1
                 self._insert_group_filter_rows(group)
@@ -548,6 +619,10 @@ class LayerPanel(tk.Frame):
                 hidden=not group.visible,
                 badges=self._group_badges(group, index - start + 1),
                 group=group,
+                name_icons=[
+                    GROUP_COLLAPSED if group.collapsed else GROUP_EXPANDED,
+                    GROUP_ICON,
+                ],
             )
             group_row[id(group)] = len(self._rows) - 1
             self._insert_group_filter_rows(group)
@@ -556,6 +631,7 @@ class LayerPanel(tk.Frame):
                     self._insert_layer_row(layers, member, layer_row, 1)
             index = start - 1
 
+        self._layout_dividers()
         self._selection_kind = "layer"
         self._selected = []
         self._anchor = None
@@ -633,7 +709,7 @@ class LayerPanel(tk.Frame):
         self._sync_button_state()
 
     def _add_row(self, text, entry, indent=0, layer=None, hidden=False,
-                 badges=None, group=None):
+                 badges=None, group=None, leading=None, name_icons=None):
         """Append one row widget and record it against its ``entry``.
 
         Every row is a fixed height (thumbnail plus padding) and reserves the
@@ -643,7 +719,13 @@ class LayerPanel(tk.Frame):
         ``group`` is a group row's :class:`~paintapp.document.Group`, whose
         members are composited into the same preview cell. ``hidden`` marks a
         layer or group row whose target is not visible, so its preview and label
-        are drawn in grayscale rather than a "(hidden)" mark. ``badges`` is a
+        are drawn in grayscale rather than a "(hidden)" mark. ``leading`` is an
+        optional ``(icon, glyph, color token, tooltip)`` type icon drawn in the
+        preview cell of a row that has no preview (a filter, text or path row),
+        replacing the text prefix such a row used to spell out. ``name_icons`` is
+        an optional list of such descriptors drawn in order just before the name,
+        for markers that belong beside the text rather than in the preview cell
+        (a group's disclosure chevron and folder type icon). ``badges`` is a
         list of ``(icon, glyph, color token, tooltip)`` status icons pinned to
         the right edge of the row, replacing the parenthesised marks that used
         to trail the name. ``icon`` names a vendored Tabler SVG (``None`` for a
@@ -651,7 +733,10 @@ class LayerPanel(tk.Frame):
         is missing. Returns the row index.
         """
         bg = theme.color("listbox_bg")
-        row = tk.Frame(self.inner, bg=bg, height=ROW_H)
+        # The row is its content height plus a pad above and below, so the
+        # content sits inset and the rule below it lands squarely in the gap to
+        # the next row rather than hugging the thumbnail.
+        row = tk.Frame(self.inner, bg=bg, height=ROW_H + 2 * ROW_GAP)
         row.pack(fill=tk.X)
         row.pack_propagate(False)
         widgets = [row]
@@ -679,6 +764,14 @@ class LayerPanel(tk.Frame):
             thumb.config(image=photo)
         thumb.place(relx=0.5, rely=0.5, anchor="center")
         widgets.append(thumb)
+        # A row without a preview (a filter, text or path row) shows its type
+        # icon in the same leading cell, so it lines up under the layer's
+        # thumbnail instead of pushing its name rightward with a text prefix.
+        if leading is not None and photo is None:
+            self._paint_leading(thumb, leading, bg, theme.color(leading[2]))
+            Tooltip(thumb, leading[3])
+        else:
+            leading = None
         # A mask rides next to the layer's own preview, so the mask and the
         # pixels it shapes are read together without opening the mask tools.
         mask_cell = None
@@ -718,9 +811,30 @@ class LayerPanel(tk.Frame):
                 Tooltip(icon, tooltip)
                 widgets.append(icon)
                 badge_widgets.append((icon, icon_name, glyph, token_name))
+        # Name icons sit between the preview cell and the name, packed before
+        # the label so they take their width from the left like the cells do.
+        name_icon_widgets = []
+        for position, name_icon in enumerate(name_icons or ()):
+            icon_label = tk.Label(row, bg=bg, bd=0)
+            self._paint_leading(icon_label, name_icon, bg,
+                                theme.color(name_icon[2]))
+            icon_label.pack(side=tk.LEFT, padx=((4 if position == 0 else 1), 0))
+            Tooltip(icon_label, name_icon[3])
+            widgets.append(icon_label)
+            name_icon_widgets.append((icon_label, name_icon))
         label = tk.Label(row, text=text, anchor="w", bg=bg, fg=theme.color("text"))
         label.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(4, 2))
         widgets.append(label)
+        # A hairline seam along the row's bottom edge. Created last so it stacks
+        # above the full-height indent and preview cells, and placed (not
+        # packed) so adding it never disturbs the row's fixed-height layout.
+        # The left gutter is filled in later by :meth:`_layout_dividers`, once
+        # every row is known, so the rule can tell an in-group separator from a
+        # group boundary; here it just spans the full width.
+        divider = tk.Frame(row, height=ROW_DIVIDER, bd=0, highlightthickness=0,
+                           bg=_divider_color(bg))
+        divider.place(relx=0.0, x=0, rely=1.0, relwidth=1.0, anchor="sw")
+        widgets.append(divider)
         self._rows.append(entry)
         index = len(self._rows) - 1
         label.bind("<Configure>", lambda e, i=index: self._fit_row_label(e, i))
@@ -741,16 +855,49 @@ class LayerPanel(tk.Frame):
         self._row_widgets.append({
             "row": row, "cell": cell, "label": label,
             "thumb": thumb, "photos": photos, "photo": photo, "token": token,
+            "leading": leading,
+            "name_icons": name_icon_widgets,
             "mask_cell": mask_cell, "mask_thumb": mask_thumb,
             "mask_gap": mask_gap,
             "mask_photos": mask_photos, "mask_photo": mask_photo,
             "mask_token": mask_token,
             "hidden": bool(hidden), "badges": badge_widgets,
             "badge_strip": badge_strip,
+            "divider": divider,
+            "indent": indent,
             "full_text": text, "font": None,
             "tooltip": name_tip, "truncated": None,
         })
         return index
+
+    def _layout_dividers(self):
+        """Place each row's bottom rule, trimmed to its indent, past the last row.
+
+        A rule between two nested rows starts at the shallower of their two
+        indents, so a group's members and their sub-rows read as one bracket
+        under the header. The rule below a group's last member is the boundary
+        to the next top-level entry, so it spans the full width: taking the
+        minimum of an indent and a top-level ``0`` gives zero there by itself.
+        The final row is left without a rule, since the panel's bottom border
+        already closes the list. Called once per rebuild, after every row exists.
+        """
+        last = len(self._row_widgets) - 1
+        for index, widgets in enumerate(self._row_widgets):
+            divider = widgets.get("divider")
+            if divider is None:
+                continue
+            if index >= last:
+                try:
+                    divider.place_forget()
+                except tk.TclError:
+                    pass
+                continue
+            next_indent = self._row_widgets[index + 1].get("indent", 0)
+            gutter = min(widgets.get("indent", 0), next_indent) * INDENT
+            try:
+                divider.place_configure(x=gutter, width=-gutter)
+            except tk.TclError:
+                pass
 
     def _fit_row_label(self, event, index):
         """Trim row ``index``'s name to its label width with an ellipsis.
@@ -797,6 +944,21 @@ class LayerPanel(tk.Frame):
             icon.config(image=image, text="", fg=color, bg=bg)
         else:
             icon.config(image="", text=glyph, fg=color, bg=bg)
+
+    def _paint_leading(self, label, leading, bg, color):
+        """Draw a row's leading type icon, or its glyph fallback.
+
+        Mirrors :meth:`_paint_badge`: the vendored Tabler ``icon`` tinted
+        ``color`` when the rasteriser is available, else the plain text
+        ``glyph``. The label is centred in the preview cell, so either form
+        lands where a layer's thumbnail would.
+        """
+        name, glyph, _token, _tip = leading
+        image = icons.photo(name, ICON_SIZE, color)
+        if image is not None:
+            label.config(image=image, text="", fg=color, bg=bg)
+        else:
+            label.config(image="", text=glyph, fg=color, bg=bg)
 
     def _set_button_icon(self, button, name, glyph, enabled=True):
         """Give an action-strip button its Tabler icon, or its ``glyph``.
@@ -1133,14 +1295,15 @@ class LayerPanel(tk.Frame):
             pass
 
     def _group_row_text(self, group):
-        """The label for a group header row: its arrow and name.
+        """The label for a group header row: its name, without the arrow.
 
-        The collapsed member count rides the row as a right-edge badge (see
-        :meth:`_group_badges`) and a hidden group carries no mark at all: its
-        row is drawn in grayscale instead.
+        The disclosure chevron is drawn as an icon before the name (see
+        :data:`GROUP_EXPANDED`/:data:`GROUP_COLLAPSED`), so the label itself is
+        just the name. The collapsed member count rides the row as a right-edge
+        badge (see :meth:`_group_badges`) and a hidden group carries no mark at
+        all: its row is drawn in grayscale instead.
         """
-        arrow = "\u25b8" if group.collapsed else "\u25be"
-        return f"{arrow} {group.name}"
+        return group.name
 
     def _group_badges(self, group, member_count):
         """The right-edge ``(icon, glyph, color token, tooltip)`` badges of a group.
@@ -1201,16 +1364,17 @@ class LayerPanel(tk.Frame):
             hidden=not layer.visible, badges=self._layer_badges(layer),
         )
         for filter_index, spec in enumerate(layer.filters):
-            text = FILTER_GLYPH + filters.describe(spec)
+            text = filters.describe(spec)
             if not spec.get("enabled", True):
                 text += "  (off)"
-            self._add_row(text, ("filter", index, filter_index), indent + 1)
+            self._add_row(text, ("filter", index, filter_index), indent + 1,
+                          leading=FILTER_LEAD)
         for text_index, spec in enumerate(layer.texts):
-            label = TEXT_GLYPH + textrender.describe(spec)
-            self._add_row(label, ("text", index, text_index), indent + 1)
+            self._add_row(textrender.describe(spec), ("text", index, text_index),
+                          indent + 1, leading=TEXT_LEAD)
         for path_index, spec in enumerate(layer.paths):
-            label = PATH_GLYPH + path.describe(spec)
-            self._add_row(label, ("path", index, path_index), indent + 1)
+            self._add_row(path.describe(spec), ("path", index, path_index),
+                          indent + 1, leading=PATH_LEAD)
 
     def _insert_group_filter_rows(self, group):
         """Insert indented rows for a group's non-destructive filters.
@@ -1220,10 +1384,11 @@ class LayerPanel(tk.Frame):
         visible while the group is collapsed, since the filter still applies.
         """
         for filter_index, spec in enumerate(group.filters):
-            text = FILTER_GLYPH + filters.describe(spec)
+            text = filters.describe(spec)
             if not spec.get("enabled", True):
                 text += "  (off)"
-            self._add_row(text, ("group_filter", group, filter_index), 1)
+            self._add_row(text, ("group_filter", group, filter_index), 1,
+                          leading=FILTER_LEAD)
 
     def selected_group(self):
         """The group behind the selected row, or ``None``.
@@ -1339,11 +1504,11 @@ class LayerPanel(tk.Frame):
             return
         if view_height <= 1:
             return
-        total = self.inner.winfo_height() or len(self._rows) * ROW_H
+        total = self.inner.winfo_height() or len(self._rows) * ROW_PITCH
         if total <= view_height:
             return
-        top = row * ROW_H
-        bottom = top + ROW_H
+        top = row * ROW_PITCH
+        bottom = top + ROW_PITCH
         first = self.canvas.canvasy(0)
         if top < first:
             self.canvas.yview_moveto(top / total)
@@ -1433,11 +1598,36 @@ class LayerPanel(tk.Frame):
                 row_bg, row_fg = bg, fg
             widgets["row"].config(bg=row_bg)
             widgets["cell"].config(bg=row_bg)
+            widgets["thumb"].config(bg=row_bg)
+            if widgets.get("leading") is not None:
+                # A type icon keeps its own muted token on a plain row and takes
+                # the row's foreground when the row is selected or hidden, so it
+                # stays legible against the fill like the status badges do.
+                self._paint_leading(
+                    widgets["thumb"], widgets["leading"], row_bg,
+                    row_fg if (selected or widgets["hidden"])
+                    else theme.color(widgets["leading"][2]),
+                )
+            if widgets.get("name_icons"):
+                # The name icons (a group's chevron and folder) follow the same
+                # rule as the type icon: their own muted token on a plain row,
+                # the row foreground when the row is selected or grayscale.
+                for icon_label, name_icon in widgets["name_icons"]:
+                    self._paint_leading(
+                        icon_label, name_icon, row_bg,
+                        row_fg if (selected or widgets["hidden"])
+                        else theme.color(name_icon[2]),
+                    )
             if widgets.get("mask_cell") is not None:
                 widgets["mask_gap"].config(bg=row_bg)
                 widgets["mask_cell"].config(bg=row_bg)
                 widgets["mask_thumb"].config(bg=row_bg)
             widgets["label"].config(bg=row_bg, fg=row_fg)
+            if widgets.get("divider") is not None:
+                # The seam follows whatever fill the row currently shows, so a
+                # selected or highlighted row keeps a subtle rule rather than a
+                # stray line in the unselected background colour.
+                widgets["divider"].config(bg=_divider_color(row_bg))
             if widgets["badge_strip"] is not None:
                 widgets["badge_strip"].config(bg=row_bg)
             if widgets["badges"]:
