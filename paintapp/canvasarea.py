@@ -1232,6 +1232,10 @@ class CanvasView(tk.Canvas):
         self.grid_visible = False
         self.grid_size = DEFAULT_GRID_SIZE
         self.grid_snap = False
+        # Outline the active layer's bounds on the stacked canvas (see
+        # :meth:`_draw_layer_outline`); the exploded grid already marks the
+        # active cell, so this applies to the normal view only.
+        self.layer_outline_visible = True
         # Viewport-only rendering: the app installs a provider that flattens just
         # the requested document region (see :meth:`set_source_providers`), so a
         # huge canvas is not composited whole on every repaint. ``_content_info``
@@ -2204,6 +2208,39 @@ class CanvasView(tk.Canvas):
             left, top, right - 1, bottom - 1,
             outline="#4a4a4a", width=1, tags="docborder",
         )
+        self._draw_layer_outline()
+
+    def _draw_layer_outline(self):
+        """Outline the active layer's bounds on the stacked canvas.
+
+        Drawn as a dashed rectangle in the same accent color the exploded view
+        uses for its selected cell, so the active layer is identifiable in the
+        normal composited view. It shares the ``docborder`` tag and is skipped
+        in exploded view (which already marks the active cell).
+        """
+        if not self.layer_outline_visible or self._layout is not None:
+            return
+        layers = getattr(self.doc, "layers", None)
+        index = getattr(self.doc, "active", -1)
+        if not layers or not (0 <= index < len(layers)):
+            return
+        layer = layers[index]
+        ox, oy = layer.offset
+        width, height = layer.size
+        if width <= 0 or height <= 0:
+            return
+        x0, y0 = self._doc_to_view(ox, oy)
+        x1, y1 = self._doc_to_view(ox + width, oy + height)
+        accent = theme.color("accent") or "#3b82f6"
+        self.create_rectangle(
+            x0, y0, x1, y1, outline=accent, width=1, dash=(4, 3),
+            tags="docborder",
+        )
+
+    def set_layer_outline(self, visible):
+        """Show or hide the active-layer outline for this view."""
+        self.layer_outline_visible = bool(visible)
+        self._draw_doc_border()
 
     # -------------------------------------------------------------------- grid
     def set_grid(self, visible=None, size=None):
@@ -4454,6 +4491,11 @@ class CanvasArea(tk.Frame):
         self.grid_visible = bool(visible)
         for view in self._views:
             view.set_grid(self.grid_visible, None)
+
+    def set_layer_outline_visible(self, visible):
+        """Show or hide the active-layer outline on every canvas tab."""
+        for view in self._views:
+            view.set_layer_outline(visible)
 
     def set_grid_size(self, size):
         """Set the grid cell size (document pixels) on every canvas tab."""

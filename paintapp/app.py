@@ -502,6 +502,9 @@ class PaintApp:
         self._last_model_activity = time.monotonic()
         self.root.after(30_000, self._auto_unload_tick)
         self.show_offscreen = True
+        # Whether the active layer's bounds are outlined on the canvas (see
+        # ``set_layer_outline``); toggled from the Layers panel.
+        self.show_layer_outline = True
         # Frozen content bounds ``((left, top), (w, h))`` while a Move drag is in
         # progress, else ``None``. With the off-canvas preview on, the content
         # bounds follow the dragged layer, so the view's scroll region would be
@@ -885,6 +888,7 @@ class PaintApp:
         self.area.set_grid_visible(self.show_grid)
         self.area.set_grid_size(self.grid_size)
         self.area.set_grid_snap(self.grid_snap)
+        self.area.set_layer_outline_visible(self.show_layer_outline)
         self.area.set_bg_color(self.offscreen_bg)
         if hasattr(self, "ruler_var"):
             self.ruler_var.set(self.show_rulers)
@@ -972,6 +976,7 @@ class PaintApp:
             on_delete_mask=self.delete_layer_mask,
             on_apply_mask=self.apply_layer_mask,
             on_mask_edit=self.set_mask_edit,
+            on_outline=self.set_layer_outline,
             on_filter_select=self._on_filter_select,
             on_filter_edit=self._on_filter_edit,
             on_filter_toggle=self.toggle_selected_filter,
@@ -2277,6 +2282,17 @@ class PaintApp:
         if hasattr(self, "grid_snap_var"):
             self.grid_snap_var.set(self.grid_snap)
         self.area.set_grid_snap(self.grid_snap)
+
+    def set_layer_outline(self, enabled):
+        """Show or hide the active layer's bounds outline on the canvas.
+
+        Toggled from the Layers panel; drawn in the same accent color the
+        exploded view uses for the selected cell.
+        """
+        self.show_layer_outline = bool(enabled)
+        if hasattr(self, "layer_panel"):
+            self.layer_panel.set_layer_outline(self.show_layer_outline)
+        self.area.set_layer_outline_visible(self.show_layer_outline)
 
     def set_grid_size(self, size):
         """Set the grid cell size in document pixels."""

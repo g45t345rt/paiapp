@@ -289,6 +289,7 @@ class LayerPanel(tk.Frame):
     def __init__(self, parent, on_add, on_delete, on_move, on_toggle,
                  on_merge, on_select, on_opacity, on_rename, on_lock,
                  on_add_mask, on_delete_mask, on_apply_mask, on_mask_edit,
+                 on_outline=None,
                  on_filter_select=None, on_filter_edit=None, on_duplicate=None,
                  on_clear=None, on_filter_toggle=None, on_filter_remove=None,
                  on_filter_move=None, on_filter_clear=None,
@@ -332,6 +333,7 @@ class LayerPanel(tk.Frame):
         self._on_delete_mask = on_delete_mask
         self._on_apply_mask = on_apply_mask
         self._on_mask_edit = on_mask_edit
+        self._on_outline = on_outline
         self._on_filter_select = on_filter_select
         self._on_filter_edit = on_filter_edit
         self._on_filter_toggle = on_filter_toggle
@@ -521,7 +523,7 @@ class LayerPanel(tk.Frame):
         self.opacity_scale.pack(side=tk.LEFT, fill=tk.X, expand=True)
 
         mask_row = tk.Frame(self)
-        mask_row.pack(fill=tk.X, pady=(2, 8))
+        mask_row.pack(fill=tk.X, pady=(2, 4))
         self.mask_edit_var = tk.BooleanVar(value=False)
         self.mask_edit_btn = tk.Checkbutton(
             mask_row, text="Edit mask", variable=self.mask_edit_var,
@@ -540,6 +542,19 @@ class LayerPanel(tk.Frame):
         self.apply_mask_btn.pack(side=tk.LEFT, padx=2)
         self.delete_mask_btn = tk.Button(mask_row, text="Del", width=4, command=self._on_delete_mask)
         self.delete_mask_btn.pack(side=tk.LEFT, padx=2)
+
+        outline_row = tk.Frame(self)
+        outline_row.pack(fill=tk.X, pady=(0, 8))
+        self.outline_var = tk.BooleanVar(value=True)
+        self.outline_btn = tk.Checkbutton(
+            outline_row, text="Show layer outline", variable=self.outline_var,
+            command=self._handle_outline,
+        )
+        self.outline_btn.pack(side=tk.LEFT)
+        self.outline_tip = Tooltip(
+            self.outline_btn,
+            "Outline the active layer's bounds on the canvas",
+        )
         self._sync_button_state()
 
     # ------------------------------------------------------------------ public
@@ -1429,6 +1444,10 @@ class LayerPanel(tk.Frame):
     def set_mask_edit(self, enabled):
         """Reflect the app's mask-edit state without re-firing the callback."""
         self.mask_edit_var.set(bool(enabled))
+
+    def set_layer_outline(self, enabled):
+        """Reflect the app's layer-outline state without re-firing the callback."""
+        self.outline_var.set(bool(enabled))
 
     def set_opacity(self, value):
         self.opacity_var.set(round(value * 100))
@@ -2762,6 +2781,10 @@ class LayerPanel(tk.Frame):
 
     def _handle_mask_edit(self):
         self._on_mask_edit(self.mask_edit_var.get())
+
+    def _handle_outline(self):
+        if self._on_outline is not None:
+            self._on_outline(self.outline_var.get())
 
     # ---------------------------------------------------------------- scrolling
     def _on_inner_configure(self, _event):
