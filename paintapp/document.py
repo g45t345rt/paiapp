@@ -1613,11 +1613,11 @@ class Layer:
 
 
 class Asset:
-    """A reference image kept with a canvas, outside the layer stack.
+    """A reference image kept with the project, outside any layer stack.
 
-    Assets are not composited: they are a per-canvas collection of images (a
+    Assets are not composited: they are a project-wide collection of images (a
     finished generation, or a file the user added) shown in the Assets panel and
-    inserted onto a layer on demand. Each has a stable per-canvas ``id``, a
+    inserted onto a layer of any canvas on demand. Each has a stable project ``id``, a
     ``name`` and the ``image`` pixels; ``source`` records where it came from
     (``"generated"`` or ``"imported"``) and ``prompt`` keeps the prompt a
     generation used, for the panel's tooltip. ``settings`` keeps the Generate
@@ -1644,6 +1644,54 @@ class Asset:
             self.prompt,
             dict(self.settings),
         )
+
+
+class AssetLibrary:
+    """The project's assets, shared by every canvas.
+
+    Assets exist to carry images between canvases, so they live at the project
+    level rather than on a :class:`Canvas` (a canvas-only image would just be a
+    hidden layer). The app owns one library and points every canvas's
+    ``library`` at it; a stand-alone canvas gets a private one.
+
+    The library is not part of any canvas's undo history: a canvas undo must
+    not drop an asset that was added while working on another canvas.
+    """
+
+    def __init__(self):
+        self.assets = []
+        self.asset_counter = 0
+
+    def add_asset(self, name=None, image=None, source="", prompt="", settings=None,
+                  index=None, size=(1, 1)):
+        """Add a reference image and return it (newest first unless ``index``).
+
+        The image is stored as-is (copied into RGBA) at its own dimensions. A
+        ``None`` image yields a transparent ``size`` slot. ``settings`` records
+        the Generate panel fields that produced a generated image.
+        """
+        self.asset_counter += 1
+        if name is None:
+            name = f"Asset {self.asset_counter}"
+        if image is None:
+            image = Image.new("RGBA", tuple(size), (0, 0, 0, 0))
+        elif image.mode != "RGBA":
+            image = image.convert("RGBA")
+        asset = Asset(name, image, self.asset_counter, source, prompt, settings)
+        if index is None:
+            self.assets.insert(0, asset)
+        else:
+            self.assets.insert(index, asset)
+        return asset
+
+    def remove_asset(self, asset):
+        """Drop ``asset`` from the library (a no-op if it is absent)."""
+        if asset in self.assets:
+            self.assets.remove(asset)
+
+    def clear(self):
+        self.assets = []
+        self.asset_counter = 0
 
 
 class MaskSurface:
@@ -1743,11 +1791,10 @@ class Canvas:
         # This canvas's own undo/redo stack (see ``paintapp.history``); its
         # snapshots capture only this document, so history is per canvas.
         self.history = History()
-        # Reference images kept with this canvas (generation results and added
-        # files), each an :class:`Asset`. They are not composited; they live
-        # beside the layer stack for the Assets panel to insert on demand.
-        self.assets = []
-        self.asset_counter = 0
+        # The project's reference images (generation results and added files).
+        # They are shared by every canvas: the app points ``library`` at its one
+        # :class:`AssetLibrary`; a stand-alone canvas keeps a private one.
+        self.library = AssetLibrary()
         # ICC colour management (see ``paintapp.colormanagement``). The layers
         # are composited in the ``working_profile`` space, and the view converts
         # that to the monitor space for display. ``proof_profile``, when set,
@@ -1842,39 +1889,37 @@ class Canvas:
         self._exploded_key = None
         return layer
 
+    @property
+    def assets(self):
+        """The project's assets (shared through :attr:`library`)."""
+        return self.library.assets
+
+    @assets.setter
+    def assets(self, value):
+        self.library.assets = list(value)
+
+    @property
+    def asset_counter(self):
+        return self.library.asset_counter
+
+    @asset_counter.setter
+    def asset_counter(self, value):
+        self.library.asset_counter = int(value)
+
     def add_asset(self, name=None, image=None, source="", prompt="", settings=None,
                   index=None):
-        """Add a reference image to this canvas's assets and return it.
+        """Add a reference image to the project's assets and return it.
 
-        The image is stored as-is (copied into RGBA), independent of any layer
-        or canvas size, so it keeps its own dimensions. A ``None`` image yields
-        a transparent canvas-sized asset, for callers that only need a slot.
-        ``settings`` records the Generate panel fields that produced a generated
-        image, so selecting the asset can restore them.
-
-        Assets are kept newest first, so the new asset goes to the front by
-        default and the Assets panel shows the most recent addition at the top.
-        Pass ``index`` to place it at a specific position instead, which loading
-        uses to rebuild a saved list in its original order.
+        A ``None`` image yields a transparent canvas-sized slot. See
+        :meth:`AssetLibrary.add_asset`.
         """
-        self.asset_counter += 1
-        if name is None:
-            name = f"Asset {self.asset_counter}"
-        if image is None:
-            image = Image.new("RGBA", self.size, (0, 0, 0, 0))
-        elif image.mode != "RGBA":
-            image = image.convert("RGBA")
-        asset = Asset(name, image, self.asset_counter, source, prompt, settings)
-        if index is None:
-            self.assets.insert(0, asset)
-        else:
-            self.assets.insert(index, asset)
-        return asset
+        return self.library.add_asset(
+            name, image, source, prompt, settings, index, size=self.size
+        )
 
     def remove_asset(self, asset):
-        """Drop ``asset`` from this canvas's list (a no-op if it is absent)."""
-        if asset in self.assets:
-            self.assets.remove(asset)
+        """Drop ``asset`` from the project's assets (a no-op if it is absent)."""
+        self.library.remove_asset(asset)
 
     def snapshot(self, app=None):
         """Capture this canvas's state for undo, sharing pixels copy-on-write.
@@ -1963,20 +2008,8 @@ class Canvas:
                 }
                 for group in self.groups
             ],
-            "assets": [
-                {
-                    "id": asset.id,
-                    "name": asset.name,
-                    "source": asset.source,
-                    "prompt": asset.prompt,
-                    "settings": dict(asset.settings),
-                    # Assets are never edited in place, so the snapshot can share
-                    # the pixels instead of copying them.
-                    "image": asset.image,
-                }
-                for asset in self.assets
-            ],
-            "asset_counter": self.asset_counter,
+            # Assets are project-wide and deliberately left out: undoing on one
+            # canvas must not drop assets added from another.
             "layers": layers,
             "guides_shared": bool(getattr(app, "guides_shared", False)),
             "shared_guides": [
@@ -2105,15 +2138,6 @@ class Canvas:
         # ``add_layer`` bumps the counter while rebuilding; reset it to the
         # snapshotted value so future layer names stay stable.
         self.layer_counter = snapshot["layer_counter"]
-        self.assets = [
-            Asset(
-                entry["name"], entry["image"], entry["id"],
-                entry.get("source", ""), entry.get("prompt", ""),
-                entry.get("settings", {}),
-            )
-            for entry in snapshot.get("assets", [])
-        ]
-        self.asset_counter = snapshot.get("asset_counter", len(self.assets))
         self.group_counter = snapshot.get("group_counter", len(self.groups))
         self.guides = [tuple(guide) for guide in snapshot.get("guides", [])]
         mask = snapshot.get("inpaint_mask")
@@ -2179,8 +2203,8 @@ class Canvas:
         duplicate.group_counter = self.group_counter
         duplicate.guides = [tuple(guide) for guide in self.guides]
         duplicate.gen_settings = dict(self.gen_settings)
-        duplicate.assets = [asset.copy() for asset in self.assets]
-        duplicate.asset_counter = self.asset_counter
+        # The copy belongs to the same project, so it shares the asset library.
+        duplicate.library = self.library
         duplicate.working_profile = self.working_profile
         duplicate.proof_profile = self.proof_profile
         duplicate.proof_intent = self.proof_intent

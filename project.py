@@ -6,11 +6,14 @@ layer, so projects stay portable and human-inspectable::
     project.json                          manifest (canvases, settings)
     canvases/0000/layers/0000_Name.png    one RGBA PNG per layer, bottom-to-top
     canvases/0000/layers/0000_Name_mask.png   optional 8-bit layer mask
+    assets/0000_Name.png                  project-wide assets, shared by canvases
 
 A project can hold several canvases, each with its own size and layer stack.
 Each canvas may also carry layer groups, referenced from its layers by id.
 Version 1 files (a single implicit canvas at ``layers/``) still load; files
-written before groups existed simply have no ``groups`` entry.
+written before groups existed simply have no ``groups`` entry. Files written
+before version 19 kept assets per canvas (``canvases/NNNN/assets/``); those
+load into the one project-wide asset list.
 
 The functions take the running :class:`paint.PaintApp` so the caller can keep
 all of its state (canvases, palette, generation panel) in one place.
@@ -32,10 +35,10 @@ from concurrent.futures import ThreadPoolExecutor
 from PIL import Image
 
 from paintapp import filters, path, poses, textrender, vector
-from paintapp.document import Canvas, Group, normalize_blend
+from paintapp.document import AssetLibrary, Canvas, Group, normalize_blend
 
 FORMAT = "pai"
-VERSION = 18
+VERSION = 19
 MANIFEST = "project.json"
 
 # Maps manifest keys to the tkinter variables that hold the generate panel.
@@ -224,9 +227,28 @@ def snapshot(app):
             [orient, int(pos)] for orient, pos in getattr(app, "shared_guides", [])
         ],
         "canvases": [],
+        "asset_counter": 0,
+        "assets": [],
     }
 
     images = {}
+    library = _app_library(app)
+    manifest["asset_counter"] = int(library.asset_counter)
+    for asset_index, asset in enumerate(library.assets):
+        # Assets are project-wide reference images; they keep their own
+        # dimensions, so no offset is stored.
+        filename = f"assets/{asset_index:04d}_{_safe_name(asset.name)}.png"
+        images[filename] = asset.image.copy()
+        manifest["assets"].append({
+            "id": int(getattr(asset, "id", asset_index + 1)),
+            "name": asset.name,
+            "source": getattr(asset, "source", ""),
+            "prompt": getattr(asset, "prompt", ""),
+            # The Generate panel fields that produced a generated image, so
+            # selecting the asset can restore them after a reload.
+            "settings": dict(getattr(asset, "settings", {}) or {}),
+            "file": filename,
+        })
     for canvas_index, canvas in enumerate(app.canvases):
         entry = {
             "name": canvas.name,
@@ -241,8 +263,6 @@ def snapshot(app):
             "proof_intent": getattr(canvas, "proof_intent", "relative"),
             "guides": [[orient, int(pos)] for orient, pos in canvas.guides],
             "show_exploded": bool(getattr(canvas, "show_exploded", False)),
-            "asset_counter": int(getattr(canvas, "asset_counter", 0)),
-            "assets": [],
             "groups": [
                 {
                     "id": group.id,
@@ -346,26 +366,17 @@ def snapshot(app):
                     getattr(layer, "pose_scene", None)
                 ),
             })
-        for asset_index, asset in enumerate(getattr(canvas, "assets", []) or []):
-            # Assets are reference images kept beside the layer stack; they keep
-            # their own dimensions, so no offset is stored.
-            filename = (
-                f"canvases/{canvas_index:04d}/assets/"
-                f"{asset_index:04d}_{_safe_name(asset.name)}.png"
-            )
-            images[filename] = asset.image.copy()
-            entry["assets"].append({
-                "id": int(getattr(asset, "id", asset_index + 1)),
-                "name": asset.name,
-                "source": getattr(asset, "source", ""),
-                "prompt": getattr(asset, "prompt", ""),
-                # The Generate panel fields that produced a generated image, so
-                # selecting the asset can restore them after a reload.
-                "settings": dict(getattr(asset, "settings", {}) or {}),
-                "file": filename,
-            })
         manifest["canvases"].append(entry)
     return {"manifest": manifest, "images": images}
+
+
+def _app_library(app):
+    """The app's project-wide :class:`AssetLibrary` (falls back to a canvas's)."""
+    library = getattr(app, "asset_library", None)
+    if library is None:
+        canvases = getattr(app, "canvases", None) or []
+        library = getattr(canvases[0], "library", None) if canvases else None
+    return library if library is not None else AssetLibrary()
 
 
 def write(payload, path, progress=None, cancel=None):
@@ -388,16 +399,15 @@ def write(payload, path, progress=None, cancel=None):
     tmp = path + ".tmp"
     try:
         with zipfile.ZipFile(tmp, "w", zipfile.ZIP_DEFLATED) as zf:
-            filenames = []
+            filenames = [
+                asset_entry.get("file")
+                for asset_entry in manifest.get("assets", []) or []
+            ]
             for entry in manifest["canvases"]:
                 filenames += [
                     layer_entry.get(key)
                     for layer_entry in entry["layers"]
                     for key in ("file", "mask")
-                ]
-                filenames += [
-                    asset_entry.get("file")
-                    for asset_entry in entry.get("assets", []) or []
                 ]
             jobs = [
                 (filename, images[filename])
@@ -482,10 +492,16 @@ def read(app, path, progress=None, cancel=None):
             for canvas_index, entry in enumerate(canvas_entries)
             for layer_index, layer_entry in enumerate(entry.get("layers", []) or [])
         ]
+        # One project-wide asset list. Files before version 19 kept assets on
+        # each canvas; those are appended (in canvas order) after any
+        # project-level ones, so an old project shows them all globally.
         asset_entries = [
-            (canvas_index, asset_index, asset_entry)
-            for canvas_index, entry in enumerate(canvas_entries)
-            for asset_index, asset_entry in enumerate(entry.get("assets", []) or [])
+            (False, asset_entry)
+            for asset_entry in manifest.get("assets", []) or []
+        ] + [
+            (True, asset_entry)
+            for entry in canvas_entries
+            for asset_entry in entry.get("assets", []) or []
         ]
         total = sum(
             1 + (1 if layer_entry.get("mask") else 0)
@@ -503,10 +519,9 @@ def read(app, path, progress=None, cancel=None):
             mask_file = layer_entry.get("mask")
             if mask_file:
                 jobs.append((masks, key, mask_file, "L", "layer"))
-        for canvas_index, asset_index, asset_entry in asset_entries:
+        for asset_index, (_legacy, asset_entry) in enumerate(asset_entries):
             jobs.append((
-                assets, (canvas_index, asset_index), asset_entry["file"],
-                "RGBA", "asset",
+                assets, asset_index, asset_entry["file"], "RGBA", "asset",
             ))
 
         def read_job(index):
@@ -539,6 +554,7 @@ def read(app, path, progress=None, cancel=None):
         "images": images,
         "masks": masks,
         "assets": assets,
+        "asset_entries": asset_entries,
         "fallback": fallback,
     }
     # Build the canvases here too, and pre-render what the first paint needs,
@@ -597,8 +613,9 @@ def _build_canvases(payload, cancel=None):
     canvas_entries = payload["canvas_entries"]
     images = payload["images"]
     masks = payload["masks"]
-    assets = payload.get("assets", {})
     fallback = payload["fallback"]
+    library = _build_library(payload)
+    payload["library"] = library
 
     canvases = []
     for canvas_index, entry in enumerate(canvas_entries):
@@ -608,6 +625,7 @@ def _build_canvases(payload, cancel=None):
         height = int(entry.get("height") or 0)
         size = (width, height) if width and height else (fallback or (800, 640))
         doc = Canvas(entry.get("name", f"Canvas {canvas_index + 1}"), size)
+        doc.library = library
         canvases.append(doc)
         doc.layers = []
         doc.gen_settings = dict(entry.get("gen_settings") or {})
@@ -715,22 +733,6 @@ def _build_canvases(payload, cancel=None):
                 layer_entry.get("pose_scene"),
                 layer.size,
             )
-        for asset_index, asset_entry in enumerate(entry.get("assets", []) or []):
-            image = assets.get((canvas_index, asset_index))
-            if image is None:
-                continue
-            asset = doc.add_asset(
-                name=asset_entry.get("name", "Asset"),
-                image=image,
-                source=asset_entry.get("source", ""),
-                prompt=asset_entry.get("prompt", ""),
-                settings=asset_entry.get("settings", {}),
-                # Rebuild the saved order (newest first) rather than
-                # front-inserting each restore, which would reverse it.
-                index=asset_index,
-            )
-            asset.id = int(asset_entry.get("id", asset.id))
-        doc.asset_counter = int(entry.get("asset_counter", len(doc.assets)))
         doc.layer_counter = int(entry.get("layer_counter", len(doc.layers)))
         doc.group_counter = int(entry.get("group_counter", len(doc.groups)))
         doc.active = (
@@ -739,6 +741,48 @@ def _build_canvases(payload, cancel=None):
         )
     _relink(canvases)
     return canvases
+
+
+def _build_library(payload):
+    """Build the project-wide :class:`AssetLibrary` from a decoded payload.
+
+    Project-level assets keep their saved ids. Assets from a pre-19 file were
+    numbered per canvas, so their ids can collide; they are renumbered after
+    the highest project-level id instead.
+    """
+    manifest = payload.get("manifest") or {}
+    assets = payload.get("assets", {})
+    entries = payload.get("asset_entries") or []
+    library = AssetLibrary()
+    kept = []
+    for asset_index, (legacy, asset_entry) in enumerate(entries):
+        image = assets.get(asset_index)
+        if image is not None:
+            kept.append((legacy, asset_entry, image))
+    next_id = max(
+        [int(manifest.get("asset_counter", 0) or 0)]
+        + [int(entry.get("id", 0) or 0) for legacy, entry, _ in kept if not legacy]
+    )
+    for legacy, asset_entry, image in kept:
+        asset = library.add_asset(
+            name=asset_entry.get("name", "Asset"),
+            image=image,
+            source=asset_entry.get("source", ""),
+            prompt=asset_entry.get("prompt", ""),
+            settings=asset_entry.get("settings", {}),
+            # Rebuild the saved order (newest first) rather than
+            # front-inserting each restore, which would reverse it.
+            index=len(library.assets),
+        )
+        if legacy:
+            next_id += 1
+            asset.id = next_id
+        else:
+            asset.id = int(asset_entry.get("id", asset.id))
+    library.asset_counter = max(
+        [next_id] + [asset.id for asset in library.assets]
+    )
+    return library
 
 
 def apply(app, payload):
@@ -755,6 +799,10 @@ def apply(app, payload):
     # A payload installs once; later loads build fresh canvases.
     payload["canvases"] = None
 
+    library = payload.get("library") or _build_library(payload)
+    app.asset_library = library
+    for doc in canvases:
+        doc.library = library
     app.canvases = list(canvases)
     app.active_canvas = 0
 

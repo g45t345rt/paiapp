@@ -1,9 +1,10 @@
-"""The per-canvas Assets panel.
+"""The project-wide Assets panel.
 
-A canvas keeps a list of reference images - finished generations and files the
-user added - beside its layer stack (see :class:`paintapp.document.Asset`). This
-panel lists the active canvas's assets as a scrollable column of thumbnails, so
-the user can pick one and insert it onto a layer, save it to disk, rename or
+A project keeps one list of reference images - finished generations and files
+the user added - shared by all of its canvases (see
+:class:`paintapp.document.AssetLibrary`). This panel lists them as a scrollable
+column of thumbnails, so the user can pick one and insert it onto a layer of
+any canvas, save it to disk, rename or
 delete it. It is purely presentational: every mutation is delegated to a
 callback supplied by the coordinator.
 """
@@ -31,7 +32,7 @@ DRAG_SLOP = 6
 
 
 class AssetsPanel(tk.Frame):
-    """A thumbnail list of the active canvas's assets.
+    """A thumbnail list of the project's assets.
 
     ``on_add()`` asks the coordinator to open an image file, and
     ``on_add_layer()`` asks it to store the selected layer as a new asset. The

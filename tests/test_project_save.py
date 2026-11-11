@@ -88,11 +88,11 @@ def fake_app(layers, assets=()):
         group_counter=0,
         guides=[],
         groups=[],
-        assets=list(assets),
-        asset_counter=len(assets),
         layers=layers,
     )
+    library = SimpleNamespace(assets=list(assets), asset_counter=len(assets))
     return SimpleNamespace(
+        asset_library=library,
         active_canvas=0,
         canvas_counter=1,
         color="#000000",
@@ -133,18 +133,54 @@ def test_save_round_trips_through_read():
     check("image decoded", (0, 0) in payload["images"], True)
 
 
-def test_save_persists_canvas_assets():
+def test_save_persists_project_assets():
     app = fake_app([fake_layer("A", (1, 2, 3, 255))], assets=[fake_asset("gen", (9, 9, 9, 255))])
     with tempfile.TemporaryDirectory() as tmp:
         path = os.path.join(tmp, "sample.pai")
         manifest = project.save(app, path)
         payload = project.read(SimpleNamespace(canvases=[]), path)
-    check("asset recorded in manifest", len(manifest["canvases"][0]["assets"]), 1)
-    check("asset decoded", (0, 0) in payload["assets"], True)
+    check("asset recorded at project level", len(manifest["assets"]), 1)
+    check("no per-canvas assets", "assets" in manifest["canvases"][0], False)
+    check("asset decoded", 0 in payload["assets"], True)
+    check("asset keeps its name", payload["library"].assets[0].name, "gen")
+    check("canvas shares library", payload["canvases"][0].library is payload["library"], True)
+
+
+def test_legacy_canvas_assets_load_globally():
+    """A pre-19 file with per-canvas assets loads them into one project list."""
+    import json
+    import zipfile
+    from PIL import Image
+    import io
+
+    def png(color):
+        buf = io.BytesIO()
+        Image.new("RGBA", (2, 2), color).save(buf, "PNG")
+        return buf.getvalue()
+
+    manifest = {
+        "format": project.FORMAT, "version": 18, "canvases": [
+            {"name": "A", "width": 4, "height": 4, "layers": [], "asset_counter": 1,
+             "assets": [{"id": 1, "name": "a1", "file": "canvases/0000/assets/0000_a1.png"}]},
+            {"name": "B", "width": 4, "height": 4, "layers": [], "asset_counter": 1,
+             "assets": [{"id": 1, "name": "b1", "file": "canvases/0001/assets/0000_b1.png"}]},
+        ],
+    }
+    with tempfile.TemporaryDirectory() as tmp:
+        path = os.path.join(tmp, "old.pai")
+        with zipfile.ZipFile(path, "w") as zf:
+            zf.writestr(project.MANIFEST, json.dumps(manifest))
+            zf.writestr("canvases/0000/assets/0000_a1.png", png((255, 0, 0, 255)))
+            zf.writestr("canvases/0001/assets/0000_b1.png", png((0, 255, 0, 255)))
+        payload = project.read(SimpleNamespace(canvases=[]), path)
+    library = payload["library"]
+    check("both legacy assets loaded", [a.name for a in library.assets], ["a1", "b1"])
+    check("legacy ids made unique", len({a.id for a in library.assets}), 2)
+    check("counter past ids", library.asset_counter >= max(a.id for a in library.assets), True)
     check(
-        "asset keeps its name",
-        manifest["canvases"][0]["assets"][0]["name"],
-        "gen",
+        "every canvas sees all assets",
+        all(doc.assets is library.assets for doc in payload["canvases"]),
+        True,
     )
 
 

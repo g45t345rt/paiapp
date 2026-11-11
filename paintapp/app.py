@@ -38,7 +38,7 @@ from .constants import (    APP_NAME, APP_VERSION, DONATE_URL, CONTRIBUTE_URL, D
     DEFAULT_PANEL_SIDES, DEFAULT_COLLAPSED_PANELS, DEFAULT_PANEL_GROUPS, rgba,
     TOOL_RAIL_W, TOOL_RAIL_MIN_W, TOOL_RAIL_MAX_W,
 )
-from .document import Canvas
+from .document import AssetLibrary, Canvas
 from .drawing import DrawingController, ToolsPanel
 from .generation import (
     GenerationPanel,
@@ -487,6 +487,8 @@ class PaintApp:
         # be re-resolved after a project load or an undo restore.
         self.master_counter = 0
         self.canvases = []
+        # Project-wide assets, shared by every canvas (see ``AssetLibrary``).
+        self.asset_library = AssetLibrary()
         self.active_canvas = 0
         self._clipboard = None
         # Fingerprint of the OS clipboard at the time ``_clipboard`` was filled,
@@ -1237,6 +1239,7 @@ class PaintApp:
         if name is None:
             name = f"Canvas {self.canvas_counter}"
         doc = Canvas(name, size)
+        doc.library = self.asset_library
         doc.working_profile = getattr(
             self, "default_working_profile", colormanagement.SRGB
         ) or colormanagement.SRGB
@@ -2565,14 +2568,13 @@ class PaintApp:
         self._refresh_preview_bar()
 
     def _refresh_asset_list(self):
-        """Show the active canvas's assets in the Assets panel."""
+        """Show the project's assets in the Assets panel."""
         if not hasattr(self, "assets_panel"):
             return
-        assets = self.current.assets if self.current is not None else []
-        self.assets_panel.refresh(assets)
+        self.assets_panel.refresh(self.asset_library.assets)
 
     def add_asset_from_file(self):
-        """Add an image file to the active canvas's assets."""
+        """Add an image file to the project's assets."""
         if self.current is None:
             self.set_result("There is no canvas to add an asset to.")
             return
@@ -2594,26 +2596,26 @@ class PaintApp:
                 self.root, "Add Asset", f"Could not open image:\n{exc}"
             )
             return
-        self._push_undo("Add asset")
+        self._set_modified(True)
         asset = self.current.add_asset(
             name=os.path.basename(path), image=image, source="imported"
         )
         self._refresh_asset_list()
         self._select_asset(asset)
-        self.set_result(f"Added '{asset.name}' to the canvas assets.")
+        self.set_result(f"Added '{asset.name}' to the project assets.")
 
     def _select_asset(self, asset):
         """Highlight ``asset`` in the Assets panel (best effort)."""
-        if not hasattr(self, "assets_panel") or self.current is None:
+        if not hasattr(self, "assets_panel"):
             return
         try:
-            index = self.current.assets.index(asset)
+            index = self.asset_library.assets.index(asset)
         except ValueError:
             return
-        self.assets_panel.refresh(self.current.assets, selected=index)
+        self.assets_panel.refresh(self.asset_library.assets, selected=index)
 
     def add_layer_to_assets(self, index=None):
-        """Store a layer's composited pixels in the active canvas's assets.
+        """Store a layer's composited pixels in the project's assets.
 
         The image is captured as the layer composites - filters, texts, vectors,
         poses, paths and mask folded in - so the asset matches what the layer
@@ -2626,7 +2628,7 @@ class PaintApp:
         if index is None:
             multi = self._multi_layer_selection()
             if multi is not None:
-                self._push_undo("Add layers to assets")
+                self._set_modified(True)
                 asset = None
                 for i in multi:
                     layer = self.layers[i]
@@ -2653,7 +2655,7 @@ class PaintApp:
         layer = self.layers[index]
         image = layer.composited_image()
         image = image.copy() if image.mode == "RGBA" else image.convert("RGBA")
-        self._push_undo("Add layer to assets")
+        self._set_modified(True)
         asset = self.current.add_asset(
             name=layer.name, image=image, source="layer",
         )
@@ -2830,13 +2832,13 @@ class PaintApp:
         name = name.strip()
         if not name or name == asset.name:
             return
-        self._push_undo("Rename asset")
+        self._set_modified(True)
         asset.name = name
         self._refresh_asset_list()
         self._select_asset(asset)
 
     def delete_asset(self, index):
-        """Remove an asset from the active canvas."""
+        """Remove an asset from the project."""
         asset = self._asset_at(index)
         if asset is None:
             return
@@ -2844,15 +2846,15 @@ class PaintApp:
             self.root, "Delete Asset", f"Delete the asset '{asset.name}'?",
         ):
             return
-        self._push_undo("Delete asset")
+        self._set_modified(True)
         self.current.remove_asset(asset)
         self._refresh_asset_list()
 
     def _asset_at(self, index):
         """The asset at ``index`` on the active canvas, or ``None``."""
-        if self.current is None or index is None:
+        if index is None:
             return None
-        assets = self.current.assets
+        assets = self.asset_library.assets
         if 0 <= index < len(assets):
             return assets[index]
         return None
@@ -5979,7 +5981,7 @@ class PaintApp:
         self.set_result(f"Pasted into layer '{layer.name}'.")
 
     def _paste_into_assets(self, data=None):
-        """Add the clipboard image to the active canvas's assets.
+        """Add the clipboard image to the project's assets.
 
         Uses the app's own in-app copy when it is still current, otherwise the
         image (or image file) on the OS clipboard.
@@ -6007,7 +6009,7 @@ class PaintApp:
         if image is None:
             self.set_result("Clipboard is empty.")
             return
-        self._push_undo("Paste asset")
+        self._set_modified(True)
         asset = self.current.add_asset(name=name, image=image, source="imported")
         self._refresh_asset_list()
         self._select_asset(asset)
@@ -6952,6 +6954,7 @@ class PaintApp:
         """Clear the workspace to an empty, unsaved project (no canvas)."""
         self._clear_generation_preview()
         self.canvases = []
+        self.asset_library.clear()
         self.active_canvas = 0
         self.canvas_counter = 0
         self.project_path = None
@@ -8483,9 +8486,9 @@ class PaintApp:
         if source == "asset":
             asset_id = binding.get("asset")
             asset = None
-            if asset_id is not None and self.current is not None:
+            if asset_id is not None:
                 asset = next(
-                    (a for a in self.current.assets if a.id == asset_id), None
+                    (a for a in self.asset_library.assets if a.id == asset_id), None
                 )
             if asset is None:
                 asset = self.selected_asset()
@@ -9065,11 +9068,13 @@ class PaintApp:
             self._show_generation_preview(doc, result, prompt, settings)
             return
         # Snapshot the canvas the job was queued against, which may no longer be
-        # the active one if the user switched tabs while it ran.
-        doc.history.push(doc, self, "Generate")
+        # the active one if the user switched tabs while it ran. Assets are
+        # project-wide and outside canvas history, so that output needs none.
         self._set_modified(True)
-        if doc is self.current:
-            self._refresh_history()
+        if output != OUTPUT_ASSETS:
+            doc.history.push(doc, self, "Generate")
+            if doc is self.current:
+                self._refresh_history()
         image = result.convert("RGBA")
         name = _summarize(prompt) or "Generated"
         if output == OUTPUT_ASSETS:
@@ -9203,7 +9208,7 @@ class PaintApp:
         a new layer, or the canvas assets. The image is centred on the canvas at
         its own size so it lines up with the pixels it would be applied to.
         ``settings`` records the panel's fields, carried to the asset if the run
-        is accepted into the canvas assets.
+        is accepted into the project assets.
         """
         index = self._canvas_index(doc)
         view = getattr(doc, "widget", None)
