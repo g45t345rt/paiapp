@@ -27,6 +27,7 @@ import io
 import json
 import os
 import zipfile
+from concurrent.futures import ThreadPoolExecutor
 
 from PIL import Image
 
@@ -65,6 +66,50 @@ def _safe_name(name):
     return cleaned or "layer"
 
 
+# Pillow releases the GIL while it runs zlib on PNG data, so encoding/decoding
+# the layer images on a small thread pool scales with the CPU's cores.
+_WORKERS = max(1, min(8, os.cpu_count() or 1))
+
+
+def _encode_png(image):
+    buf = io.BytesIO()
+    image.save(buf, format="PNG")
+    return buf.getvalue()
+
+
+def _decode_png(data, mode):
+    image = Image.open(io.BytesIO(data))
+    image.load()
+    # ``convert`` copies even when the mode already matches; skip that copy.
+    return image if image.mode == mode else image.convert(mode)
+
+
+def _run_parallel(func, items, on_result, cancel=None):
+    """Call ``func(*item)`` for each item on a thread pool, in order.
+
+    ``on_result(index, result)`` runs on the calling thread as results arrive
+    (in submission order), and ``cancel`` is checked between them; pending work
+    is dropped when the job is cancelled or an item fails.
+    """
+    if not items:
+        return
+    if _WORKERS == 1 or len(items) == 1:
+        for index, item in enumerate(items):
+            if cancel is not None:
+                cancel.throw_if_cancelled()
+            on_result(index, func(*item))
+        return
+    pool = ThreadPoolExecutor(max_workers=_WORKERS)
+    try:
+        futures = [pool.submit(func, *item) for item in items]
+        for index, future in enumerate(futures):
+            if cancel is not None:
+                cancel.throw_if_cancelled()
+            on_result(index, future.result())
+    finally:
+        pool.shutdown(wait=True, cancel_futures=True)
+
+
 def _load_guides(entries):
     """Coerce saved guide pairs to ``(orient, pos)``, dropping malformed ones."""
     guides = []
@@ -90,16 +135,24 @@ def _place_layer(image, size, offset):
     top = min(0, oy)
     right = max(size[0], ox + image.width)
     bottom = max(size[1], oy + image.height)
+    if (left, top) == (ox, oy) and (right - left, bottom - top) == image.size:
+        # The image already covers the canvas at its offset (the usual case):
+        # the placed buffer would be an identical copy, so skip the composite.
+        return image, (left, top)
     out = Image.new("RGBA", (right - left, bottom - top), (0, 0, 0, 0))
-    out.alpha_composite(image, dest=(ox - left, oy - top))
+    # The buffer is fully transparent, so a straight copy equals compositing.
+    out.paste(image, (ox - left, oy - top))
     return out, (left, top)
 
 
 def _place_layer_mask(mask, size, offset):
     """Align an 8-bit mask to a placed layer's buffer (see :func:`_place_layer`)."""
     ox, oy = offset
+    dest = (ox - min(0, ox), oy - min(0, oy))
+    if dest == (0, 0) and mask.size == tuple(size):
+        return mask
     out = Image.new("L", size, 0)
-    out.paste(mask, (ox - min(0, ox), oy - min(0, oy)))
+    out.paste(mask, dest)
     return out
 
 
@@ -331,8 +384,9 @@ def write(payload, path, progress=None, cancel=None):
     tmp = path + ".tmp"
     try:
         with zipfile.ZipFile(tmp, "w", zipfile.ZIP_DEFLATED) as zf:
+            filenames = []
             for entry in manifest["canvases"]:
-                filenames = [
+                filenames += [
                     layer_entry.get(key)
                     for layer_entry in entry["layers"]
                     for key in ("file", "mask")
@@ -341,18 +395,24 @@ def write(payload, path, progress=None, cancel=None):
                     asset_entry.get("file")
                     for asset_entry in entry.get("assets", []) or []
                 ]
-                for filename in filenames:
-                    image = images.get(filename) if filename else None
-                    if image is None:
-                        continue
-                    if cancel is not None:
-                        cancel.throw_if_cancelled()
-                    buf = io.BytesIO()
-                    image.save(buf, format="PNG")
-                    zf.writestr(filename, buf.getvalue())
-                    done += 1
-                    if progress is not None:
-                        progress(done / total if total else 1.0)
+            jobs = [
+                (filename, images[filename])
+                for filename in filenames
+                if filename and images.get(filename) is not None
+            ]
+
+            def store(index, data):
+                nonlocal done
+                # PNG data is already deflated; compressing it again in the
+                # zip costs time and saves nothing.
+                zf.writestr(jobs[index][0], data, compress_type=zipfile.ZIP_STORED)
+                done += 1
+                if progress is not None:
+                    progress(done / total if total else 1.0)
+
+            _run_parallel(
+                lambda _name, image: _encode_png(image), jobs, store, cancel
+            )
             zf.writestr(MANIFEST, json.dumps(manifest, indent=2))
         os.replace(tmp, path)
     except BaseException:
@@ -430,36 +490,40 @@ def read(app, path, progress=None, cancel=None):
         images = {}
         masks = {}
         assets = {}
-        done = 0
+        # (target dict, key, archive member, mode, progress label) per image,
+        # in the same order the progress steps were always reported.
+        jobs = []
         for canvas_index, layer_index, layer_entry in layer_entries:
-            if cancel is not None:
-                cancel.throw_if_cancelled()
-            data = zf.read(layer_entry["file"])
-            images[(canvas_index, layer_index)] = (
-                Image.open(io.BytesIO(data)).convert("RGBA")
-            )
-            done += 1
-            if progress is not None:
-                progress(done / total, f"layer {done}/{total}")
+            key = (canvas_index, layer_index)
+            jobs.append((images, key, layer_entry["file"], "RGBA", "layer"))
             mask_file = layer_entry.get("mask")
             if mask_file:
-                mask_data = zf.read(mask_file)
-                masks[(canvas_index, layer_index)] = (
-                    Image.open(io.BytesIO(mask_data)).convert("L")
-                )
-                done += 1
-                if progress is not None:
-                    progress(done / total, f"layer {done}/{total}")
+                jobs.append((masks, key, mask_file, "L", "layer"))
         for canvas_index, asset_index, asset_entry in asset_entries:
+            jobs.append((
+                assets, (canvas_index, asset_index), asset_entry["file"],
+                "RGBA", "asset",
+            ))
+
+        def read_job(index):
+            # ZipFile reads are not thread-safe; only the decode is pooled.
             if cancel is not None:
                 cancel.throw_if_cancelled()
-            data = zf.read(asset_entry["file"])
-            assets[(canvas_index, asset_index)] = (
-                Image.open(io.BytesIO(data)).convert("RGBA")
-            )
+            return zf.read(jobs[index][2]), jobs[index][3]
+
+        done = 0
+
+        def install(index, image):
+            nonlocal done
+            target, key, _member, _mode, label = jobs[index]
+            target[key] = image
             done += 1
             if progress is not None:
-                progress(done / total, f"asset {done}/{total}")
+                progress(done / total, f"{label} {done}/{total}")
+
+        _run_parallel(
+            _decode_png, [read_job(i) for i in range(len(jobs))], install, cancel
+        )
 
     if progress is not None and not total:
         # A project with no layer images still finished loading.
