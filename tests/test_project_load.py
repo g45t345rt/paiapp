@@ -100,7 +100,8 @@ def test_read_reports_progress_per_image():
     check(
         "one step per image",
         [label for _frac, label in seen],
-        ["reading project", "layer 1/3", "layer 2/3", "layer 3/3"],
+        ["reading project", "layer 1/3", "layer 2/3", "layer 3/3",
+         "preparing layer 1/2", "preparing layer 2/2"],
     )
     check(
         "progress never goes backwards",

@@ -1917,6 +1917,11 @@ class PaintApp:
         self.render()
 
     def render(self):
+        if getattr(self, "_loading_project", False):
+            # ``project.apply`` is still installing the canvases; panel
+            # callbacks fired by its variable writes would paint a half-built
+            # project. ``_finish_project_load`` renders once it is complete.
+            return
         if self.current is None:
             self._refresh_gallery_if_visible()
             return

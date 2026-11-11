@@ -22,6 +22,33 @@ ROW_H = THUMB + 2 * ROW_PAD
 # thumbnails read as separate cells instead of one wide image.
 MASK_GAP = 2
 
+
+def thumbnail(image):
+    """A tiny ``RGB`` preview of ``image`` over a checkerboard.
+
+    ``Image.BOX`` averages whole source boxes, so at this reduction it is
+    both cheaper than a windowed filter and a truer thumbnail; the
+    checkerboard stands in for transparency, as in the Assets panel. Pure PIL
+    work, so a project load can build it off the Tk thread.
+    """
+    source = image if image.mode == "RGBA" else image.convert("RGBA")
+    width, height = source.size
+    scale = min(THUMB / max(1, width), THUMB / max(1, height), 1.0)
+    target = (max(1, round(width * scale)), max(1, round(height * scale)))
+    board = checkerboard(target)
+    board.alpha_composite(source.resize(target, Image.BOX))
+    return board.convert("RGB")
+
+
+def prepare_thumbnail(layer):
+    """Precompute ``layer``'s row preview, stamped with its pixel token.
+
+    :meth:`LayerPanel._build_photos` uses it while the token still matches,
+    so only the cheap ``PhotoImage`` conversion is left for the Tk thread.
+    """
+    layer._prepared_thumb = (
+        layer.pixels_token, thumbnail(layer.composited_image(include_mask=False))
+    )
 # Tint a mask preview paints the kept region with, over the checkerboard.
 # Matches the Region Prompts panel so every mask thumbnail reads the same way.
 MASK_TINT = (90, 170, 255)
@@ -810,10 +837,17 @@ class LayerPanel(tk.Frame):
         preview can be made.
         """
         try:
-            composited = getattr(layer, "composited_image", None)
-            source = (composited(include_mask=False)
-                      if composited is not None else layer.image)
-            color = self._thumb(source)
+            prepared = getattr(layer, "_prepared_thumb", None)
+            if prepared is not None and prepared[0] == layer.pixels_token:
+                color = prepared[1]
+            else:
+                composited = getattr(layer, "composited_image", None)
+                source = (composited(include_mask=False)
+                          if composited is not None else layer.image)
+                color = self._thumb(source)
+            # Used once; a later edit rebuilds the preview the normal way.
+            if prepared is not None:
+                layer._prepared_thumb = None
             gray = color.convert("L").convert("RGB")
             dark = Image.blend(gray, Image.new("RGB", gray.size, (0, 0, 0)), 0.25)
             return (
@@ -947,19 +981,8 @@ class LayerPanel(tk.Frame):
             return None, None, None
 
     def _thumb(self, image):
-        """A tiny ``RGB`` preview of ``image`` over a checkerboard.
-
-        ``Image.BOX`` averages whole source boxes, so at this reduction it is
-        both cheaper than a windowed filter and a truer thumbnail; the
-        checkerboard stands in for transparency, as in the Assets panel.
-        """
-        source = image if image.mode == "RGBA" else image.convert("RGBA")
-        width, height = source.size
-        scale = min(THUMB / max(1, width), THUMB / max(1, height), 1.0)
-        target = (max(1, round(width * scale)), max(1, round(height * scale)))
-        board = checkerboard(target)
-        board.alpha_composite(source.resize(target, Image.BOX))
-        return board.convert("RGB")
+        """A tiny ``RGB`` preview of ``image`` over a checkerboard (see :func:`thumbnail`)."""
+        return thumbnail(image)
 
     def sync_previews(self):
         """Rebuild previews whose layer pixels changed, once painting settles.

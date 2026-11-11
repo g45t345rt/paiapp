@@ -1076,6 +1076,10 @@ class Layer:
         top-left is the box's top-left and the layer's ``offset`` places it.
         ``include_mask`` is forwarded to the source's composite.
         """
+        # Without a source mask both variants are the same pixels; collapse the
+        # flag so the layer panel (unmasked) and the viewport (masked) share
+        # one cached resample instead of evicting each other.
+        include_mask = bool(include_mask) and source.mask is not None
         base = source._composited_image_at(source.content_offset(), include_mask)
         draft = bool(getattr(self, "_transform_draft", False))
         left, top, right, bottom = _affine_bounds(matrix, base.size)

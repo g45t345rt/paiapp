@@ -32,7 +32,7 @@ from concurrent.futures import ThreadPoolExecutor
 from PIL import Image
 
 from paintapp import filters, path, poses, textrender, vector
-from paintapp.document import Group, normalize_blend
+from paintapp.document import Canvas, Group, normalize_blend
 
 FORMAT = "pai"
 VERSION = 18
@@ -69,6 +69,10 @@ def _safe_name(name):
 # Pillow releases the GIL while it runs zlib on PNG data, so encoding/decoding
 # the layer images on a small thread pool scales with the CPU's cores.
 _WORKERS = max(1, min(8, os.cpu_count() or 1))
+
+# Fraction of a load's progress bar spent decoding images; the rest covers
+# preparing the layers (see :func:`_warm_caches`), which usually costs more.
+_DECODE_SHARE = 0.3
 
 
 def _encode_png(image):
@@ -519,7 +523,8 @@ def read(app, path, progress=None, cancel=None):
             target[key] = image
             done += 1
             if progress is not None:
-                progress(done / total, f"{label} {done}/{total}")
+                share = _DECODE_SHARE if layer_entries else 1.0
+                progress(share * done / total, f"{label} {done}/{total}")
 
         _run_parallel(
             _decode_png, [read_job(i) for i in range(len(jobs))], install, cancel
@@ -528,7 +533,7 @@ def read(app, path, progress=None, cancel=None):
     if progress is not None and not total:
         # A project with no layer images still finished loading.
         progress(1.0, "")
-    return {
+    payload = {
         "manifest": manifest,
         "canvas_entries": canvas_entries,
         "images": images,
@@ -536,29 +541,74 @@ def read(app, path, progress=None, cancel=None):
         "assets": assets,
         "fallback": fallback,
     }
+    # Build the canvases here too, and pre-render what the first paint needs,
+    # so the Tk thread only has to install them (see :func:`apply`).
+    payload["canvases"] = _build_canvases(payload, cancel=cancel)
+    _warm_caches(payload["canvases"], cancel=cancel, progress=progress)
+    return payload
 
 
-def apply(app, payload):
-    """Install a :func:`read` payload into ``app``. Returns the manifest.
+def _relink(canvases):
+    """Point every link layer at its master (mirrors ``PaintApp._relink_masters``)."""
+    masters = {
+        layer.master_id: layer
+        for canvas in canvases for layer in canvas.layers
+        if getattr(layer, "is_master", False) and layer.master_id is not None
+    }
+    for canvas in canvases:
+        for layer in canvas.layers:
+            if getattr(layer, "link_id", None) is not None:
+                layer.master = masters.get(layer.link_id)
 
-    Runs on the Tk thread: it builds the canvases, layers and masks from the
-    decoded images, then pushes the saved palette, tool and generation-panel
-    state back into their widgets.
+
+def _warm_caches(canvases, cancel=None, progress=None):
+    """Render each layer's composite once so its caches are filled.
+
+    The layer panel's previews and the first viewport paint ask every layer for
+    its composite (filters, texts, paths, link transforms). Those are cached on
+    the layer, so computing them here, on the worker and before the layers are
+    visible to the Tk thread, keeps that work from freezing the window when
+    the project is installed. Failures are ignored: the Tk thread simply
+    renders the layer itself as before. ``progress`` advances from
+    :data:`_DECODE_SHARE` to 1.0, one step per layer.
     """
-    manifest = payload["manifest"]
+    from paintapp import layers as layer_panel
+
+    layers = [layer for canvas in canvases for layer in canvas.layers]
+    for index, layer in enumerate(layers, 1):
+        if cancel is not None:
+            cancel.throw_if_cancelled()
+        try:
+            layer.composited_image(include_mask=True)
+            # Also fills the unmasked composite the layer panel shows.
+            layer_panel.prepare_thumbnail(layer)
+        except Exception:
+            pass
+        if progress is not None:
+            frac = _DECODE_SHARE + (1.0 - _DECODE_SHARE) * index / len(layers)
+            progress(frac, f"preparing layer {index}/{len(layers)}")
+
+
+def _build_canvases(payload, cancel=None):
+    """Build detached :class:`Canvas` objects from a decoded payload.
+
+    Touches no app or widget state, so it can run on the worker thread.
+    """
     canvas_entries = payload["canvas_entries"]
     images = payload["images"]
     masks = payload["masks"]
     assets = payload.get("assets", {})
     fallback = payload["fallback"]
 
-    app.canvases = []
-    app.active_canvas = 0
+    canvases = []
     for canvas_index, entry in enumerate(canvas_entries):
+        if cancel is not None:
+            cancel.throw_if_cancelled()
         width = int(entry.get("width") or 0)
         height = int(entry.get("height") or 0)
         size = (width, height) if width and height else (fallback or (800, 640))
-        doc = app._new_canvas(entry.get("name", f"Canvas {canvas_index + 1}"), size)
+        doc = Canvas(entry.get("name", f"Canvas {canvas_index + 1}"), size)
+        canvases.append(doc)
         doc.layers = []
         doc.gen_settings = dict(entry.get("gen_settings") or {})
         doc.working_profile = str(entry.get("working_profile") or "sRGB")
@@ -687,6 +737,26 @@ def apply(app, payload):
             max(0, min(int(entry.get("active", 0)), len(doc.layers) - 1))
             if doc.layers else 0
         )
+    _relink(canvases)
+    return canvases
+
+
+def apply(app, payload):
+    """Install a :func:`read` payload into ``app``. Returns the manifest.
+
+    Runs on the Tk thread. :func:`read` has already built the canvases, layers
+    and masks off-thread, so this installs them and pushes the saved palette,
+    tool and generation-panel state back into their widgets.
+    """
+    manifest = payload["manifest"]
+    canvases = payload.get("canvases")
+    if canvases is None:
+        canvases = _build_canvases(payload)
+    # A payload installs once; later loads build fresh canvases.
+    payload["canvases"] = None
+
+    app.canvases = list(canvases)
+    app.active_canvas = 0
 
     app.canvas_counter = int(manifest.get("canvas_counter", len(app.canvases)))
     app.master_counter = max(
