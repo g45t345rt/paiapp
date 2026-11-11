@@ -3530,7 +3530,9 @@ class CanvasView(tk.Canvas):
         self._selection_image = None
         if self.selection is None:
             return
-        if self.selection.outline_segments() is not None and not self.transformed:
+        if ((self.selection.masked
+             or self.selection.outline_segments() is not None)
+                and not self.transformed):
             self._draw_selection_image()
             return
         points = self.selection.outline()

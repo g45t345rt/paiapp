@@ -9,9 +9,13 @@ them.
 Boxes use ``(left, top, right, bottom)`` with the right/bottom edges exclusive,
 matching :meth:`PIL.Image.Image.crop`.
 
-A selection made from a mask (the wand, or a grow/shrink/invert/feather result)
-has no meaningful polygon, so it carries ``edges`` - the boundary line segments
-in document pixels - and the view draws the ants from those instead.
+A selection made from a mask (the wand, alpha to selection, or a
+grow/shrink/invert/feather result) has no meaningful polygon, so it is marked
+``masked`` and the view draws the ants from the mask's own boundary. It also
+carries ``edges`` - the boundary line segments in document pixels - when that
+list is small enough to enumerate; a large boundary is traced from the mask at
+draw time instead, so a resized layer keeps its real outline rather than its
+bounding box.
 """
 
 import math
@@ -21,8 +25,9 @@ from PIL import Image, ImageDraw, ImageFilter
 
 from . import gpuops
 
-# Above this many boundary segments the outline is drawn from the bounding box
-# instead, so a noisy wand selection on a photo cannot flood Tk with line items.
+# Above this many boundary segments the segment list is dropped and the view
+# traces the outline straight from the mask instead (see ``boundary_image``), so
+# a noisy wand selection on a photo does not pay for enumerating every segment.
 MAX_EDGES = 8000
 
 # Arc segments per rounded corner when approximating the marquee outline.
@@ -78,8 +83,9 @@ def rounded_polygon(box, radius, steps=CORNER_STEPS):
 def mask_edges(mask):
     """Boundary segments of a binary mask, as ``((x1, y1), (x2, y2))`` pairs.
 
-    Returns ``None`` when the mask is empty or has too many segments to draw
-    cheaply (the caller then falls back to the bounding box).
+    Returns ``None`` when the mask is empty or has too many segments to
+    enumerate cheaply. The view still draws the mask's outline in that case by
+    tracing the mask itself (see :meth:`Selection.boundary_image`).
     """
     arr = np.asarray(mask) > 127
     if not arr.any():
@@ -108,7 +114,7 @@ def mask_edges(mask):
 
 
 class Selection:
-    def __init__(self, size, mask, polygon, edges=None, rect=False):
+    def __init__(self, size, mask, polygon, edges=None, rect=False, masked=False):
         self.size = size
         self.mask = mask
         self.polygon = polygon
@@ -116,6 +122,12 @@ class Selection:
         # True for the rectangular marquee, so its bounding-box corners can be
         # dragged to resize it directly (see the Select tool's rect mode).
         self.rect = rect
+        # True for a selection made from an arbitrary mask (the wand, alpha to
+        # selection, or a grow/shrink/invert/feather result). Such a selection
+        # has no meaningful polygon, so the view draws its boundary from the
+        # mask even when ``edges`` is ``None`` because the outline was too large
+        # to enumerate (see :meth:`boundary_image`).
+        self.masked = masked
         self._boundary = None
 
     @property
@@ -152,6 +164,16 @@ class Selection:
                 pen = ImageDraw.Draw(mask)
                 for (x1, y1), (x2, y2) in self.edges:
                     pen.line((x1, y1, x2, y2), fill=255)
+            elif self.masked:
+                # The outline was too large to enumerate as segments (see
+                # ``mask_edges``), so trace it straight from the mask: this is
+                # a vectorised pass, so a full-canvas selection stays cheap
+                # instead of falling back to its bounding box.
+                boundary = self._boundary_pixels()
+                if boundary is not None:
+                    mask = Image.fromarray(
+                        np.where(boundary, 255, 0).astype("u1"), "L"
+                    )
             halo = gpuops.dilate(mask, 1)
             if halo is None:
                 halo = mask.filter(ImageFilter.MaxFilter(3))
@@ -162,11 +184,23 @@ class Selection:
             self._boundary = image
         return self._boundary
 
+    def _boundary_pixels(self):
+        """Boundary pixels of the mask as a boolean array, or ``None`` if empty."""
+        arr = np.asarray(self.mask) > 127
+        if not arr.any():
+            return None
+        padded = np.pad(arr, 1, constant_values=False)
+        interior = (
+            padded[:-2, 1:-1] & padded[2:, 1:-1]
+            & padded[1:-1, :-2] & padded[1:-1, 2:]
+        )
+        return padded[1:-1, 1:-1] & ~interior
+
     def moved(self, dx, dy):
         """Return a copy translated by ``(dx, dy)``."""
         mask = Image.new("L", self.size, 0)
         mask.paste(self.mask, (dx, dy))
-        if self.edges is not None:
+        if self.masked:
             return Selection.from_mask(self.size, mask)
         polygon = [(x + dx, y + dy) for x, y in self.polygon]
         return Selection(self.size, mask, polygon, rect=self.rect)
@@ -210,7 +244,7 @@ class Selection:
                 resample=Image.BILINEAR,
             )
             out.paste(tile, (x0, y0))
-        if self.edges is None:
+        if not self.masked:
             # Keep the marching-ants polygon so the marquee keeps its dashed
             # style; a mask-boundary selection would draw as a solid outline.
             polygon = [
@@ -252,12 +286,12 @@ class Selection:
         """Build a selection from an arbitrary 8-bit mask (wand and ops)."""
         box = mask.getbbox()
         if box is None:
-            return cls(size, mask, [], None)
+            return cls(size, mask, [], None, masked=True)
         left, top, right, bottom = box
         polygon = [
             (left, top), (right, top), (right, bottom), (left, bottom),
         ]
-        return cls(size, mask, polygon, mask_edges(mask))
+        return cls(size, mask, polygon, mask_edges(mask), masked=True)
 
     # ------------------------------------------------------------ operations
     def inverted(self):
