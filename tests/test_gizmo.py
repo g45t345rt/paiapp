@@ -1,5 +1,6 @@
 """Unit tests for the transform gizmo (run: .venv\\Scripts\\python.exe tests\\test_gizmo.py)."""
 
+import math
 import os
 import sys
 
@@ -300,6 +301,73 @@ def test_rotation_origin_snaps_to_anchors():
     instance.reset_rotation_pivot()
     check("reset returns to the default centre",
           instance._rotation_pivot_local(), (60.0, 45.0))
+
+
+def _rotation_angle(instance):
+    """The gizmo matrix's rotation in degrees (the linear part is a rotation)."""
+    return math.degrees(math.atan2(instance.matrix[1], instance.matrix[0]))
+
+
+def test_rotation_snap_step_is_configurable():
+    # The Transform tool's rotation snap step replaces the old hard-coded 15
+    # degrees; a step of 0 turns snapping off entirely.
+    def drag_to(angle_deg, snap):
+        layer = photo_layer(120, 90)
+        app = FakeApp(layer, layer.size)
+        instance = gizmo.TransformGizmo()
+        check("session for snap step", instance.begin(app, None), True)
+        instance.rotation_snap = snap
+        cx, cy = instance._rotation_pivot_local()
+        radius = 100.0
+        instance.start("rot", cx, cy - radius)
+        x = cx + radius * math.sin(math.radians(angle_deg))
+        y = cy - radius * math.cos(math.radians(angle_deg))
+        instance.update(x, y, uniform=True)
+        return _rotation_angle(instance)
+
+    check("rotation snaps to the configured step",
+          round(drag_to(50.0, 45.0), 3), 45.0)
+    check("zero step leaves the angle free",
+          abs(drag_to(50.0, 0.0) - 50.0) < 0.5, True)
+
+
+def test_snap_anchors_can_be_disabled():
+    layer = photo_layer(120, 90)
+    app = FakeApp(layer, layer.size)
+    instance = gizmo.TransformGizmo()
+    check("session for snap toggle", instance.begin(app, None), True)
+    instance.snap_anchors = False
+    instance.start("pivot", 60.0, 45.0)
+    instance.update(3.0, 3.0)
+    check("no snap keeps the dragged pivot point",
+          (round(instance.rot_pivot_local[0], 1),
+           round(instance.rot_pivot_local[1], 1)), (3.0, 3.0))
+
+
+def test_interpolation_selects_the_kernel():
+    # A non-bicubic kernel has no shader, so the session must skip the GPU
+    # upload and commit through Pillow instead.
+    calls = []
+    original = gizmo.gpuimage.texture
+
+    def counting(image, *args, **kwargs):
+        calls.append(image.size)
+        return original(image, *args, **kwargs)
+
+    layer = photo_layer()
+    app = FakeApp(layer, layer.size)
+    instance = gizmo.TransformGizmo()
+    instance.interpolation = "bilinear"
+    gizmo.gpuimage.texture = counting
+    try:
+        check("session for interpolation", instance.begin(app, None), True)
+        instance.start("se", 320.0, 240.0)
+        instance.update(480.0, 360.0)
+        instance.finish()
+    finally:
+        gizmo.gpuimage.texture = original
+    check("a non-bicubic kernel skips the GPU upload", calls, [])
+    check("bilinear still commits a scaled buffer", layer.image.size, (480, 360))
 
 
 def test_selection_gizmo_touches_no_pixels():

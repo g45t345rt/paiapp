@@ -8,7 +8,7 @@ from tkinter import ttk
 from PIL import Image, ImageChops, ImageDraw, ImageFilter, ImageTk
 
 from . import (
-    antialias, brush, dialogs, fill, fontpicker, fonts, gradient,
+    antialias, brush, dialogs, fill, fontpicker, fonts, gizmo, gradient,
     gradienteditor, icons, poses, shape, symmetry, textrender, theme, vector,
     warp,
 )
@@ -297,7 +297,8 @@ class ToolsPanel(tk.Frame):
                  get_color=None, on_warp_action=None, on_puppet_action=None,
                  on_poses_action=None, on_vector_action=None,
                  on_vector_settings=None, on_layout_change=None,
-                 get_layout_family=None, on_layout_capture=None):
+                 get_layout_family=None, on_layout_capture=None,
+                 on_transform_action=None):
         super().__init__(parent)
         self._on_mode_change = on_mode_change
         self._on_brush_size = on_brush_size
@@ -318,6 +319,7 @@ class ToolsPanel(tk.Frame):
         self._on_layout_change = on_layout_change
         self._get_layout_family = get_layout_family
         self._on_layout_capture = on_layout_capture
+        self._on_transform_action = on_transform_action
         # The MOSS layout rows live here so they survive the Tool Settings panel
         # being rebuilt on every tool change.
         self.layout_model = LayoutModel()
@@ -577,6 +579,15 @@ class ToolsPanel(tk.Frame):
         self.poses_color = poses.DEFAULT_COLOR
         self.poses_opacity = 100
         self.poses_grid = True
+        # Transform tool options (see ``gizmo.TransformGizmo``): whether scaling
+        # is uniform without holding Shift, the rotation snap step in degrees
+        # (0 disables snapping), whether the rotation origin snaps to a frame
+        # anchor, the default pivot preset, and the resample kernel a commit uses.
+        self.transform_uniform = False
+        self.transform_rotation_snap = 15
+        self.transform_snap_anchors = True
+        self.transform_pivot = "center"
+        self.transform_interpolation = "bicubic"
         # Symmetry guide (see ``symmetry``): mirrors every dab of a painting
         # tool across the canvas centre. ``symmetry_mode`` is the guide mode;
         # ``symmetry_count`` and ``symmetry_mirror`` apply to the radial mode.
@@ -920,6 +931,25 @@ class ToolsPanel(tk.Frame):
         tk.Checkbutton(
             row, text=label, variable=var, command=command, anchor="w",
         ).pack(fill=tk.X)
+
+    def _entry_row(self, parent, label, fields, command=None):
+        """A label plus one or more small numeric entries.
+
+        ``fields`` is a sequence of ``(prefix, var)`` pairs laid out left to
+        right (an empty prefix omits its inline label), so a pair such as X and Y
+        shares one row. ``command`` is bound to ``<Return>`` in each entry.
+        """
+        row = tk.Frame(parent)
+        row.pack(fill=tk.X, pady=(3, 0))
+        tk.Label(row, text=label, width=9, anchor="w").pack(side=tk.LEFT)
+        for prefix, var in fields:
+            if prefix:
+                tk.Label(row, text=prefix).pack(side=tk.LEFT, padx=(3, 1))
+            entry = tk.Entry(row, textvariable=var, width=5, justify="right")
+            entry.pack(side=tk.LEFT)
+            if command is not None:
+                entry.bind("<Return>", command)
+        return row
 
     def _advanced_toggle(self, parent, attr_name):
         """A header that shows/hides a collapsible "Advanced" block.
@@ -2016,6 +2046,128 @@ class ToolsPanel(tk.Frame):
 
     def _on_paste_ask(self):
         self.paste_ask = bool(self.paste_ask_var.get())
+
+    # ----------------------------------------------------- transform settings
+    def _settings_for_transform(self):
+        tk.Label(
+            self.settings, text="Drag on the canvas to transform the active "
+                                "layer: corners scale, edges skew, the top "
+                                "handle rotates, and the orange origin sets the "
+                                "pivot. The fields below apply an exact "
+                                "transform on top of the current frame.",
+            anchor="w", fg="#888888", wraplength=210, justify="left",
+        ).pack(fill=tk.X, pady=(0, 4))
+
+        row = tk.Frame(self.settings)
+        row.pack(fill=tk.X, pady=(2, 0))
+        for label, action in (("Flip H", "flip_h"), ("Flip V", "flip_v")):
+            tk.Button(
+                row, text=label,
+                command=lambda a=action: self._transform_action(a),
+            ).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=1)
+        row = tk.Frame(self.settings)
+        row.pack(fill=tk.X, pady=(2, 0))
+        for label, action in (("Rot 90\u00b0 CCW", "rotate_ccw"),
+                              ("Rot 90\u00b0 CW", "rotate_cw")):
+            tk.Button(
+                row, text=label,
+                command=lambda a=action: self._transform_action(a),
+            ).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=1)
+        row = tk.Frame(self.settings)
+        row.pack(fill=tk.X, pady=(2, 0))
+        for label, action in (("Rotate 180\u00b0", "rotate_180"),
+                              ("Reset", "reset")):
+            tk.Button(
+                row, text=label,
+                command=lambda a=action: self._transform_action(a),
+            ).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=1)
+
+        self._t_dx_var = tk.StringVar(value="0")
+        self._t_dy_var = tk.StringVar(value="0")
+        self._t_sx_var = tk.StringVar(value="100")
+        self._t_sy_var = tk.StringVar(value="100")
+        self._t_angle_var = tk.StringVar(value="0")
+        self._t_shear_var = tk.StringVar(value="0")
+        self._entry_row(self.settings, "Position",
+                        [("X", self._t_dx_var), ("Y", self._t_dy_var)],
+                        self._on_transform_apply)
+        self._entry_row(self.settings, "Scale %",
+                        [("X", self._t_sx_var), ("Y", self._t_sy_var)],
+                        self._on_transform_apply)
+        self._entry_row(self.settings, "Angle \u00b0",
+                        [("", self._t_angle_var)], self._on_transform_apply)
+        self._entry_row(self.settings, "Shear %",
+                        [("", self._t_shear_var)], self._on_transform_apply)
+        tk.Button(
+            self.settings, text="Apply", command=self._on_transform_apply,
+        ).pack(fill=tk.X, pady=(4, 0))
+
+        self._t_pivot_var = tk.StringVar(value=self.transform_pivot)
+        self._menu_row(
+            self.settings, "Pivot", self._t_pivot_var,
+            [("center", "Centre"), ("nw", "Top Left"), ("ne", "Top Right"),
+             ("sw", "Bottom Left"), ("se", "Bottom Right")],
+            self._on_transform_pivot,
+        )
+        self._t_uniform_var = tk.BooleanVar(value=self.transform_uniform)
+        self._check_row(
+            self.settings, "Uniform scale by default", self._t_uniform_var,
+            self._on_transform_settings,
+        )
+        self._t_snap_var = tk.BooleanVar(value=self.transform_snap_anchors)
+        self._check_row(
+            self.settings, "Snap pivot to anchors", self._t_snap_var,
+            self._on_transform_settings,
+        )
+        self._t_rot_snap_var = tk.IntVar(value=self.transform_rotation_snap)
+        self._slider_row(
+            self.settings, "Snap \u00b0", self._t_rot_snap_var, 0, 90,
+            self._on_transform_settings,
+        )
+        self._t_interp_var = tk.StringVar(value=self.transform_interpolation)
+        self._menu_row(
+            self.settings, "Smooth", self._t_interp_var,
+            [("bicubic", "Bicubic"), ("bilinear", "Bilinear"),
+             ("nearest", "Nearest")],
+            self._on_transform_interpolation,
+        )
+
+    def _transform_action(self, action, values=None):
+        if self._on_transform_action is not None:
+            self._on_transform_action(action, values)
+
+    def _on_transform_apply(self, _event=None):
+        try:
+            values = {
+                "dx": float(self._t_dx_var.get() or 0),
+                "dy": float(self._t_dy_var.get() or 0),
+                "scale_x": float(self._t_sx_var.get() or 100) / 100.0,
+                "scale_y": float(self._t_sy_var.get() or 100) / 100.0,
+                "angle": float(self._t_angle_var.get() or 0),
+                "shear": float(self._t_shear_var.get() or 0) / 100.0,
+            }
+        except ValueError:
+            return
+        if values["scale_x"] <= 0 or values["scale_y"] <= 0:
+            return
+        self._transform_action("apply", values)
+
+    def _on_transform_pivot(self, _event=None):
+        self.transform_pivot = self._t_pivot_var.get()
+        self._transform_action("pivot", self.transform_pivot)
+
+    def _on_transform_settings(self, _event=None):
+        # The gizmo reads these at the next drag (see
+        # ``DrawingController._apply_transform_options``), so no re-sync is
+        # needed - rebuilding the session here would re-crop the layer on every
+        # tick of the snap slider.
+        self.transform_uniform = bool(self._t_uniform_var.get())
+        self.transform_snap_anchors = bool(self._t_snap_var.get())
+        self.transform_rotation_snap = max(
+            0, min(180, self._int_var(self._t_rot_snap_var, 15)))
+
+    def _on_transform_interpolation(self, _event=None):
+        self.transform_interpolation = self._t_interp_var.get()
 
     # ---------------------------------------------------------- crop settings
     def _settings_for_crop(self):
@@ -3581,6 +3733,8 @@ class ToolsPanel(tk.Frame):
         "poses_mode", "poses_scale", "poses_color",
         "poses_opacity", "poses_body", "poses_pose", "poses_hand",
         "poses_hand_side", "poses_drag", "poses_grid",
+        "transform_uniform", "transform_rotation_snap",
+        "transform_snap_anchors", "transform_pivot", "transform_interpolation",
         "symmetry_mode", "symmetry_count", "symmetry_mirror",
     ]
 
@@ -3634,6 +3788,15 @@ class ToolsPanel(tk.Frame):
             pass
         if self.select_mode in ("wand", "segment"):
             self.select_transform = False
+        if self.transform_pivot not in ("center", "nw", "ne", "sw", "se"):
+            self.transform_pivot = "center"
+        if self.transform_interpolation not in ("bicubic", "bilinear", "nearest"):
+            self.transform_interpolation = "bicubic"
+        try:
+            self.transform_rotation_snap = max(
+                0, min(180, int(self.transform_rotation_snap)))
+        except (TypeError, ValueError):
+            self.transform_rotation_snap = 15
         self.size_var.set(self.brush_size)
         self._sync_buttons()
 
@@ -9540,6 +9703,8 @@ class DrawingController:
             self.gizmo.clear()
             self.app.set_result("Nothing to transform on this layer.")
             return
+        self._apply_transform_options()
+        self._apply_transform_pivot_preset()
         view.set_gizmo(self.gizmo.geometry())
         self.app.render()
 
@@ -9623,7 +9788,11 @@ class DrawingController:
         if not self.gizmo.moving_pivot and not self._transform_pushed:
             self.app._push_undo("Transform")
             self._transform_pushed = True
-        uniform = bool(event.state & 0x1)
+        self._apply_transform_options()
+        # Shift inverts the "uniform scale by default" setting, so holding it
+        # always gives the opposite of the tool's chosen default.
+        uniform = bool(event.state & 0x1) != bool(
+            getattr(self.app.tools, "transform_uniform", False))
         # Moving the rotation origin touches no pixels, and the first event of
         # any drag must paint immediately; otherwise rate-limit the resample and
         # overlay work so a fast drag is not stalled by a frame it cannot keep
@@ -9649,6 +9818,115 @@ class DrawingController:
         # A deferred move bakes only on release, so repaint the committed state.
         self.app.render()
 
+    def _apply_transform_options(self):
+        """Mirror the Transform tool's settings onto the layer gizmo."""
+        tools = self.app.tools
+        self.gizmo.snap_anchors = bool(
+            getattr(tools, "transform_snap_anchors", True))
+        self.gizmo.interpolation = getattr(
+            tools, "transform_interpolation", "bicubic")
+        try:
+            self.gizmo.rotation_snap = float(
+                getattr(tools, "transform_rotation_snap", 15) or 0)
+        except (TypeError, ValueError):
+            self.gizmo.rotation_snap = 15.0
+
+    def on_transform_action(self, action, values=None):
+        """Handle the Transform settings panel's buttons and fields."""
+        if action in ("flip_h", "flip_v", "rotate_cw", "rotate_ccw",
+                      "rotate_180"):
+            self._transform_quick(action)
+        elif action == "reset":
+            self.reset_transform_frame()
+        elif action == "pivot":
+            self.set_transform_pivot(values)
+        elif action == "apply":
+            self.apply_transform_values(values or {})
+
+    def _transform_quick(self, action):
+        """Run a whole-layer flip/rotate and keep the gizmo in step."""
+        app = self.app
+        if app.current is None or app.active_layer() is None:
+            return
+        {
+            "flip_h": app.flip_horizontal,
+            "flip_v": app.flip_vertical,
+            "rotate_cw": app.rotate_cw,
+            "rotate_ccw": app.rotate_ccw,
+            "rotate_180": app.rotate_180,
+        }[action]()
+        if app.tools.transform_tool:
+            self.sync_transform()
+
+    def reset_transform_frame(self):
+        """Drop the live frame back to identity, re-based on the pixels."""
+        if not self.app.tools.transform_tool:
+            return
+        self.gizmo.clear()
+        self.sync_transform()
+        self.app.set_result("Reset the transform frame.")
+
+    def set_transform_pivot(self, preset):
+        """Move the rotation origin to a frame preset."""
+        if not self._transform_ready():
+            self.sync_transform()
+        if not self._transform_ready():
+            return
+        self._apply_transform_pivot_preset(preset)
+        view = self.gizmo.view
+        if view is not None:
+            view.set_gizmo(self.gizmo.geometry())
+        self.app.render()
+        self.app.set_result("Set the rotation origin.")
+
+    def _apply_transform_pivot_preset(self, preset=None):
+        """Put the rotation origin on the tool's chosen frame anchor."""
+        if preset is None:
+            preset = getattr(self.app.tools, "transform_pivot", "center")
+        key = {"nw": "nw", "ne": "ne", "sw": "sw", "se": "se"}.get(preset, "c")
+        self.gizmo.rot_pivot_local = self.gizmo._anchor_local()[key]
+
+    def apply_transform_values(self, values):
+        """Apply an exact scale/rotate/shear/translate to the active layer.
+
+        The values act about the frame centre and compose onto the current
+        frame, so repeated applies accumulate; every apply resamples from the
+        session's original pixels, so no interpolation error builds up.
+        """
+        if not self._transform_ready():
+            self.sync_transform()
+        if not self._transform_ready():
+            self.app.set_result("Nothing to transform on this layer.")
+            return
+        if (abs(values.get("scale_x", 1.0) - 1.0) < 1e-9
+                and abs(values.get("scale_y", 1.0) - 1.0) < 1e-9
+                and abs(values.get("angle", 0.0)) < 1e-9
+                and abs(values.get("shear", 0.0)) < 1e-9
+                and abs(values.get("dx", 0.0)) < 1e-9
+                and abs(values.get("dy", 0.0)) < 1e-9):
+            return
+        g = self.gizmo
+        cx, cy = g._center_local()
+        matrix = gizmo.mul(
+            gizmo.rotation(math.radians(values.get("angle", 0.0))),
+            gizmo.shearing(values.get("shear", 0.0), 0.0),
+        )
+        matrix = gizmo.mul(matrix, gizmo.scaling(
+            values.get("scale_x", 1.0), values.get("scale_y", 1.0)))
+        matrix = gizmo.about(matrix, cx, cy)
+        self._apply_transform_options()
+        self.app._push_undo("Transform")
+        g.matrix = gizmo.mul(
+            gizmo.translation(values.get("dx", 0.0), values.get("dy", 0.0)),
+            gizmo.mul(g.matrix, matrix),
+        )
+        g._apply_pixels()
+        view = g.view
+        if view is not None:
+            view.set_gizmo(g.geometry())
+        self.app.render()
+        self.app.set_result("Applied transform.")
+
     def _selection_transform_press(self, event):
         if not self.sel_gizmo.active:
             self.sync_transform()
@@ -9667,7 +9945,8 @@ class DrawingController:
             return
         if not self.sel_gizmo.moving_pivot:
             self._sel_transform_dragged = True
-        uniform = bool(event.state & 0x1)
+        uniform = bool(event.state & 0x1) != bool(
+            getattr(self.app.tools, "transform_uniform", False))
         if self.sel_gizmo.update(x, y, uniform):
             event.widget.set_gizmo(self.sel_gizmo.geometry())
             self.app.render()

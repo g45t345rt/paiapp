@@ -50,6 +50,15 @@ CORNER_OPPOSITE = {"nw": "se", "ne": "sw", "se": "nw", "sw": "ne"}
 CORNERS = ("nw", "ne", "se", "sw")
 EDGES = ("n", "e", "s", "w")
 
+#: Resample kernels a session may commit with, chosen from the Transform tool's
+#: settings. The GPU shader implements bicubic only, so any other kernel falls
+#: back to the Pillow resample (see :meth:`TransformGizmo._resample_base`).
+RESAMPLE = {
+    "bicubic": Image.BICUBIC,
+    "bilinear": Image.BILINEAR,
+    "nearest": Image.NEAREST,
+}
+
 # The affine resample as a fragment shader: one output pixel maps back to a
 # source coordinate by the same matrix ``Image.transform`` is handed, and reads
 # the source there with a Catmull-Rom (a = -0.5) bicubic - the kernel behind
@@ -248,6 +257,13 @@ class TransformGizmo:
         # lands the final, full-quality resample (see :meth:`finish`).
         self._pending_apply = False
         self._draft_used = False
+        # Options mirrored from the Transform tool's settings (see the
+        # controller's ``_apply_transform_options``): the rotation snap step in
+        # degrees (0 disables snapping), whether the rotation origin snaps to a
+        # frame anchor, and the resample kernel a commit uses.
+        self.rotation_snap = 15.0
+        self.snap_anchors = True
+        self.interpolation = "bicubic"
 
     # -------------------------------------------------------------- lifecycle
     def begin(self, app, view):
@@ -697,7 +713,10 @@ class TransformGizmo:
             gx, gy = self._pivot_grab if self._pivot_grab is not None else (0.0, 0.0)
             marker_local = (local[0] + gx, local[1] + gy)
             marker_doc = apply(base, *marker_local)
-            snapped = self._snap_anchor_local(marker_doc[0], marker_doc[1], base)
+            snapped = None
+            if self.snap_anchors:
+                snapped = self._snap_anchor_local(
+                    marker_doc[0], marker_doc[1], base)
             self.rot_pivot_local = snapped if snapped is not None else marker_local
             return True
         if handle == "move":
@@ -719,8 +738,8 @@ class TransformGizmo:
         if handle == "rot":
             cx, cy = self._pivot_doc
             delta = math.atan2(y - cy, x - cx) - self._angle0
-            if uniform:
-                step = math.radians(15.0)
+            if uniform and self.rotation_snap > 0:
+                step = math.radians(self.rotation_snap)
                 delta = round(delta / step) * step
             self.matrix = mul(about(rotation(delta), cx, cy), base)
         elif handle in CORNERS:
@@ -823,7 +842,7 @@ class TransformGizmo:
                 self.layer.mask = self._link_mask.transform(
                     self.layer.size, Image.AFFINE,
                     (frame[0], frame[2], frame[4], frame[1], frame[3], frame[5]),
-                    resample=Image.BICUBIC,
+                    resample=RESAMPLE.get(self.interpolation, Image.BICUBIC),
                 )
             return
         self._resample_base()
@@ -858,13 +877,15 @@ class TransformGizmo:
         inverse = invert(mul(translation(-left, -top), self.matrix))
         data = (inverse[0], inverse[2], inverse[4],
                 inverse[1], inverse[3], inverse[5])
-        textures = self._gpu_textures()
+        resample = RESAMPLE.get(self.interpolation, Image.BICUBIC)
+        # The GPU shader is bicubic only; any other kernel keeps the Pillow path.
+        textures = self._gpu_textures() if resample == Image.BICUBIC else None
         result = None
         if textures is not None:
             result = self._resample_gpu(textures[0], self.source, size, data)
         if result is None:
             result = self.source.transform(
-                size, Image.AFFINE, data, resample=Image.BICUBIC
+                size, Image.AFFINE, data, resample=resample
             )
         self.layer.set_image(result)
         if self.source_mask is not None:
@@ -874,7 +895,7 @@ class TransformGizmo:
                     textures[1], self.source_mask, size, data)
             if mask is None:
                 mask = self.source_mask.transform(
-                    size, Image.AFFINE, data, resample=Image.BICUBIC
+                    size, Image.AFFINE, data, resample=resample
                 )
             self.layer.mask = mask
         self.layer.offset = (left, top)

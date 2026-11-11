@@ -937,6 +937,7 @@ class PaintApp:
             on_puppet_action=self.drawing.on_puppet_action,
             on_poses_action=self.drawing.on_poses_action,
             on_vector_action=self.drawing.on_vector_action,
+            on_transform_action=self.drawing.on_transform_action,
             on_vector_settings=self.drawing.refresh_vector,
             on_layout_change=self._on_layout_change,
             get_layout_family=lambda: self.gen.model_family()
@@ -5767,6 +5768,11 @@ class PaintApp:
             lambda img: img.transpose(Image.ROTATE_90), "Rotated"
         )
 
+    def rotate_180(self):
+        self._transform_layer(
+            lambda img: img.transpose(Image.ROTATE_180), "Rotated"
+        )
+
     # ---------------------------------------------------- canvas-level transform
     def _transform_canvas(self, kind, label):
         """Rotate or flip the whole canvas, not just the active layer.
@@ -6254,10 +6260,10 @@ class PaintApp:
         elif tools.move_tool:
             status = "move: drag to move the selected layers or a guide"
         elif tools.transform_tool:
-            status = ("transform: drag to move; corners scale (Shift uniform); "
-                      "edges skew; top handle rotates; drag the orange origin "
-                      "to change the pivot (snaps to corners/centre, "
-                      "double-click it to reset)")
+            status = ("transform: drag to move; corners scale (Shift inverts "
+                      "uniform); edges skew; the top handle rotates; drag the "
+                      "orange origin to change the pivot. Exact values, pivot "
+                      "presets, snapping and smoothing are in Tool Settings")
         elif tools.paste_tool:
             status = "paste: paste the clipboard, or set the paste options"
         elif tools.arrow_tool:
