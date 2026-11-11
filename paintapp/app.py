@@ -2915,6 +2915,24 @@ class PaintApp:
             self.drawing.sync_transform()
         self.render()
 
+    def select_layer(self, delta):
+        """Move the active layer one row up (``-1``) or down (``1``) the list.
+
+        ``delta`` follows the on-screen list, which is drawn top-most-first, so
+        the Up and Down arrow keys walk the same column the user sees. Only
+        layer rows are visited: group headers and filter, text and path rows are
+        skipped, and a layer inside a collapsed group is out of reach. At the
+        top or bottom of the list the selection stays put.
+        """
+        if self.current is None or not self.layers:
+            return
+        target = self.layer_panel.step_layer(delta)
+        if target is None or target == self.active:
+            return
+        self._on_layer_select(target)
+        self._refresh_layer_list()
+        self.layer_panel.reveal_layer(target)
+
     # ----------------------------------------------------------- prompt box
     def _on_positive_prompt(self, text):
         """Store the positive prompt on the active layer so it survives a switch."""

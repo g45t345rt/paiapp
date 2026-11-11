@@ -364,12 +364,18 @@ class LayerPanel(tk.Frame):
         scrollbar = ArrowScrollbar(list_frame)
         self.canvas = tk.Canvas(
             list_frame, height=ROW_H * 6, highlightthickness=0,
-            bg=theme.color("listbox_bg"),
+            bg=theme.color("listbox_bg"), takefocus=True,
         )
         scrollbar.set_command(self.canvas.yview)
         self.canvas.configure(yscrollcommand=scrollbar.set)
         scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
         self.canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        # Arrow keys walk the list only while it holds keyboard focus, so a
+        # focused combobox or text field keeps its own arrow behaviour. Clicking
+        # a row (see :meth:`_on_press`) or the empty canvas focuses the list.
+        self.canvas.bind("<Button-1>", self._on_canvas_press)
+        self.canvas.bind("<Up>", lambda _e: self._on_arrow(-1))
+        self.canvas.bind("<Down>", lambda _e: self._on_arrow(1))
         self.inner = tk.Frame(self.canvas, bg=theme.color("listbox_bg"))
         self._window = self.canvas.create_window(
             (0, 0), window=self.inner, anchor="nw"
@@ -1288,6 +1294,62 @@ class LayerPanel(tk.Frame):
         self._apply_selection_colors()
         self._sync_button_state()
 
+    def step_layer(self, delta):
+        """The layer index ``delta`` visible rows from the selected layer.
+
+        Arrow-key navigation steps between the layer rows that are actually on
+        screen, skipping group headers and filter, text and path rows, so
+        members of a collapsed group are not reachable and the walk matches the
+        column the user sees. ``delta`` counts rows down the list, matching the
+        Up (``-1``) and Down (``1``) arrow keys. Returns ``None`` at an end of
+        the list or when no layer rows are listed.
+        """
+        rows = [i for i, entry in enumerate(self._rows) if entry[0] == "layer"]
+        if not rows:
+            return None
+        current = None
+        for i in rows:
+            if self._rows[i] == ("layer", self._active):
+                current = i
+                break
+        if current is None:
+            target = rows[0] if delta > 0 else rows[-1]
+            return self._rows[target][1]
+        position = rows.index(current) + delta
+        if position < 0 or position >= len(rows):
+            return None
+        return self._rows[rows[position]][1]
+
+    def reveal_layer(self, index):
+        """Scroll the row for layer ``index`` fully into view, if it is listed."""
+        for row, entry in enumerate(self._rows):
+            if entry == ("layer", index):
+                self.reveal_row(row)
+                return
+
+    def reveal_row(self, row):
+        """Scroll the list the least amount needed to show row ``row`` whole.
+
+        Used after keyboard navigation so the newly selected layer is brought
+        on screen without recentring the whole list under the user's cursor.
+        """
+        try:
+            view_height = self.canvas.winfo_height()
+        except tk.TclError:
+            return
+        if view_height <= 1:
+            return
+        total = self.inner.winfo_height() or len(self._rows) * ROW_H
+        if total <= view_height:
+            return
+        top = row * ROW_H
+        bottom = top + ROW_H
+        first = self.canvas.canvasy(0)
+        if top < first:
+            self.canvas.yview_moveto(top / total)
+        elif bottom > first + view_height:
+            self.canvas.yview_moveto((bottom - view_height) / total)
+
     def selected_indices(self, count):
         """Document-order indices of the selected layer rows (filters excluded)."""
         indices = set()
@@ -1430,11 +1492,44 @@ class LayerPanel(tk.Frame):
         self._apply_selection_colors()
         self._dispatch(target)
 
+    def focus_list(self):
+        """Give the list keyboard focus so the arrow keys walk it."""
+        try:
+            self.canvas.focus_set()
+        except tk.TclError:
+            pass
+
+    def _on_canvas_press(self, _event):
+        """A press on the empty canvas hands the list keyboard focus."""
+        self.focus_list()
+
+    def _on_arrow(self, delta):
+        """Move the active layer with an arrow key while the list has focus.
+
+        Bound on the canvas, so it only fires when the list itself is focused and
+        never competes with a focused combobox or text field. ``delta`` follows
+        the on-screen list (``-1`` up, ``1`` down); the moved-to row is selected
+        and dispatched like a click, and scrolled into view.
+        """
+        target = self.step_layer(delta)
+        if target is None or target == self._active:
+            return "break"
+        for row, entry in enumerate(self._rows):
+            if entry == ("layer", target):
+                self._active = target
+                self._select_rows([row], row)
+                self.reveal_row(row)
+                break
+        return "break"
+
     # ------------------------------------------------------------------ events
     def _on_press(self, event, row):
         """A click on a row: plain selects it, Ctrl toggles, Shift extends."""
         if not (0 <= row < len(self._rows)):
             return
+        # The click also hands the list keyboard focus so the arrow keys walk it
+        # (see :meth:`_on_arrow`).
+        self.focus_list()
         # Remember the press so a following drag on the row can become a reorder
         # (see :meth:`_on_motion`); cleared by the drag, a double click or a
         # right click so neither starts one.

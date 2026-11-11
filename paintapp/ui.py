@@ -1360,6 +1360,16 @@ def build_menus(app, parent):
         label="Move Down", command=lambda: app.move_layer(-1),
         enabled=lambda: can_move(-1),
     )
+    layers_menu.add_separator()
+    layers_menu.add_command(
+        label="Select Layer Above", accelerator="Up",
+        command=lambda: app.select_layer(-1), enabled=lambda: bool(app.layers),
+    )
+    layers_menu.add_command(
+        label="Select Layer Below", accelerator="Down",
+        command=lambda: app.select_layer(1), enabled=lambda: bool(app.layers),
+    )
+    layers_menu.add_separator()
     layers_menu.add_command(
         label="Merge Layers", accelerator=accel("layer_merge"), command=app.merge_layers,
         enabled=lambda: selected_layer_count() >= 2,
