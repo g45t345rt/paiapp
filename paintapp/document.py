@@ -200,6 +200,82 @@ def _draft_spec(spec):
     return draft
 
 
+def _preview_key(layer):
+    """The live transform preview's matrix (for render signatures), or ``None``."""
+    preview = getattr(layer, "_live_preview", None)
+    if preview is None:
+        return None
+    return (id(preview[0]), tuple(preview[1]))
+
+
+def _paste_preview(base, layer, preview, left, top, clip, scale, ax, ay):
+    """Composite a live transform preview straight at display resolution.
+
+    ``preview`` is ``(image, matrix)``: a snapshot of the layer's composited
+    pixels and the affine (``(a, b, c, d, e, f)``, as :func:`_affine_mul`)
+    mapping that image's pixels into document space. Sampling directly into the
+    ``base`` grid costs the viewport's pixels however large the layer is; a full
+    resolution resample of the layer happens only once, on release.
+    """
+    image, matrix = preview
+    # Zoomed out, one source pixel per output pixel aliases badly: sample a
+    # power-of-two reduction of the snapshot instead (built once per drag).
+    linear = math.sqrt(abs(matrix[0] * matrix[3] - matrix[1] * matrix[2])) * scale
+    factor = 1
+    while factor < 32 and linear * factor * 2 <= 1.0 and \
+            min(image.size) // (factor * 2) >= 1:
+        factor *= 2
+    if factor > 1:
+        mips = getattr(layer, "_live_preview_mips", None)
+        if mips is None or mips[0] is not image:
+            mips = (image, {})
+            layer._live_preview_mips = mips
+        reduced = mips[1].get(factor)
+        if reduced is None:
+            reduced = image.reduce(factor)
+            mips[1][factor] = reduced
+        matrix = _affine_mul(matrix, (image.width / reduced.width, 0.0, 0.0,
+                                      image.height / reduced.height, 0.0, 0.0))
+        image = reduced
+    bx0 = int(round((left - ax) * scale))
+    by0 = int(round((top - ay) * scale))
+    # base pixel (u, v) -> document (ax + (u + bx0) / scale, ...).
+    to_base = _affine_mul(
+        _affine_mul(
+            (scale, 0.0, 0.0, scale, -bx0, -by0),
+            _affine_translate(-ax, -ay),
+        ),
+        matrix,
+    )
+    l, t, r, b = _affine_bounds(to_base, image.size)
+    l = max(0, math.floor(l) - 1)
+    t = max(0, math.floor(t) - 1)
+    r = min(base.width, math.ceil(r) + 1)
+    b = min(base.height, math.ceil(b) + 1)
+    if r <= l or b <= t:
+        return
+    # Pillow premultiplies the *whole* source on every RGBA resample, so crop it
+    # to the part the output rectangle can sample first.
+    back = _affine_invert(to_base)
+    sl, st, sr, sb = _affine_bounds(
+        _affine_mul(back, _affine_translate(l, t)), (r - l, b - t))
+    sl = max(0, math.floor(sl) - 2)
+    st = max(0, math.floor(st) - 2)
+    sr = min(image.width, math.ceil(sr) + 2)
+    sb = min(image.height, math.ceil(sb) + 2)
+    if sr <= sl or sb <= st:
+        return
+    if (sl, st, sr, sb) != (0, 0) + image.size:
+        image = image.crop((sl, st, sr, sb))
+        to_base = _affine_mul(to_base, _affine_translate(sl, st))
+    inverse = _affine_invert(_affine_mul(_affine_translate(-l, -t), to_base))
+    data = (inverse[0], inverse[2], inverse[4],
+            inverse[1], inverse[3], inverse[5])
+    sub = image.transform((r - l, b - t), Image.AFFINE, data,
+                          resample=Image.BILINEAR)
+    _composite_sub(base, layer, sub, (l, t), clip)
+
+
 def _paste_layer(base, layer, left, top, clip=None, scale=1.0, offset=None,
                  anchor=None):
     """Alpha-composite one layer into ``base``, whose top-left is document
@@ -231,6 +307,10 @@ def _paste_layer(base, layer, left, top, clip=None, scale=1.0, offset=None,
     without changing the document.
     """
     ax, ay = (left, top) if anchor is None else anchor
+    preview = getattr(layer, "_live_preview", None)
+    if preview is not None and offset is None:
+        _paste_preview(base, layer, preview, left, top, clip, scale, ax, ay)
+        return
     ox, oy = offset if offset is not None else layer.offset
     lw, lh = layer.size
     region_w = base.width / scale
@@ -997,6 +1077,7 @@ class Layer:
         ``include_mask`` is forwarded to the source's composite.
         """
         base = source._composited_image_at(source.content_offset(), include_mask)
+        draft = bool(getattr(self, "_transform_draft", False))
         left, top, right, bottom = _affine_bounds(matrix, base.size)
         left_i = math.floor(left)
         top_i = math.floor(top)
@@ -1013,13 +1094,60 @@ class Layer:
             source._poses_token,
             source._path_token,
             source._mask_token,
-            tuple(matrix),
+            tuple(round(v, 9) for v in matrix),
             left_i,
             top_i,
             include_mask,
+            draft,
         )
         if self._transform_cache is not None and self._transform_key == key:
             return self._transform_cache
+        # A live transform drag resamples with a cheap kernel; the release
+        # re-renders with the exact bicubic one (the key includes ``draft``).
+        resample = Image.BILINEAR if draft else Image.BICUBIC
+        # The master's composite is usually canvas-sized while its content is
+        # small: resample only the content's bounding box, then place it in the
+        # full-size buffer, instead of running the filter over every pixel.
+        bbox = base.getbbox() if "A" in base.getbands() else None
+        if bbox is not None:
+            # Keep the bicubic kernel's footprint around the content.
+            bbox = (
+                max(0, bbox[0] - 2), max(0, bbox[1] - 2),
+                min(base.size[0], bbox[2] + 2), min(base.size[1], bbox[3] + 2),
+            )
+        if bbox is not None and bbox != (0, 0) + base.size:
+            sub = base.crop(bbox)
+            sub_matrix = _affine_mul(
+                _affine_mul(_affine_translate(-left_i, -top_i), matrix),
+                _affine_translate(bbox[0], bbox[1]),
+            )
+            sl, st, sr, sb = _affine_bounds(sub_matrix, sub.size)
+            # One pixel of margin for the kernel's footprint.
+            sl = max(0, math.floor(sl) - 2)
+            st = max(0, math.floor(st) - 2)
+            sr = min(size[0], math.ceil(sr) + 2)
+            sb = min(size[1], math.ceil(sb) + 2)
+            result = Image.new(base.mode, size)
+            if sr > sl and sb > st:
+                inverse = _affine_invert(
+                    _affine_mul(_affine_translate(-sl, -st), sub_matrix)
+                )
+                data = (
+                    inverse[0], inverse[2], inverse[4],
+                    inverse[1], inverse[3], inverse[5],
+                )
+                part = sub.transform(
+                    (sr - sl, sb - st), Image.AFFINE, data, resample=resample
+                )
+                result.paste(part, (sl, st))
+            self._transform_cache = result
+            self._transform_key = key
+            return result
+        if bbox is None and "A" in base.getbands():
+            result = Image.new(base.mode, size)
+            self._transform_cache = result
+            self._transform_key = key
+            return result
         inverse = _affine_invert(
             _affine_mul(_affine_translate(-left_i, -top_i), matrix)
         )
@@ -1027,7 +1155,7 @@ class Layer:
             inverse[0], inverse[2], inverse[4],
             inverse[1], inverse[3], inverse[5],
         )
-        result = base.transform(size, Image.AFFINE, data, resample=Image.BICUBIC)
+        result = base.transform(size, Image.AFFINE, data, resample=resample)
         self._transform_cache = result
         self._transform_key = key
         return result
@@ -1368,8 +1496,8 @@ class Layer:
         top_i = math.floor(top)
         self.transform = _affine_mul(_affine_translate(-left_i, -top_i), matrix)
         self.offset = (left_i, top_i)
-        self._transform_cache = None
-        self._transform_key = None
+        # The transform cache keys on the normalised matrix, so a pure integer
+        # move (same normalised matrix, new offset) keeps reusing it.
 
     def clear_transform(self):
         """Drop the per-instance transform (back to the master's own pixels).
@@ -2597,6 +2725,7 @@ class Canvas:
             tuple(layer.offset),
             tuple(getattr(layer, "_content_delta", (0, 0)) or (0, 0)),
             None if layer.transform is None else tuple(layer.transform),
+            _preview_key(layer),
             layer.opacity,
             layer.visible,
             layer.blend,

@@ -257,6 +257,9 @@ class TransformGizmo:
         # lands the final, full-quality resample (see :meth:`finish`).
         self._pending_apply = False
         self._draft_used = False
+        self._preview_image = None
+        self._preview_origin = None
+        self._link_mask_frame = None
         # Options mirrored from the Transform tool's settings (see the
         # controller's ``_apply_transform_options``): the rotation snap step in
         # degrees (0 disables snapping), whether the rotation origin snaps to a
@@ -492,6 +495,8 @@ class TransformGizmo:
         self._drag_mask = None
         self._pending_apply = False
         self._draft_used = False
+        self._link_mask_frame = None
+        self._clear_preview()
         if self.layer is not None:
             # A draft frame's cheap overlay render must not outlive the drag.
             self.layer._transform_draft = False
@@ -663,6 +668,7 @@ class TransformGizmo:
     def start(self, handle, x, y):
         self._handle = handle
         self._press = (x, y)
+        self._preview_image = None
         self._start_matrix = self.matrix
         self._press_local = apply(invert(self.matrix), x, y)
         self._drag_offset = tuple(self.layer.offset)
@@ -731,7 +737,15 @@ class TransformGizmo:
             # release (see :meth:`_bake_move`). A link records its own transform,
             # so it keeps the per-event path.
             if self._is_link:
-                self._apply_pixels()
+                # A link records its own transform. Snap the live move to whole
+                # pixels so the normalised transform (and with it the link's
+                # cached resample) stays unchanged and only the offset slides;
+                # the release lands the exact sub-pixel position.
+                self.matrix = mul(translation(round(dx), round(dy)), base)
+                self._apply_pixels(draft=True)
+                self.matrix = mul(translation(dx, dy), base)
+                self._pending_apply = True
+                self._draft_used = True
             else:
                 self._apply_move(dx, dy)
             return True
@@ -764,7 +778,14 @@ class TransformGizmo:
             else:
                 shear = about(shearing(0.0, (local[1] - pl[1]) / height), cx, cy)
             self.matrix = mul(base, shear)
-        if apply_pixels:
+        if apply_pixels and draft:
+            # A live frame: show the drag-start snapshot through the new matrix,
+            # sampled at display resolution by the renderer, instead of
+            # resampling the whole layer every frame. The release resamples once.
+            self._show_preview()
+            self._pending_apply = False
+            self._draft_used = True
+        elif apply_pixels:
             self._apply_pixels(draft=draft)
             self._pending_apply = False
             self._draft_used = draft
@@ -773,6 +794,46 @@ class TransformGizmo:
             # not: remember to land them on release.
             self._pending_apply = True
         return True
+
+    def flush_draft(self):
+        """Land a throttled drag's skipped frame as a draft. True if it painted.
+
+        The drag throttle skips resampling between frames; when the pointer then
+        holds still, this catches the pixels up to the gizmo frame without
+        waiting for the release.
+        """
+        if not (self.active and self.dragging and self._pending_apply):
+            return False
+        if self._handle == "move" and self._is_link:
+            return False  # already painted (snapped) every event
+        self._show_preview()
+        self._pending_apply = False
+        self._draft_used = True
+        return True
+
+    def _show_preview(self):
+        """Point the layer's live preview at the current :attr:`matrix`.
+
+        The snapshot is the layer's composite (filters, overlays, masks) taken
+        once at the first live frame of the drag; the matrix maps its pixels
+        through the drag's delta into document space.
+        """
+        if self._preview_image is None:
+            image = self.layer.composited_image()
+            if image.mode != "RGBA":
+                image = image.convert("RGBA")
+            self._preview_image = image
+            ox, oy = self._drag_offset
+            self._preview_origin = translation(ox, oy)
+        delta = mul(self.matrix, invert(self._start_matrix))
+        self.layer._live_preview = (
+            self._preview_image, mul(delta, self._preview_origin))
+
+    def _clear_preview(self):
+        self._preview_image = None
+        if self.layer is not None:
+            self.layer._live_preview = None
+            self.layer._live_preview_mips = None
 
     def finish(self):
         # A move drag deferred its resample (see :meth:`_apply_move`); commit it
@@ -832,6 +893,7 @@ class TransformGizmo:
             content_matrix = mul(
                 self.matrix, translation(-box[0], -box[1])
             )
+            self.layer._transform_draft = draft
             self.layer.set_transform(content_matrix)
             if self._link_mask is not None:
                 # The instance mask lives in the buffer frame the transform
@@ -839,13 +901,19 @@ class TransformGizmo:
                 # new one, resampling from the original every frame.
                 new_matrix = self.layer.transform or IDENTITY
                 frame = mul(self._link_mask_matrix, invert(new_matrix))
+                frame_key = (tuple(round(v, 9) for v in frame),
+                             tuple(self.layer.size), self.interpolation)
+                if getattr(self, "_link_mask_frame", None) == frame_key:
+                    # A pure move keeps the same buffer frame: nothing to redo.
+                    return
+                self._link_mask_frame = frame_key
                 self.layer.mask = self._link_mask.transform(
                     self.layer.size, Image.AFFINE,
                     (frame[0], frame[2], frame[4], frame[1], frame[3], frame[5]),
                     resample=RESAMPLE.get(self.interpolation, Image.BICUBIC),
                 )
             return
-        self._resample_base()
+        self._resample_base(draft=draft)
         # Carry the document-space overlays through the same gesture, from the
         # session's original placement, so a path/vector/text/pose travels with
         # the transformed pixels instead of staying pinned to the page.
@@ -855,7 +923,7 @@ class TransformGizmo:
         # release resamples with ``draft=False`` and clears it again.
         self.layer._transform_draft = draft
 
-    def _resample_base(self):
+    def _resample_base(self, draft=False):
         """Re-sample the base pixels and mask through :attr:`matrix`."""
         # Render into a buffer big enough to hold the transformed content as well
         # as the canvas, then record where that buffer sits in document space via
@@ -867,8 +935,17 @@ class TransformGizmo:
             (float(width), float(height)), (0.0, float(height)),
         )]
         doc_w, doc_h = self.canvas_size
-        left = min(0, math.floor(min(p[0] for p in corners)))
-        top = min(0, math.floor(min(p[1] for p in corners)))
+        if draft:
+            # A live drag frame only needs the transformed content itself: the
+            # layer offset places it. Growing the buffer to the canvas made every
+            # frame resample (and invalidate) a canvas-sized image; the release
+            # (``draft=False``) restores the canvas-covering buffer.
+            doc_w = doc_h = float("-inf")
+            left = math.floor(min(p[0] for p in corners))
+            top = math.floor(min(p[1] for p in corners))
+        else:
+            left = min(0, math.floor(min(p[0] for p in corners)))
+            top = min(0, math.floor(min(p[1] for p in corners)))
         right = max(doc_w, math.ceil(max(p[0] for p in corners)))
         bottom = max(doc_h, math.ceil(max(p[1] for p in corners)))
         size = (max(1, right - left), max(1, bottom - top))
@@ -946,6 +1023,7 @@ class SelectionGizmo(TransformGizmo):
         """Begin a drag; like the base, minus the layer backup."""
         self._handle = handle
         self._press = (x, y)
+        self._preview_image = None
         self._start_matrix = self.matrix
         self._press_local = apply(invert(self.matrix), x, y)
         if handle == "pivot":

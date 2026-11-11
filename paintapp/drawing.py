@@ -9805,6 +9805,27 @@ class DrawingController:
             if apply:
                 self._transform_render_at = now
                 self.app.render()
+            else:
+                self._schedule_transform_trailing(now)
+
+    def _schedule_transform_trailing(self, now):
+        """Queue one trailing draft frame for a throttled transform drag.
+
+        Without it a drag that pauses mid-gesture shows stale pixels until the
+        release; the timer coalesces with any frame the drag paints meanwhile.
+        """
+        if getattr(self, "_transform_trailing_job", None) is not None:
+            return
+        wait = self.TRANSFORM_RENDER_INTERVAL - (now - self._transform_render_at)
+        delay = max(1, int(wait * 1000) + 1)
+        self._transform_trailing_job = self.app.root.after(
+            delay, self._run_transform_trailing)
+
+    def _run_transform_trailing(self):
+        self._transform_trailing_job = None
+        if self.gizmo.flush_draft():
+            self._transform_render_at = time.monotonic()
+            self.app.render()
 
     def _transform_release(self):
         if not self.gizmo.active:
