@@ -5954,6 +5954,30 @@ class PaintApp:
         view = self.area.current_view()
         return getattr(view, "selection", None)
 
+    def alpha_to_selection(self):
+        """Select the active layer's opaque pixels (its alpha channel)."""
+        layer = self.active_layer()
+        if layer is None:
+            self.set_result("There is no layer to select from.")
+            return
+        view = self.area.current_view()
+        if view is None:
+            return
+        alpha = layer.composited_image().getchannel("A")
+        mask = Image.new("L", self.current.size, 0)
+        mask.paste(alpha, layer.offset)
+        selection = Selection.from_mask(self.current.size, mask)
+        if selection.is_empty():
+            self.set_result(f"Layer '{layer.name}' has no opaque pixels.")
+            return
+        view.set_selection(selection)
+        self.tools.select("select")
+        box = selection.bbox
+        self.set_result(
+            f"Selected {box[2] - box[0]} x {box[3] - box[1]} "
+            f"from layer '{layer.name}'."
+        )
+
     def select_all(self):
         view = self.area.current_view()
         if view is None:

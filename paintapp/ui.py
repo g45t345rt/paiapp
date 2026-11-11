@@ -1324,6 +1324,10 @@ def build_menus(app, parent):
         enabled=lambda: bool(app.layers),
     )
     layers_menu.add_command(
+        label="Alpha to Selection", command=app.alpha_to_selection,
+        enabled=lambda: bool(app.layers),
+    )
+    layers_menu.add_command(
         label="Delete Layer", accelerator=accel("edit_delete"),
         command=app.delete_layer, enabled=lambda: len(app.layers) >= 1,
     )
