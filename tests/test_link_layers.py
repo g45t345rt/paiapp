@@ -348,6 +348,39 @@ def test_save_load_round_trip():
     check("master counter restored", reloaded.master_counter, 1)
 
 
+def test_save_load_keeps_link_offset():
+    """A link's move (its offset) survives save/load, not just its transform.
+
+    A link re-renders its master's content at its own offset, so the loader must
+    not re-place the fallback pixels: placing would enlarge the buffer and
+    recentre a positive offset to ``(0, 0)``, silently undoing the move.
+    """
+    app = make_project_app()
+    source = app._new_canvas("Source", (8, 8))
+    source.layers = []
+    master = source.add_layer(name="Master")
+    master.draw.point((1, 1), fill=(255, 0, 0, 255))
+    master.is_master = True
+    master.master_id = 1
+    target = app._new_canvas("Target", (8, 8))
+    target.layers = []
+    link = target.add_layer(name="Link")
+    link.link_id = 1
+    link.master = master
+    link.offset = (3, 2)
+    app.master_counter = 1
+
+    with tempfile.TemporaryDirectory() as tmp:
+        path = os.path.join(tmp, "links.pai")
+        project.save(app, path)
+        payload = project.read(SimpleNamespace(canvases=[]), path)
+        reloaded = make_project_app()
+        project.apply(reloaded, payload)
+
+    new_link = reloaded.canvases[1].layers[0]
+    check("link offset persisted", new_link.offset, (3, 2))
+
+
 def test_link_instance_mask_hides_only_that_instance():
     doc = make_doc()
     master = promote(doc)

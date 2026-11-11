@@ -519,10 +519,16 @@ def apply(app, payload):
             layer = doc.add_layer(name=layer_entry.get("name", "Layer"))
             offset = layer_entry.get("offset") or (0, 0)
             offset = (int(offset[0]), int(offset[1]))
-            if image is not None:
+            # A link re-renders its master's content at its own offset instead
+            # of keeping the stored pixels, so keep its saved buffer frame and
+            # offset as-is: placing it would enlarge the buffer and recentre a
+            # positive offset to (0, 0), dropping the instance's move on reload.
+            if image is not None and layer_entry.get("link_id") is None:
                 placed, placed_offset = _place_layer(image, doc.size, offset)
                 layer.set_image(placed)
             else:
+                if image is not None:
+                    layer.set_image(image)
                 placed_offset = offset
             layer.offset = placed_offset
             mask = masks.get((canvas_index, layer_index))
