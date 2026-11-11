@@ -1,5 +1,6 @@
 """Document models: a :class:`Canvas` holds a stack of :class:`Layer` images."""
 
+import itertools
 import math
 
 from PIL import Image, ImageChops, ImageDraw
@@ -14,6 +15,41 @@ from .history import History
 # content-sized, so a canvas larger than this falls back to a whole-stack
 # flatten per render rather than holding hundreds of megabytes.
 MAX_BACKDROP_PIXELS = 12_000_000
+
+# Process-wide source of content versions and object ids. Every layer content
+# token is drawn from it, so a token value is never reused for different
+# content. That lets an undo snapshot carry a layer's tokens (and its ``uid``)
+# to the rebuilt layer: the restored object reports the same ``pixels_token``
+# its content had, and the layer panel's thumbnail cache (keyed on ``uid`` and
+# token) still hits instead of rebuilding every preview on each undo/redo.
+_counter = itertools.count(1)
+
+
+def next_token():
+    """A new, process-unique version number."""
+    return next(_counter)
+
+
+_LAYER_TOKENS = (
+    "_image_token", "_text_token", "_vector_token", "_path_token",
+    "_poses_token", "_mask_token",
+)
+
+# Per-layer render caches an undo restore hands from the replaced layer object
+# to the rebuilt one (see :meth:`Canvas.restore`). Each is guarded by a key of
+# content tokens, so a stale one is never used.
+_LAYER_CACHES = (
+    "_filter_cache", "_filter_key",
+    "_text_cache", "_text_key",
+    "_vector_cache", "_vector_key",
+    "_path_cache", "_path_key",
+    "_poses_cache", "_poses_key",
+    "_composite_cache", "_composite_key",
+    "_transform_cache", "_transform_key",
+    "_instance_mask_cache", "_instance_mask_key",
+    "_instance_mask_scale", "_instance_mask_scale_key",
+    "_mip_cache",
+)
 
 # Layer blend modes, in menu order. "normal" is plain over-compositing; the
 # others mix the layer's color with the pixels already composited beneath it.
@@ -413,7 +449,7 @@ def _mip_region(layer, left, top, ix0, iy0, ix1, iy1, scale, ax, ay, ox, oy):
         return None
     source = layer.content_source()
     key = (
-        id(source), source._image_token, filters.chain_key(source.filters),
+        source.uid, source._image_token, filters.chain_key(source.filters),
         source._text_token, source._vector_token, source._poses_token,
         source._path_token, source._mask_token, tuple(layer.content_offset()),
         None if layer.transform is None else tuple(layer.transform), level,
@@ -520,6 +556,8 @@ class Group:
     def __init__(self, name, group_id):
         self.name = name
         self.id = group_id
+        # Stable identity for view caches; carried across undo restores.
+        self.uid = next_token()
         self.visible = True
         self.opacity = 1.0
         self.collapsed = False
@@ -591,6 +629,10 @@ class Group:
 class Layer:
     def __init__(self, name, size, fill=(0, 0, 0, 0)):
         self.name = name
+        # Stable identity for view caches (the layer panel's previews). An undo
+        # restore rebuilds layer objects but carries this over, together with
+        # the content tokens, so unchanged layers keep their cached thumbnails.
+        self.uid = next_token()
         self.image = Image.new("RGBA", size, fill)
         self.draw = ImageDraw.Draw(self.image)
         self.visible = True
@@ -690,29 +732,29 @@ class Layer:
         self._transform_key = None
         self._filter_cache = None
         self._filter_key = None
-        self._image_token = 0
-        self._text_token = 0
+        self._image_token = next_token()
+        self._text_token = next_token()
         self._text_cache = None
         self._text_key = None
         # Version of the stroke list and its rendered overlay, bumped whenever
         # the strokes change so the composited-image cache invalidates.
-        self._vector_token = 0
+        self._vector_token = next_token()
         self._vector_cache = None
         self._vector_key = None
         # Version of the path list and its rendered overlay, bumped whenever the
         # paths change so the composited-image cache invalidates.
-        self._path_token = 0
+        self._path_token = next_token()
         self._path_cache = None
         self._path_key = None
         # Version of the poses list and its rendered overlay, bumped
         # whenever the figures change so the composited-image cache invalidates.
-        self._poses_token = 0
+        self._poses_token = next_token()
         self._poses_cache = None
         self._poses_key = None
         # Version of the mask's pixels, bumped whenever the mask is replaced or
         # handed out for an in-place edit. The composited-image cache keys on it
         # so a mask edit invalidates the cache without a full pixel comparison.
-        self._mask_token = 0
+        self._mask_token = next_token()
         self._composite_cache = None
         self._composite_key = None
         # Cache of a link layer's composite with its own per-instance mask
@@ -735,7 +777,7 @@ class Layer:
         # so the copy-on-write marker clears.
         self._mask = value
         self._mask_shared = False
-        self._mask_token += 1
+        self._mask_token = next_token()
 
     def set_image(self, image):
         """Replace the layer's pixels and rebind the draw handle."""
@@ -762,7 +804,7 @@ class Layer:
         The caller mutates the returned mask in place, so the mask version is
         bumped here to invalidate the composited-image cache for the edit.
         """
-        self._mask_token += 1
+        self._mask_token = next_token()
         if self._mask is not None and self._mask_shared:
             self.mask = self._mask.copy()
         return self._mask
@@ -818,7 +860,7 @@ class Layer:
 
     def invalidate_filters(self):
         """Drop the cached filtered image (call after editing ``image``)."""
-        self._image_token += 1
+        self._image_token = next_token()
         self._filter_cache = None
         self._filter_key = None
 
@@ -911,6 +953,8 @@ class Layer:
             # its version belongs in the token (a no-op for a plain layer, whose
             # mask is already the source's).
             self._mask_token,
+            # A per-instance transform reshapes the composite (and thumbnail).
+            None if self.transform is None else tuple(self.transform),
         )
 
     def content_offset(self):
@@ -931,13 +975,13 @@ class Layer:
 
     def invalidate_texts(self):
         """Drop the cached text overlay (call after editing ``texts``)."""
-        self._text_token += 1
+        self._text_token = next_token()
         self._text_cache = None
         self._text_key = None
 
     def invalidate_vectors(self):
         """Drop the cached stroke overlay (call after editing ``strokes``)."""
-        self._vector_token += 1
+        self._vector_token = next_token()
         self._vector_cache = None
         self._vector_key = None
 
@@ -950,13 +994,13 @@ class Layer:
 
     def invalidate_poses(self):
         """Drop the cached figure overlay (call after editing ``poses``)."""
-        self._poses_token += 1
+        self._poses_token = next_token()
         self._poses_cache = None
         self._poses_key = None
 
     def invalidate_paths(self):
         """Drop the cached path overlay (call after editing ``paths``)."""
-        self._path_token += 1
+        self._path_token = next_token()
         self._path_cache = None
         self._path_key = None
 
@@ -1063,7 +1107,7 @@ class Layer:
         """The master's content versions a link's composite depends on."""
         source = self.content_source()
         return (
-            id(source), source._image_token, filters.chain_key(source.filters),
+            source.uid, source._image_token, filters.chain_key(source.filters),
             source._text_token, source._vector_token, source._poses_token,
             source._path_token, source._mask_token,
         )
@@ -1090,7 +1134,7 @@ class Layer:
             max(1, math.ceil(bottom - top_i)),
         )
         key = (
-            id(source),
+            source.uid,
             source._image_token,
             filters.chain_key(source.filters),
             source._text_token,
@@ -1829,6 +1873,8 @@ class Canvas:
             if layer.mask is not None:
                 layer._mask_shared = True
             layers.append({
+                "uid": layer.uid,
+                "tokens": {name: getattr(layer, name) for name in _LAYER_TOKENS},
                 "name": layer.name,
                 "image": layer.image,
                 "mask": layer.mask,
@@ -1889,6 +1935,7 @@ class Canvas:
             "groups": [
                 {
                     "id": group.id,
+                    "uid": group.uid,
                     "name": group.name,
                     "visible": group.visible,
                     "opacity": group.opacity,
@@ -1927,13 +1974,17 @@ class Canvas:
         per-canvas undo stack survives a restore.
         """
         self.name = snapshot["name"]
+        resized = (self.width, self.height) != (snapshot["width"], snapshot["height"])
         self.width = snapshot["width"]
         self.height = snapshot["height"]
+        previous = {getattr(layer, "uid", None): layer for layer in self.layers}
         self.groups = []
         self.layers = []
         groups = {}
         for group_entry in snapshot.get("groups", []):
             group = Group(group_entry["name"], group_entry["id"])
+            if "uid" in group_entry:
+                group.uid = group_entry["uid"]
             group.visible = group_entry.get("visible", True)
             group.opacity = group_entry.get("opacity", 1.0)
             group.collapsed = group_entry.get("collapsed", False)
@@ -2017,6 +2068,22 @@ class Canvas:
                 layer_entry.get("pose_scene"),
                 layer.size,
             )
+            # The setters above bumped fresh tokens; the content now equals
+            # what it was at snapshot time, so take back that version (and the
+            # identity) so caches keyed on them stay valid across the restore.
+            if "uid" in layer_entry:
+                layer.uid = layer_entry["uid"]
+            for name, value in layer_entry.get("tokens", {}).items():
+                setattr(layer, name, value)
+            # Reuse the replaced layer's render caches. Their keys fold in the
+            # (process-unique) content tokens and uid, so a cache only hits when
+            # the restored content is exactly what it was built from; a layer
+            # the undone step changed simply misses and re-renders.
+            old = previous.get(layer.uid)
+            if old is not None:
+                for name in _LAYER_CACHES:
+                    if name in old.__dict__:
+                        setattr(layer, name, old.__dict__[name])
         # ``add_layer`` bumps the counter while rebuilding; reset it to the
         # snapshotted value so future layer names stay stable.
         self.layer_counter = snapshot["layer_counter"]
@@ -2041,10 +2108,11 @@ class Canvas:
         self.active = (
             max(0, min(snapshot["active"], len(self.layers) - 1)) if self.layers else 0
         )
-        # The rebuilt layer stack invalidates the region-composite cache.
-        self._region_cache_signature = None
-        self._region_cache_images = None
-        self._last_render = None
+        # The region-composite cache is keyed on every layer's signature (uid and
+        # content tokens), so it stays valid across a restore and an undo of a
+        # stroke only recomposites the live span. A size change drops it.
+        if resized:
+            self._drop_region_cache()
         if app is not None:
             app.shared_guides = [
                 tuple(guide) for guide in snapshot.get("shared_guides", [])
@@ -2717,7 +2785,7 @@ class Canvas:
         content = layer.content_source()
         group = getattr(layer, "group", None)
         return (
-            id(layer),
+            layer.uid,
             content._image_token,
             filters.chain_key(content.filters),
             content._text_token,
@@ -2735,7 +2803,7 @@ class Canvas:
             layer.blend,
             getattr(layer, "clip", False),
             None if group is None else (
-                id(group), group.visible, group.opacity,
+                group.uid, group.visible, group.opacity,
                 filters.chain_key(getattr(group, "filters", []) or []),
             ),
         )

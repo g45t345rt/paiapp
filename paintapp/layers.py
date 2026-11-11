@@ -23,6 +23,17 @@ ROW_H = THUMB + 2 * ROW_PAD
 MASK_GAP = 2
 
 
+def _uid(target):
+    """Cache key of a layer or group: its stable ``uid``.
+
+    Unlike ``id()`` it survives an undo/redo restore, which rebuilds the layer
+    objects, so unchanged rows keep their cached thumbnails. Objects without a
+    ``uid`` (test doubles) fall back to ``id``.
+    """
+    uid = getattr(target, "uid", None)
+    return ("uid", uid) if uid is not None else ("id", id(target))
+
+
 def thumbnail(image):
     """A tiny ``RGB`` preview of ``image`` over a checkerboard.
 
@@ -491,11 +502,11 @@ class LayerPanel(tk.Frame):
         for child in self.inner.winfo_children():
             child.destroy()
         self._layers = layers
+        self._groups = list(groups) if groups else []
         # Preview photos outlive a rebuild (that is what makes re-listing cheap,
         # including a return to a canvas), so drop only the ones whose layer has
         # been deleted since.
         self._drop_dead_previews()
-        self._groups = list(groups) if groups else []
         self._active = active
         layer_row = {}
         group_row = {}
@@ -813,14 +824,14 @@ class LayerPanel(tk.Frame):
         weakly, so it never keeps a deleted layer's pixels alive.
         """
         token = layer.pixels_token
-        entry = self._preview_cache.get(id(layer))
-        if entry is not None and entry["layer"]() is layer \
+        entry = self._preview_cache.get(_uid(layer))
+        if entry is not None \
                 and entry["token"] == token:
             return token, entry["photos"]
         photos = self._build_photos(layer)
         if photos[0] is None:
             return token, None
-        self._preview_cache[id(layer)] = {
+        self._preview_cache[_uid(layer)] = {
             "layer": weakref.ref(layer), "token": token, "photos": photos,
         }
         return token, photos
@@ -866,14 +877,14 @@ class LayerPanel(tk.Frame):
         layer preview's own staleness check. The cache holds the layer weakly.
         """
         token = layer.pixels_token
-        entry = self._mask_preview_cache.get(id(layer))
-        if entry is not None and entry["layer"]() is layer \
+        entry = self._mask_preview_cache.get(_uid(layer))
+        if entry is not None \
                 and entry["token"] == token:
             return token, entry["photos"]
         photos = self._build_mask_photos(layer)
         if photos[0] is None:
             return token, None
-        self._mask_preview_cache[id(layer)] = {
+        self._mask_preview_cache[_uid(layer)] = {
             "layer": weakref.ref(layer), "token": token, "photos": photos,
         }
         return token, photos
@@ -923,14 +934,14 @@ class LayerPanel(tk.Frame):
         group as a whole. The cache holds the group weakly.
         """
         token = self._group_token(group)
-        entry = self._preview_cache.get(id(group))
-        if entry is not None and entry["layer"]() is group \
+        entry = self._preview_cache.get(_uid(group))
+        if entry is not None \
                 and entry["token"] == token:
             return token, entry["photos"]
         photos = self._build_group_photos(group)
         if photos[0] is None:
             return token, None
-        self._preview_cache[id(group)] = {
+        self._preview_cache[_uid(group)] = {
             "layer": weakref.ref(group), "token": token, "photos": photos,
         }
         return token, photos
@@ -946,7 +957,7 @@ class LayerPanel(tk.Frame):
         return (
             tuple(
                 (
-                    id(member), member.pixels_token, tuple(member.offset),
+                    _uid(member), member.pixels_token, tuple(member.offset),
                     member.visible, member.opacity,
                     getattr(member, "clip", False),
                 )
@@ -1059,7 +1070,7 @@ class LayerPanel(tk.Frame):
                 continue
             widgets["photos"] = photos
             widgets["token"] = token
-            self._preview_cache[id(target)] = {
+            self._preview_cache[_uid(target)] = {
                 "layer": weakref.ref(target), "token": token, "photos": photos,
             }
             if entry[0] == "layer" and widgets.get("mask_thumb") is not None:
@@ -1070,14 +1081,26 @@ class LayerPanel(tk.Frame):
                 if mask_photos[0] is None:
                     widgets["mask_thumb"].config(image="")
                 else:
-                    self._mask_preview_cache[id(target)] = {
+                    self._mask_preview_cache[_uid(target)] = {
                         "layer": weakref.ref(target), "token": token,
                         "photos": mask_photos,
                     }
             self._show_preview(widgets, row in self._selected)
 
     def _drop_dead_previews(self):
-        """Forget cached previews whose layer has been deleted."""
+        """Forget cached previews whose layer has been deleted.
+
+        An undo/redo restore rebuilds the layer objects but keeps each layer's
+        ``uid``, so entries are first re-pointed at the live objects of the
+        shown canvas; only previews whose layer is truly gone are dropped.
+        """
+        live = list(self._layers or []) + list(self._groups or [])
+        for target in live:
+            ref = weakref.ref(target)
+            for cache in (self._preview_cache, self._mask_preview_cache):
+                entry = cache.get(_uid(target))
+                if entry is not None and entry["layer"]() is not target:
+                    entry["layer"] = ref
         self._preview_cache = {
             key: entry for key, entry in self._preview_cache.items()
             if entry["layer"]() is not None
