@@ -6286,7 +6286,7 @@ class PaintApp:
             what = ("stroke a line (brush size)" if tools.path_mode == "stroke"
                     else "fill and stroke the shape"
                     if tools.path_mode == "both" else "fill the shape")
-            status = ("path: click to add points, drag for curves; drag a "
+            status = ("path: click to add points, drag for curves; Alt-drag a "
                       "round handle to reshape, drag a point to move, "
                       "right-click to delete; click the first point, "
                       f"double-click, or Enter to {what}")

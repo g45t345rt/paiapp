@@ -2977,6 +2977,15 @@ class CanvasView(tk.Canvas):
                 ax, ay, rx, ry, fill="#0078d7", width=1, dash=(4, 3),
                 tags="path",
             )
+        for x, y in anchors:
+            vx, vy = self._doc_to_view(x, y)
+            self.create_rectangle(
+                vx - 3, vy - 3, vx + 3, vy + 3,
+                fill="#ffffff", outline="#0078d7", width=1, tags="path",
+            )
+        # Handles are drawn after the anchors so a short handle (whose grip
+        # overlaps its anchor) stays visible on top, matching the path tool's
+        # grab priority, which tests handles before anchors.
         for index, handle in enumerate(handles):
             if not show_handles or index >= len(anchors):
                 break
@@ -2993,12 +3002,6 @@ class CanvasView(tk.Canvas):
                     vx - 3, vy - 3, vx + 3, vy + 3,
                     fill="#ffffff", outline="#0078d7", width=1, tags="path",
                 )
-        for x, y in anchors:
-            vx, vy = self._doc_to_view(x, y)
-            self.create_rectangle(
-                vx - 3, vy - 3, vx + 3, vy + 3,
-                fill="#ffffff", outline="#0078d7", width=1, tags="path",
-            )
 
     # ---------------------------------------------------------------- vector
     def set_vector_overlay(self, data):

@@ -5792,6 +5792,11 @@ class DrawingController:
     # --------------------------------------------------------------- path
     PATH_CLOSE_HIT = 8
     PATH_HIT = 6
+    # Handles are tested before anchors, but a short handle sits only a few
+    # pixels from its anchor. Giving handles a slightly larger grab radius than
+    # the anchor (``PATH_CLOSE_HIT``) keeps a click meant for the handle from
+    # falling through to the anchor and reshaping the curve instead.
+    PATH_HANDLE_HIT = 9
     # Minimum seconds between repaints while dragging a committed path. A drag
     # paints a draft (non-antialiased) frame, whose re-raster is cheap, so this
     # only trims redundant work on layers with many path objects.
@@ -5829,17 +5834,23 @@ class DrawingController:
         scale = max(view.zoom, 1e-6)
         path = self._path
         if path is not None and len(path) > 0:
-            handle = self._path_hit_handle(path, x, y, self.PATH_HIT / scale)
-            if handle is not None:
-                self._path_handle = handle
-                self._path_press_origin = (x, y)
-                self._path_moved = False
-                return
+            alt = bool(event.state & ALT_STATE_MASK)
+            # Handles are edited only while Alt is held, so an ordinary drag
+            # near a short handle moves the anchor (or the whole path) instead
+            # of bending the curve by accident.
+            if alt:
+                handle = self._path_hit_handle(
+                    path, x, y, self.PATH_HANDLE_HIT / scale)
+                if handle is not None:
+                    self._path_handle = handle
+                    self._path_press_origin = (x, y)
+                    self._path_moved = False
+                    return
             index = self._path_hit_anchor(
                 path, x, y, self.PATH_CLOSE_HIT / scale
             )
             if index is not None:
-                if event.state & ALT_STATE_MASK:
+                if alt:
                     self._path_handle = ("out", index)
                     self._path_press_origin = (x, y)
                     self._path_moved = False
@@ -6119,7 +6130,7 @@ class DrawingController:
         self.app._refresh_layer_list()
         self.app.render()
         self.app.set_result(
-            "Editing path; drag to move, anchors/handles to reshape, "
+            "Editing path; drag to move, Alt-drag a handle to reshape, "
             "double-click to add, right-click to remove, Enter commits, Esc cancels."
         )
 
