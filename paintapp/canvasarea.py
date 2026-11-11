@@ -1494,8 +1494,10 @@ class CanvasView(tk.Canvas):
 
     # ------------------------------------------------------------------ render
     def render(self, composite=None, origin=None, top_left=None, pad=0,
-               live=False, dirty=None):
+               live=False, dirty=None, zoom_preview=False):
         self._rendering = True
+        if not zoom_preview:
+            self._cancel_zoom_refine()
         # A live stroke (``live``) hands over the document rectangle the brush
         # just changed (``dirty``); the frame already on screen is patched over
         # that rectangle instead of being re-flattened whole, so painting a large
@@ -1546,6 +1548,11 @@ class CanvasView(tk.Canvas):
             # covers, which would otherwise grow as 1/zoom^2. ``source_scale`` is the
             # composite's pixels per document pixel.
             source_scale = min(1.0, self.zoom) if composite is None else 1.0
+            if (zoom_preview and composite is None and not live
+                    and self._layout is None and self.zoom < 1.0):
+                preview_source = self._zoom_preview_source()
+                if preview_source is not None:
+                    composite, origin, source_scale = preview_source
             if composite is None:
                 region = (
                     math.floor(window[0]), math.floor(window[1]),
@@ -2583,8 +2590,99 @@ class CanvasView(tk.Canvas):
         return board
 
     # ------------------------------------------------------------------ zoom
-    def set_zoom(self, factor, focus=None):
-        """Set the zoom factor, optionally keeping ``focus`` (an event) fixed."""
+    # Delay after the last wheel zoom before the exact repaint replaces the
+    # gesture preview.
+    ZOOM_REFINE_MS = 180
+
+    def _zoom_preview_source(self):
+        """A whole-content composite at a power-of-two scale, for zoom gestures.
+
+        Zoomed out, every zoom step otherwise re-flattens each layer of the
+        viewport at the new scale. During a wheel gesture the view instead
+        resamples one cached flatten of the whole content (at the pyramid level
+        just above the zoom), which costs a single crop and resize per step
+        however many layers the document has; once the wheel stops,
+        :meth:`_refine_zoom` repaints exactly. The cache is keyed on every
+        layer's signature, so any edit rebuilds it. Returns ``(image, origin,
+        scale)`` or ``None`` when there is nothing to use.
+        """
+        doc = self.doc
+        if doc is None or self._region_provider is None:
+            return None
+        level = 1
+        while level < 5 and self.zoom <= 0.5 ** (level + 1):
+            level += 1
+        scale = 0.5 ** level
+        (ox, oy), (cw, ch) = self._content_origin, self._content_size
+        signature = getattr(doc, "_layer_signature", None)
+        layers = getattr(doc, "layers", None) or []
+        try:
+            stack = tuple(signature(layer) for layer in layers) if signature else None
+        except Exception:
+            return None
+        if stack is None:
+            return None
+        key = (id(doc), self._region_provider, (ox, oy, cw, ch),
+               tuple(self._frame_size), stack)
+        cache = getattr(self, "_zoom_preview_cache", None)
+        if cache is None or cache["key"] != key:
+            cache = {"key": key, "levels": {}}
+            self._zoom_preview_cache = cache
+        levels = cache["levels"]
+        entry = levels.get(level)
+        if entry is None and levels:
+            finer = [n for n in levels if n < level]
+            if finer:
+                # Halve the nearest finer level instead of flattening again.
+                have = max(finer)
+                image, origin = levels[have]
+                for n in range(have + 1, level + 1):
+                    image = image.reduce(2)
+                    levels[n] = (image, origin)
+                entry = levels[level]
+            else:
+                # Only coarser levels exist (zooming in from far out): upsample
+                # the nearest one for the gesture; the refine repaints sharp.
+                have = min(levels)
+                entry = levels[have]
+                level = have
+        if entry is None:
+            region = (int(math.floor(ox)), int(math.floor(oy)),
+                      int(math.ceil(ox + cw)), int(math.ceil(oy + ch)))
+            result = self._flatten(region, scale, draft=True)
+            if result is None:
+                return None
+            image, origin = result
+            if image.width <= 0 or image.height <= 0:
+                return None
+            entry = (image, origin)
+            levels[level] = entry
+        image, origin = entry
+        return image, origin, 0.5 ** level
+
+    def _cancel_zoom_refine(self):
+        job = getattr(self, "_zoom_refine_job", None)
+        self._zoom_refine_job = None
+        if job is not None:
+            try:
+                self.after_cancel(job)
+            except tk.TclError:
+                pass
+
+    def _refine_zoom(self):
+        self._zoom_refine_job = None
+        try:
+            if self.winfo_exists():
+                self.render()
+        except tk.TclError:
+            pass
+
+    def set_zoom(self, factor, focus=None, preview=False):
+        """Set the zoom factor, optionally keeping ``focus`` (an event) fixed.
+
+        ``preview`` (a wheel gesture) paints a fast approximation when zoomed
+        out and schedules the exact repaint for when the gesture pauses.
+        """
         factor = max(self.MIN_ZOOM, min(self.MAX_ZOOM, factor))
         if abs(factor - self.zoom) < 1e-9:
             return
@@ -2600,7 +2698,11 @@ class CanvasView(tk.Canvas):
         else:
             top_left = self._view_to_doc_float(self.canvasx(0), self.canvasy(0))
             self.zoom = factor
-        self.render(top_left=top_left)
+        use_preview = preview and factor < 1.0 and not self.transformed
+        self.render(top_left=top_left, zoom_preview=use_preview)
+        if use_preview:
+            self._cancel_zoom_refine()
+            self._zoom_refine_job = self.after(self.ZOOM_REFINE_MS, self._refine_zoom)
 
     def zoom_in(self, focus=None):
         self.set_zoom(self.zoom * self.ZOOM_STEP, focus)

@@ -4316,13 +4316,41 @@ class DrawingController:
         return int(-event.delta / 120) or (-1 if event.delta > 0 else 1)
 
     def on_ctrl_wheel(self, event):
+        # Coalesce a burst of wheel notches into one zoom + repaint: a fast
+        # scroll queues several events, and repainting a large document once
+        # per notch made the view trail behind the wheel. Tk runs idle
+        # callbacks only after the queued events, so every notch that arrived
+        # meanwhile is folded into the single pending zoom.
         view = event.widget
-        if event.delta > 0:
-            view.zoom_in(event)
-        else:
-            view.zoom_out(event)
-        self.app.report_zoom(view)
+        step = 1 if event.delta > 0 else -1
+        pending = getattr(self, "_pending_wheel_zoom", None)
+        if pending is not None and pending["view"] is view:
+            pending["steps"] += step
+            pending["event"] = event
+            return "break"
+        if pending is not None:
+            self._flush_wheel_zoom()
+        self._pending_wheel_zoom = {"view": view, "steps": step, "event": event}
+        try:
+            view.after_idle(self._flush_wheel_zoom)
+        except (tk.TclError, AttributeError):
+            self._flush_wheel_zoom()
         return "break"
+
+    def _flush_wheel_zoom(self):
+        pending = getattr(self, "_pending_wheel_zoom", None)
+        self._pending_wheel_zoom = None
+        if pending is None or not pending["steps"]:
+            return
+        view = pending["view"]
+        try:
+            if not view.winfo_exists():
+                return
+        except tk.TclError:
+            return
+        view.set_zoom(view.zoom * view.ZOOM_STEP ** pending["steps"],
+                      pending["event"], preview=True)
+        self.app.report_zoom(view)
 
     def on_alt_wheel(self, event):
         """Alt+wheel dollies the pose scene's 3D camera, zooming about the cursor.

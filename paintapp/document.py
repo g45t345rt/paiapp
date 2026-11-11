@@ -452,19 +452,36 @@ def _mip_region(layer, left, top, ix0, iy0, ix1, iy1, scale, ax, ay, ox, oy):
         source.uid, source._image_token, filters.chain_key(source.filters),
         source._text_token, source._vector_token, source._poses_token,
         source._path_token, source._mask_token, tuple(layer.content_offset()),
-        None if layer.transform is None else tuple(layer.transform), level,
+        None if layer.transform is None else tuple(layer.transform),
         layer._mask_token,
     )
+    # The cache keeps the whole pyramid (built lazily, each level halving the
+    # one above it), so a zoom that crosses a power-of-two boundary reuses the
+    # levels it already made instead of re-reducing the full-size layer.
+    # Levels are stored premultiplied (``RGBa``): PIL resamples an ``RGBA``
+    # image by converting the *whole* image to ``RGBa`` and back on every call,
+    # which made each zoomed-out frame pay a full-level conversion per layer.
     cache = getattr(layer, "_mip_cache", None)
     if cache is None or cache[0] != key:
-        image = layer.composited_image()
-        if image.mode != "RGBA":
-            image = image.convert("RGBA")
-        factor = 2 ** level
-        mip = image.reduce(factor)
-        cache = (key, mip, image.width / mip.width, image.height / mip.height)
+        cache = (key, {}, layer.composited_image().size)
         layer._mip_cache = cache
-    _key, mip, fx, fy = cache
+    _key, levels, (full_w, full_h) = cache
+    mip = levels.get(level)
+    if mip is None:
+        have = max((n for n in levels if n < level), default=0)
+        if have:
+            mip = levels[have]
+        else:
+            mip = layer.composited_image()
+            if mip.mode != "RGBa":
+                if mip.mode != "RGBA":
+                    mip = mip.convert("RGBA")
+                mip = mip.convert("RGBa")
+        for n in range(have + 1, level + 1):
+            mip = mip.reduce(2)
+            levels[n] = mip
+    fx = full_w / mip.width
+    fy = full_h / mip.height
     gx0 = int(round((left + ix0 - ax) * scale))
     gy0 = int(round((top + iy0 - ay) * scale))
     gx1 = int(round((left + ix1 - ax) * scale))
@@ -483,6 +500,7 @@ def _mip_region(layer, left, top, ix0, iy0, ix1, iy1, scale, ax, ay, ox, oy):
     if mx1 - mx0 <= 0 or my1 - my0 <= 0:
         return False, None
     sub = mip.resize((width, height), Image.BOX, box=(mx0, my0, mx1, my1))
+    sub = sub.convert("RGBA")
     if sub.getbbox() is None:
         return False, None
     dest = (gx0 - int(round((left - ax) * scale)),
@@ -2365,8 +2383,34 @@ class Canvas:
     def _layer_alpha_region(self, layer, left, top, width, height, scale=1.0,
                             anchor=None):
         """A region-sized ``L`` image of ``layer``'s alpha at its own offset."""
-        image = layer.composited_image()
         ox, oy = layer.offset
+        if scale < 1.0:
+            # Zoomed out: sample the clip base's cached pyramid level (the same
+            # one its own composite uses) instead of cropping and downscaling
+            # the full-resolution alpha on every frame.
+            ax, ay = (left, top) if anchor is None else anchor
+            size = (
+                max(1, int(round((left + width - ax) * scale))
+                    - int(round((left - ax) * scale))),
+                max(1, int(round((top + height - ay) * scale))
+                    - int(round((top - ay) * scale))),
+            )
+            lw, lh = layer.size
+            ix0 = max(0, ox - left)
+            iy0 = max(0, oy - top)
+            ix1 = min(width, ox + lw - left)
+            iy1 = min(height, oy + lh - top)
+            alpha = Image.new("L", size, 0)
+            if ix1 <= ix0 or iy1 <= iy0:
+                return alpha
+            mipped = _mip_region(layer, left, top, ix0, iy0, ix1, iy1, scale,
+                                 ax, ay, ox, oy)
+            if mipped is not None:
+                sub, dest = mipped
+                if sub is not False:
+                    alpha.paste(sub.getchannel("A"), dest)
+                return alpha
+        image = layer.composited_image()
         box = (left - ox, top - oy, left - ox + width, top - oy + height)
         alpha = image.crop(box).getchannel("A")
         if scale != 1.0:
