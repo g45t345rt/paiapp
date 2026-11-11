@@ -237,6 +237,25 @@ def _paste_layer(base, layer, left, top, clip=None, scale=1.0, offset=None,
     )
     if box[2] <= box[0] or box[3] <= box[1]:
         return
+    sub = None
+    if scale < 1.0:
+        mipped = _mip_region(layer, left, top, ix0, iy0, ix1, iy1, scale,
+                             ax, ay, ox, oy)
+        if mipped is not None:
+            sub, dest = mipped
+            if sub is False:
+                return
+    if sub is None:
+        sub, dest = _crop_scaled(layer, box, left, top, ix0, iy0, ix1, iy1,
+                                 scale, ax, ay, anchor)
+        if sub is None:
+            return
+    _composite_sub(base, layer, sub, dest, clip)
+
+
+def _crop_scaled(layer, box, left, top, ix0, iy0, ix1, iy1, scale, ax, ay,
+                 anchor):
+    """The layer's overlap cropped at full resolution, then resampled."""
     # Fetch only the overlap, so a masked/filtered layer is not copied and
     # re-multiplied at full size on every dab. ``ix0``/``iy0`` are already
     # relative to the region's top-left.
@@ -250,7 +269,7 @@ def _paste_layer(base, layer, left, top, clip=None, scale=1.0, offset=None,
     # blank one only pays a single scan. The band check keeps a mode without an
     # alpha channel (an opaque RGB layer) from being mistaken for blank.
     if "A" in sub.getbands() and sub.getbbox() is None:
-        return
+        return None, None
     if anchor is None:
         dest = (int(round(ix0 * scale)), int(round(iy0 * scale)))
     else:
@@ -270,6 +289,80 @@ def _paste_layer(base, layer, left, top, clip=None, scale=1.0, offset=None,
             height = max(1, int(round((top + iy1 - ay) * scale))
                          - int(round((top + iy0 - ay) * scale)))
         sub = sub.resize((width, height), Image.BOX)
+    return sub, dest
+
+
+# Smallest pyramid level kept for a zoomed-out view (1/2^MIP_MAX_LEVEL).
+MIP_MAX_LEVEL = 5
+
+
+def _mip_region(layer, left, top, ix0, iy0, ix1, iy1, scale, ax, ay, ox, oy):
+    """The layer's overlap resampled from a cached downscaled copy, or ``None``.
+
+    A zoomed-out repaint would otherwise crop the layer at document resolution
+    and downscale that crop for every layer on every frame - on a large canvas
+    that is most of a frame's cost. Instead each layer keeps one pyramid level
+    (the power-of-two reduction just above ``scale``) of its composited pixels,
+    and the overlap is resampled from it. Every zoomed-out composite of a layer
+    goes through its level (never a mix of the two paths), so a one-off frame,
+    a cached frame and a live stroke patch all agree pixel for pixel.
+
+    Each output pixel samples the level over the document span of its own grid
+    cell (``ax``/``ay`` anchored), so a frame and a sub-region patch drawn with
+    the same anchor land on identical pixels. Returns ``(False, None)`` for a
+    blank overlap.
+    """
+    if getattr(layer, "_transform_draft", False):
+        return None
+    level = 0
+    while level < MIP_MAX_LEVEL and scale <= 0.5 ** (level + 1):
+        level += 1
+    if level == 0:
+        return None
+    source = layer.content_source()
+    key = (
+        id(source), source._image_token, filters.chain_key(source.filters),
+        source._text_token, source._vector_token, source._poses_token,
+        source._path_token, source._mask_token, tuple(layer.content_offset()),
+        None if layer.transform is None else tuple(layer.transform), level,
+    )
+    cache = getattr(layer, "_mip_cache", None)
+    if cache is None or cache[0] != key:
+        image = layer.composited_image()
+        if image.mode != "RGBA":
+            image = image.convert("RGBA")
+        factor = 2 ** level
+        mip = image.reduce(factor)
+        cache = (key, mip, image.width / mip.width, image.height / mip.height)
+        layer._mip_cache = cache
+    _key, mip, fx, fy = cache
+    gx0 = int(round((left + ix0 - ax) * scale))
+    gy0 = int(round((top + iy0 - ay) * scale))
+    gx1 = int(round((left + ix1 - ax) * scale))
+    gy1 = int(round((top + iy1 - ay) * scale))
+    width = max(1, gx1 - gx0)
+    height = max(1, gy1 - gy0)
+    # Document span of the output cells, in the level's pixel space.
+    mx0 = ((ax + gx0 / scale) - ox) / fx
+    my0 = ((ay + gy0 / scale) - oy) / fy
+    mx1 = ((ax + (gx0 + width) / scale) - ox) / fx
+    my1 = ((ay + (gy0 + height) / scale) - oy) / fy
+    mx0 = min(max(0.0, mx0), mip.width)
+    my0 = min(max(0.0, my0), mip.height)
+    mx1 = min(max(mx0, mx1), mip.width)
+    my1 = min(max(my0, my1), mip.height)
+    if mx1 - mx0 <= 0 or my1 - my0 <= 0:
+        return False, None
+    sub = mip.resize((width, height), Image.BOX, box=(mx0, my0, mx1, my1))
+    if sub.getbbox() is None:
+        return False, None
+    dest = (gx0 - int(round((left - ax) * scale)),
+            gy0 - int(round((top - ay) * scale)))
+    return sub, dest
+
+
+def _composite_sub(base, layer, sub, dest, clip):
+    """Blend, clip and alpha-composite a layer's resampled overlap into ``base``."""
     # The overlay must be RGBA to composite: a layer's own image can be a
     # non-alpha mode (e.g. an RGB result stored by a tool), and PIL's
     # ``alpha_composite`` raises "images do not match" on a mode mismatch.
@@ -1820,7 +1913,8 @@ class Canvas:
             units.append(("group", group, members))
         return units
 
-    def _flatten(self, layers, region, plain=False, scale=1.0, anchor=None):
+    def _flatten(self, layers, region, plain=False, scale=1.0, anchor=None,
+                 base=None):
         """Composite ``layers`` over ``region`` into a straight-alpha RGBA image.
 
         This is the document-level flatten: it honours layer groups as units
@@ -1849,9 +1943,12 @@ class Canvas:
         by0 = int(round((top - ay) * scale))
         bx1 = int(round((right - ax) * scale))
         by1 = int(round((bottom - ay) * scale))
-        base = Image.new(
-            "RGBA", (max(0, bx1 - bx0), max(0, by1 - by0)), (0, 0, 0, 0)
-        )
+        size = (max(0, bx1 - bx0), max(0, by1 - by0))
+        if base is None or base.size != size or base.mode != "RGBA":
+            # ``base`` lets a caller composite ``layers`` over an existing
+            # backdrop (the cached layers below, see ``_flatten_cached``) so a
+            # blend mode still sees the pixels beneath it. It is drawn into.
+            base = Image.new("RGBA", size, (0, 0, 0, 0))
         # Resolve each clipped layer's clip base: the nearest layer below it
         # that is not itself clipped. A clipped layer with no such base (or a
         # hidden base) is fully hidden, matching the usual clipping behaviour.
@@ -1932,8 +2029,14 @@ class Canvas:
         """
         left, top = 0, 0
         right, bottom = self.size
+        if exclude is None:
+            excluded = ()
+        elif isinstance(exclude, int):
+            excluded = (exclude,)
+        else:
+            excluded = exclude
         for index, layer in enumerate(self.layers):
-            if index == exclude:
+            if index in excluded:
                 continue
             if not layer.visible or layer.opacity <= 0.0:
                 continue
@@ -2153,126 +2256,158 @@ class Canvas:
         rl, rt, rr, rb = (
             int(bounds[0]), int(bounds[1]), int(bounds[2]), int(bounds[3])
         )
-        if scale != 1.0:
-            # The document-anchored backdrop cache composites at full resolution
-            # and resamples once, which costs the whole document rectangle at a
-            # zoomed-out scale. A live stroke patches a small dirty rectangle of
-            # the frame already on screen, so the frame and every patch must use
-            # the same per-layer ``scale`` path (``_flatten``) to line up exactly;
-            # the cache is only worth its content-sized buffers at ``scale == 1``.
+        bounds = (rl, rt, rr, rb)
+        if active_index is None or not 0 <= active_index < len(self.layers):
+            self._drop_region_cache()
             return self._flatten(self.layers, bounds, scale=scale)
-        cacheable = (
-            active_index is not None
-            and 0 <= active_index < len(self.layers)
-            and not any(getattr(layer, "group", None) is not None
-                        for layer in self.layers)
-            and not any(getattr(layer, "clip", False) for layer in self.layers)
-        )
-        # Anchor the backdrop on every visible layer except the active one. The
-        # active layer is composited live over the crop, and a move only changes
-        # its offset, so excluding it keeps the cache (and its origin) stable
-        # through a whole drag instead of rebuilding - and re-anchoring - it on
-        # every event.
-        cache_bounds = (
-            self.content_bounds(exclude=active_index) if cacheable else None
-        )
-        if cache_bounds is not None:
-            width = max(0, cache_bounds[2] - cache_bounds[0])
-            height = max(0, cache_bounds[3] - cache_bounds[1])
+        # The "live" span is the smallest run of layers around the active one
+        # that can be composited on its own: the active layer's whole group
+        # (a group's opacity and filters apply to its combined pixels) and any
+        # clipping chain it belongs to. Everything below it is cached as one
+        # backdrop, everything above as one overlay, so groups, clipping masks
+        # and a zoomed-out view keep the cheap path instead of re-flattening
+        # every layer on every motion event.
+        start, end = self._live_span(active_index)
+        below_layers = self.layers[:start]
+        live_layers = self.layers[start:end]
+        above_layers = self.layers[end:]
+        # A flattened "above" image cannot carry top-level blend modes, since it
+        # is composited over the live backdrop rather than the pixels it was
+        # flattened with. So the layers up to the last top-level blend layer
+        # join the live span, and only the plain ones above that are cached.
+        # Blends inside a group only see the group's own pixels, so they do
+        # not count.
+        split = 0
+        for index, layer in enumerate(above_layers):
+            if (getattr(layer, "group", None) is None
+                    and getattr(layer, "blend", "normal") != "normal"):
+                split = index + 1
+        while split < len(above_layers) and getattr(above_layers[split], "clip", False):
+            split += 1
+        if split:
+            end += split
+            live_layers = self.layers[start:end]
+            above_layers = self.layers[end:]
+        if scale == 1.0:
+            # At full resolution the backdrop covers the requested region plus
+            # a margin of half its size on each side (clipped to the content),
+            # rather than the whole document: building it at the start of a
+            # gesture then costs a few viewport-sized flattens instead of a
+            # multi-megapixel stall, and a pan within the margin only crops it.
+            content = self.content_bounds(exclude=range(start, end))
+            mx = (rr - rl) // 2
+            my = (rb - rt) // 2
+            cache_bounds = (
+                max(content[0], rl - mx), max(content[1], rt - my),
+                min(content[2], rr + mx), min(content[3], rb + my),
+            )
+            cache_bounds = (
+                min(cache_bounds[0], rl), min(cache_bounds[1], rt),
+                max(cache_bounds[2], rr), max(cache_bounds[3], rb),
+            )
+            width = cache_bounds[2] - cache_bounds[0]
+            height = cache_bounds[3] - cache_bounds[1]
             if width * height > MAX_BACKDROP_PIXELS:
-                cache_bounds = None
-        if cache_bounds is None:
-            self._region_cache_signature = None
-            self._region_cache_images = None
-            self._last_render = None
-            return self._flatten(self.layers, bounds, scale=scale)
-        above_layers = self.layers[active_index + 1:]
-        # A flattened "above" image cannot carry blend modes, since it is
-        # composited over the live backdrop rather than the pixels it was
-        # flattened with; only cache it when every above layer is a plain over.
-        above_cacheable = all(
-            getattr(layer, "blend", "normal") == "normal"
-            for layer in above_layers
-        )
-        # Key only the layers around the active one: the active layer is
-        # recomposited live on every call, so its own edits must not evict the
-        # cached backdrop (that is what makes a stroke cheap).
+                self._drop_region_cache()
+                return self._flatten(self.layers, bounds, scale=scale)
+            cache_key = "doc"
+        else:
+            # Zoomed out, the backdrop is cached at display resolution over the
+            # requested region itself (viewport-sized, so cheap to hold). It is
+            # flattened through the same per-layer ``scale`` path as a one-off
+            # frame and the live stroke patch, so all three line up exactly; a
+            # pan or zoom changes the region and rebuilds it.
+            cache_bounds = bounds
+            cache_key = bounds
+        # Key only the layers around the live span: it is recomposited on every
+        # call, so its own edits must not evict the cached backdrop (that is
+        # what makes a stroke, a move or an overlay edit cheap).
         signature = (
-            active_index,
-            tuple(
-                self._layer_signature(layer)
-                for layer in self.layers[:active_index]
-            ),
-            tuple(
-                self._layer_signature(layer)
-                for layer in above_layers
-            ),
+            start, end, cache_key, scale,
+            tuple(self._layer_signature(layer) for layer in below_layers),
+            tuple(self._layer_signature(layer) for layer in above_layers),
         )
-        active_layer = self.layers[active_index]
         current = (
-            signature, (rl, rt, rr, rb), scale,
-            self._layer_signature(active_layer),
+            signature, bounds, scale,
+            tuple(self._layer_signature(layer) for layer in live_layers),
         )
         last = self._last_render
+        held = getattr(self, "_region_cache_bounds", None)
+        covered = (held is not None and held[0] <= rl and held[1] <= rt
+                   and held[2] >= rr and held[3] >= rb)
         if (self._region_cache_images is not None
-                and self._region_cache_signature == signature):
+                and self._region_cache_signature == signature and covered):
             below, above = self._region_cache_images
-        elif (last is not None and last[0] == signature
-                and last[1:] != current[1:]):
-            # The same layer stack as the previous render, but the view or the
-            # active layer changed since: this is a transform gesture (zoom or
-            # pan) or a stroke, so promote to the content-sized backdrop.
-            # Building it costs more than one viewport-sized flatten, so an
-            # unchanged or one-off render stays on the cheap whole-stack path and
+            cache_bounds = held
+        elif ((self._region_cache_images is not None
+                and self._region_cache_signature == signature)
+              or (last is not None and last[0] == signature
+                  and last[1:] != current[1:])):
+            # The same stack around the live span as the previous render, but
+            # the view or the live span changed since: this is a gesture (a
+            # stroke, a move, an overlay drag, a zoom or pan), so promote to the
+            # cached backdrop. A one-off render stays on the whole-stack path and
             # never pays for a cache it will not reuse.
-            below = self._flatten(self.layers[:active_index], cache_bounds)
-            above = (self._flatten(above_layers, cache_bounds)
-                     if above_cacheable else None)
+            below = self._flatten(below_layers, cache_bounds, scale=scale)
+            above = (self._flatten(above_layers, cache_bounds, scale=scale)
+                     if above_layers else None)
             self._region_cache_images = (below, above)
             self._region_cache_signature = signature
+            self._region_cache_bounds = cache_bounds
         else:
             self._last_render = current
             self._region_cache_signature = None
             self._region_cache_images = None
-            # Render this one-off frame the way the cached path does - composite
-            # at document resolution, then resample once - instead of downscaling
-            # each layer separately. At ``scale < 1`` the two differ, so a drag
-            # that promotes to the cache mid-gesture would switch the whole frame
-            # (a zoomed-out flicker). Matching the scaling keeps it seamless.
-            full = self._flatten(self.layers, bounds, scale=1.0)
-            if scale != 1.0:
-                full = full.resize(
-                    (max(1, int(round((rr - rl) * scale))),
-                     max(1, int(round((rb - rt) * scale)))),
-                    Image.BOX,
-                )
-            return full
+            return self._flatten(self.layers, bounds, scale=scale)
         self._last_render = current
-        # Crop the fixed-resolution backdrop to the requested region, composite
-        # the active layer at document resolution, then resample once. Cropping a
-        # zoomed-out view's large region and resizing the combined result is
-        # cheaper than downscaling every layer separately, and sharpens the
-        # zoomed-in case (composite at full resolution, then resample).
-        cl, ct = int(cache_bounds[0]), int(cache_bounds[1])
-        box = (rl - cl, rt - ct, rr - cl, rb - ct)
-        base = below.crop(box)
-        if active_layer.visible and active_layer.opacity > 0.0:
-            _paste_layer(base, active_layer, rl, rt)
-        if above is not None:
-            base.alpha_composite(above.crop(box))
+        if scale == 1.0:
+            cl, ct = int(cache_bounds[0]), int(cache_bounds[1])
+            box = (rl - cl, rt - ct, rr - cl, rb - ct)
+            base = below.crop(box)
+            above_img = above.crop(box) if above is not None else None
         else:
-            # Blend layers above the active one need the backdrop, so paste them
-            # in stack order instead of compositing a flattened image.
-            for layer in above_layers:
-                if layer.visible and layer.opacity > 0.0:
-                    _paste_layer(base, layer, rl, rt)
-        if scale != 1.0:
-            base = base.resize(
-                (max(1, int(round((rr - rl) * scale))),
-                 max(1, int(round((rb - rt) * scale)))),
-                Image.BOX,
-            )
+            base = below.copy()
+            above_img = above
+        base = self._flatten(live_layers, bounds, scale=scale, base=base)
+        if above_img is not None:
+            base.alpha_composite(above_img)
         return base
+
+    def _drop_region_cache(self):
+        self._region_cache_signature = None
+        self._region_cache_images = None
+        self._last_render = None
+
+    def _live_span(self, active_index):
+        """``(start, end)`` of the layers that must be composited with the active one.
+
+        The span grows to cover the active layer's whole group and any clipping
+        chain touching it (a clipped layer and its base must be flattened
+        together), so the layers outside it can be cached as plain backdrops.
+        """
+        layers = self.layers
+        count = len(layers)
+        start, end = active_index, active_index + 1
+        changed = True
+        while changed:
+            changed = False
+            group = getattr(layers[start], "group", None)
+            while (group is not None and start > 0
+                   and getattr(layers[start - 1], "group", None) is group):
+                start -= 1
+                changed = True
+            group = getattr(layers[end - 1], "group", None)
+            while (group is not None and end < count
+                   and getattr(layers[end], "group", None) is group):
+                end += 1
+                changed = True
+            if start > 0 and getattr(layers[start], "clip", False):
+                start -= 1
+                changed = True
+            while end < count and getattr(layers[end], "clip", False):
+                end += 1
+                changed = True
+        return start, end
 
     @staticmethod
     def _layer_signature(layer):
@@ -2282,17 +2417,27 @@ class Canvas:
         change to the master invalidates every canvas that shows a link to it.
         """
         content = layer.content_source()
+        group = getattr(layer, "group", None)
         return (
             id(layer),
             content._image_token,
             filters.chain_key(content.filters),
             content._text_token,
+            content._vector_token,
+            content._poses_token,
+            content._path_token,
             content._mask_token,
             tuple(layer.offset),
+            tuple(getattr(layer, "_content_delta", (0, 0)) or (0, 0)),
             None if layer.transform is None else tuple(layer.transform),
             layer.opacity,
             layer.visible,
             layer.blend,
+            getattr(layer, "clip", False),
+            None if group is None else (
+                id(group), group.visible, group.opacity,
+                filters.chain_key(getattr(group, "filters", []) or []),
+            ),
         )
 
     def bake_offsets(self):

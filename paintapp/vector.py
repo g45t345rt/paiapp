@@ -65,23 +65,49 @@ FILL_SUPERSAMPLE_AREA = 2_000_000
 # fill then reuses its raster instead of re-scanning it - which is what makes
 # dragging a vector layer smooth, since moving the layer changes its offset and
 # re-composites the layer every frame but leaves the geometry untouched. The
-# cache is bounded by entry count and total pixels.
+# cache is bounded by entry count and total pixels. Keys are translation
+# invariant (see ``_shift_key``), so moving a vector layer - which translates
+# every spec by a whole-pixel delta on release - reuses the rasters too.
 _SPRITE_CACHE = {}
 _SPRITE_CACHE_PIXELS = 0
-_SPRITE_CACHE_BUDGET = 16_000_000
-_SPRITE_CACHE_MAX = 48
+_SPRITE_CACHE_BUDGET = 40_000_000
+_SPRITE_CACHE_MAX = 256
+
+
+def _shift_key(points):
+    """The integer origin a sprite key is made relative to.
+
+    Shifting every coordinate by ``floor`` of the first point makes the key of
+    a spec translated by whole pixels identical, and the sprite rendered for it
+    is the same raster at a shifted ``left``/``top``.
+    """
+    for point in points:
+        return (math.floor(float(point[0])), math.floor(float(point[1])))
+    return (0, 0)
+
+
+def _rel(points, shift):
+    sx, sy = shift
+    return tuple((float(p[0]) - sx, float(p[1]) - sy) for p in points)
 
 
 def _sprite_lookup(key):
-    entry = _SPRITE_CACHE.get(key)
-    return entry[0] if entry is not None else None
+    key, (sx, sy) = key
+    entry = _SPRITE_CACHE.pop(key, None)
+    if entry is None:
+        return None
+    # Re-insert so eviction is least-recently-used, not first-in.
+    _SPRITE_CACHE[key] = entry
+    sprite, left, top = entry[0]
+    return sprite, left + sx, top + sy
 
 
 def _sprite_store(key, sprite, left, top):
     global _SPRITE_CACHE_PIXELS
+    key, (sx, sy) = key
     if key in _SPRITE_CACHE:
         return
-    _SPRITE_CACHE[key] = ((sprite, left, top), sprite.width * sprite.height)
+    _SPRITE_CACHE[key] = ((sprite, left - sx, top - sy), sprite.width * sprite.height)
     _SPRITE_CACHE_PIXELS += sprite.width * sprite.height
     while len(_SPRITE_CACHE) > _SPRITE_CACHE_MAX:
         oldest = next(iter(_SPRITE_CACHE))
@@ -93,31 +119,40 @@ def _sprite_store(key, sprite, left, top):
 
 def _stroke_sprite_key(spec):
     handles_in, handles_out = handles(spec)
+    points = spec.get("points") or []
+    shift = _shift_key(points)
     return (
         spec.get("color"), spec.get("width"),
         round(float(spec.get("opacity", 1.0)), 4),
         bool(spec.get("closed", False)), spec.get("cap"), spec.get("join"),
         bool(spec.get("antialias", True)),
-        tuple((float(p[0]), float(p[1])) for p in spec.get("points") or []),
-        tuple((float(p[0]), float(p[1])) for p in handles_in),
-        tuple((float(p[0]), float(p[1])) for p in handles_out),
-    )
+        repr(spec.get("fill")),
+        _rel(points, shift),
+        _rel(handles_in, shift),
+        _rel(handles_out, shift),
+    ), shift
 
 
 def _fill_sprite_key(spec):
     contours = []
+    shift = None
     for contour in spec.get("contours") or []:
         handles_in, handles_out = handles(contour)
+        points = contour.get("points") or []
+        if shift is None and points:
+            shift = _shift_key(points)
+        s = shift or (0, 0)
         contours.append((
-            tuple((float(p[0]), float(p[1])) for p in contour.get("points") or []),
-            tuple((float(p[0]), float(p[1])) for p in handles_in),
-            tuple((float(p[0]), float(p[1])) for p in handles_out),
+            _rel(points, s),
+            _rel(handles_in, s),
+            _rel(handles_out, s),
         ))
+    shift = shift or (0, 0)
     return (
         spec.get("color"), round(float(spec.get("opacity", 1.0)), 4),
         bool(spec.get("antialias", True)), bool(spec.get("even_odd", True)),
         tuple(contours),
-    )
+    ), shift
 
 
 # ------------------------------------------------------------------- specs

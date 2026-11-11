@@ -711,24 +711,78 @@ def paste(image, spec, offset=(0, 0)):
     if not feather and opacity == 100 and not antialias_on:
         _paint(ImageDraw.Draw(image), spec, (ox, oy), 1)
         return image
-    scale = (antialias.scale_for(right - left, bottom - top)
-             if antialias_on else 1)
-    temp = Image.new(
-        "RGBA", ((right - left) * scale, (bottom - top) * scale), (0, 0, 0, 0)
-    )
-    _paint(ImageDraw.Draw(temp), spec, (ox + left, oy + top), scale)
-    if scale > 1:
-        temp = antialias.downscale(temp, scale)
-    if feather:
-        temp = antialias.blur_premultiplied(temp, feather)
-    if opacity < 100:
-        temp.putalpha(
-            temp.getchannel("A").point(lambda value: value * opacity // 100)
-        )
+    # Render (or reuse) the sprite over the geometry's whole document-space box,
+    # independent of the layer offset and of the target's clip, so re-compositing
+    # an unchanged path - every overlay rebuild after an edit to *another* path,
+    # a text, or a move - costs one paste instead of a supersampled re-raster.
+    doc_left = int(math.floor(min(xs) + ox)) - pad
+    doc_top = int(math.floor(min(ys) + oy)) - pad
+    doc_right = int(math.ceil(max(xs) + ox)) + pad
+    doc_bottom = int(math.ceil(max(ys) + oy)) + pad
+    key = _sprite_key(spec, doc_left, doc_top)
+    temp = _sprite_get(key)
+    if temp is None:
+        sw, sh = doc_right - doc_left, doc_bottom - doc_top
+        scale = antialias.scale_for(sw, sh) if antialias_on else 1
+        temp = Image.new("RGBA", (sw * scale, sh * scale), (0, 0, 0, 0))
+        _paint(ImageDraw.Draw(temp), spec, (doc_left, doc_top), scale)
+        if scale > 1:
+            temp = antialias.downscale(temp, scale)
+        if feather:
+            temp = antialias.blur_premultiplied(temp, feather)
+        if opacity < 100:
+            temp.putalpha(
+                temp.getchannel("A").point(lambda value: value * opacity // 100)
+            )
+        _sprite_put(key, temp)
+    dest_x = doc_left - int(round(ox))
+    dest_y = doc_top - int(round(oy))
+    if (left, top, right, bottom) != (dest_x, dest_y, dest_x + temp.width,
+                                      dest_y + temp.height):
+        temp = temp.crop((left - dest_x, top - dest_y,
+                          right - dest_x, bottom - dest_y))
     # ``alpha_composite`` is a true source-over composite. ``Image.paste`` with a
     # mask linearly blends every channel by the mask, including alpha, so an
     # anti-aliased edge comes out darkened with its coverage squared - a fringe
     # over the layers below. ``temp`` is clipped to ``image``, so ``dest`` fits.
     image.alpha_composite(temp, dest=(left, top))
     return image
+
+
+# Rendered path sprites, keyed by style plus geometry relative to the sprite's
+# integer origin (so a whole-pixel move reuses them). LRU, bounded by pixels.
+_SPRITES = {}
+_SPRITE_PIXELS = [0]
+_SPRITE_BUDGET = 40_000_000
+_SPRITE_MAX = 256
+
+
+def _sprite_key(spec, left, top):
+    def rel(points):
+        return tuple((float(p[0]) - left, float(p[1]) - top) for p in points or [])
+
+    return (
+        spec.get("mode"), repr(spec.get("fill_color")), repr(spec.get("stroke_color")),
+        spec.get("width"), spec.get("outline"), spec.get("feather"),
+        spec.get("opacity"), bool(spec.get("antialias", True)),
+        spec.get("cap"), spec.get("join"), bool(spec.get("closed")),
+        rel(spec.get("anchors")), rel(spec.get("handles_in")),
+        rel(spec.get("handles_out")),
+    )
+
+
+def _sprite_get(key):
+    sprite = _SPRITES.pop(key, None)
+    if sprite is not None:
+        _SPRITES[key] = sprite
+    return sprite
+
+
+def _sprite_put(key, sprite):
+    _SPRITES[key] = sprite
+    _SPRITE_PIXELS[0] += sprite.width * sprite.height
+    while _SPRITES and (len(_SPRITES) > _SPRITE_MAX
+                        or _SPRITE_PIXELS[0] > _SPRITE_BUDGET) and len(_SPRITES) > 1:
+        old = _SPRITES.pop(next(iter(_SPRITES)))
+        _SPRITE_PIXELS[0] -= old.width * old.height
 
