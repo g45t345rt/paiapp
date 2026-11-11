@@ -18,7 +18,10 @@ from PIL import Image  # noqa: E402
 
 import project  # noqa: E402
 from paintapp.app import PaintApp  # noqa: E402
+from paintapp import gizmo  # noqa: E402
 from paintapp.document import Canvas  # noqa: E402
+from paintapp.drawing import DrawingController  # noqa: E402
+from paintapp.gizmo import TransformGizmo  # noqa: E402
 
 FAILED = []
 
@@ -594,6 +597,41 @@ def test_link_mask_follows_a_canvas_crop():
     check("mask cropped with it", link.mask.size, (3, 3))
     check("mask pixel kept", link.mask.getpixel((1, 1)), 0)
     check("still hidden after crop", doc.composite_transparent().getpixel((1, 1))[3], 0)
+
+
+def test_quick_transform_works_on_a_link():
+    """The Transform panel's flip/rotate buttons edit a link per instance."""
+    doc = make_doc()
+    master = promote(doc)
+    master.set_image(Image.new("RGBA", doc.size, (255, 0, 0, 255)))
+    master.visible = False
+    link = link_to(doc, master)
+    doc.active = doc.layers.index(link)
+
+    app = fake_app(doc)
+    app.tools = SimpleNamespace(
+        transform_tool=True, transform_snap_anchors=True,
+        transform_interpolation="bicubic", transform_rotation_snap=15,
+    )
+    instance = TransformGizmo()
+    check("gizmo begins on a link", instance.begin(app, None), True)
+
+    controller = SimpleNamespace(app=app, gizmo=instance)
+    controller._transform_ready = (
+        lambda: instance.active and instance.layer is app.active_layer())
+    controller.sync_transform = lambda: None
+    controller._apply_transform_options = lambda: None
+    controller._transform_link_quick = (
+        lambda action: DrawingController._transform_link_quick(controller, action))
+    DrawingController._transform_quick(controller, "rotate_180")
+
+    check("link gained a per-instance transform", link.transform is not None, True)
+    # The 4x4 opaque content is turned half a circle about its centre, so the
+    # content pixel at the top left lands at the bottom right.
+    x, y = gizmo.apply(link.transform, 0.5, 0.5)
+    check("link content rotated about its centre",
+          (round(x + link.offset[0], 3), round(y + link.offset[1], 3)),
+          (3.5, 3.5))
 
 
 def main():

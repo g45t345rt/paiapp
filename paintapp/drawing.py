@@ -9869,6 +9869,13 @@ class DrawingController:
         app = self.app
         if app.current is None or app.active_layer() is None:
             return
+        if app.active_layer().is_link:
+            # A link owns no pixels, so the destructive ``app.flip_*`` calls
+            # below cannot touch it. Apply the same whole-layer flip/rotate to
+            # its per-instance transform instead, about the frame centre in
+            # document space so the result matches the pixel path.
+            self._transform_link_quick(action)
+            return
         {
             "flip_h": app.flip_horizontal,
             "flip_v": app.flip_vertical,
@@ -9878,6 +9885,33 @@ class DrawingController:
         }[action]()
         if app.tools.transform_tool:
             self.sync_transform()
+
+    def _transform_link_quick(self, action):
+        """Flip/rotate a link's per-instance transform about its frame centre."""
+        if not self._transform_ready():
+            self.sync_transform()
+        if not self._transform_ready():
+            return
+        label = "Flipped" if action.startswith("flip") else "Rotated"
+        if action == "flip_h":
+            op = gizmo.scaling(-1.0, 1.0)
+        elif action == "flip_v":
+            op = gizmo.scaling(1.0, -1.0)
+        else:
+            angle = {"rotate_cw": 90.0, "rotate_ccw": -90.0,
+                     "rotate_180": 180.0}[action]
+            op = gizmo.rotation(math.radians(angle))
+        g = self.gizmo
+        dcx, dcy = gizmo.apply(g.matrix, *g._center_local())
+        self._apply_transform_options()
+        self.app._push_undo(label)
+        g.matrix = gizmo.mul(gizmo.about(op, dcx, dcy), g.matrix)
+        g._apply_pixels()
+        view = g.view
+        if view is not None:
+            view.set_gizmo(g.geometry())
+        self.app.render()
+        self.app.set_result(f"{label} layer '{self.app.active_layer().name}'.")
 
     def reset_transform_frame(self):
         """Drop the live frame back to identity, re-based on the pixels."""
