@@ -553,15 +553,21 @@ class ToolsPanel(tk.Frame):
         self.vector_antialias = True
         self.vector_smooth = 0
         self.vector_detail = 15
+        self.vector_dash = "solid"
+        self.vector_arrow_start = "none"
+        self.vector_arrow_end = "none"
+        self.vector_blend = "normal"
         # Edit options. ``vector_snap`` pulls a dragged anchor onto a nearby one;
         # ``vector_anchor_size`` is the on-canvas handle size in pixels.
         self.vector_snap = True
         self.vector_anchor_size = 4
         # Correction options. ``vector_width_mode`` is how the width tool adjusts
-        # a line ("set" to the brush size, or "thicken"/"narrow"); ``vector_erase_mode``
-        # is what the eraser removes ("touch" the covered anchors, or the "whole"
-        # line when it is touched).
+        # a line ("set" to the brush size, or "thicken"/"narrow"); ``vector_width_target``
+        # chooses between the whole line and the nearest anchor (a width profile);
+        # ``vector_erase_mode`` is what the eraser removes ("touch" the covered
+        # anchors, or the "whole" line when it is touched).
         self.vector_width_mode = "set"
+        self.vector_width_target = "line"
         self.vector_erase_mode = "touch"
         # When set, scaling a selection with the corner handles scales each
         # line's width too (CSP's "adjust line thickness when scaling").
@@ -2389,6 +2395,13 @@ class ToolsPanel(tk.Frame):
         self._vector_aa_var = tk.BooleanVar(value=self.vector_antialias)
         self._vector_smooth_var = tk.IntVar(value=self.vector_smooth)
         self._vector_detail_var = tk.IntVar(value=self.vector_detail)
+        self._vector_dash_var = tk.StringVar(value=self.vector_dash)
+        self._vector_arrow_start_var = tk.StringVar(
+            value=self.vector_arrow_start)
+        self._vector_arrow_end_var = tk.StringVar(value=self.vector_arrow_end)
+        self._vector_blend_var = tk.StringVar(value=self.vector_blend)
+        self._vector_width_target_var = tk.StringVar(
+            value=self.vector_width_target)
         self._vector_snap_var = tk.BooleanVar(value=self.vector_snap)
         self._vector_anchor_size_var = tk.IntVar(value=self.vector_anchor_size)
         self._vector_width_mode_var = tk.StringVar(value=self.vector_width_mode)
@@ -2429,6 +2442,10 @@ class ToolsPanel(tk.Frame):
                        self._vector_width_mode_var,
                        [("set", "Set"), ("thicken", "Thicken"),
                         ("narrow", "Narrow")], self._on_vector_correct)
+        self._menu_row(self._vector_width_frame, "Target",
+                       self._vector_width_target_var,
+                       [("line", "Whole line"), ("point", "Anchor")],
+                       self._on_vector_correct)
 
         self._vector_erase_frame = tk.Frame(self.settings)
         self._menu_row(self._vector_erase_frame, "Erase",
@@ -2454,6 +2471,22 @@ class ToolsPanel(tk.Frame):
         self._menu_row(self._vector_draw, "Join", self._vector_join_var,
                        [("round", "Round"), ("miter", "Miter")],
                        self._on_vector_draw)
+        self._menu_row(self._vector_draw, "Dash", self._vector_dash_var,
+                       [("solid", "Solid"), ("dashed", "Dashed"),
+                        ("dotted", "Dotted"), ("dashdot", "Dash-dot")],
+                       self._on_vector_draw)
+        self._menu_row(self._vector_draw, "Start", self._vector_arrow_start_var,
+                       [("none", "None"), ("triangle", "Arrow"),
+                        ("stealth", "Stealth"), ("circle", "Circle"),
+                        ("square", "Square"), ("bar", "Bar")],
+                       self._on_vector_draw)
+        self._menu_row(self._vector_draw, "End", self._vector_arrow_end_var,
+                       [("none", "None"), ("triangle", "Arrow"),
+                        ("stealth", "Stealth"), ("circle", "Circle"),
+                        ("square", "Square"), ("bar", "Bar")],
+                       self._on_vector_draw)
+        self._menu_row(self._vector_draw, "Blend", self._vector_blend_var,
+                       list(brush.BLEND_MODES.items()), self._on_vector_draw)
         self._slider_row(self._vector_draw, "Smooth", self._vector_smooth_var,
                          0, 100, self._on_vector_draw)
         self._slider_row(self._vector_draw, "Detail", self._vector_detail_var,
@@ -2497,6 +2530,37 @@ class ToolsPanel(tk.Frame):
                 shape_actions2, text=label,
                 command=lambda a=action: self._vector_action(a),
             ).pack(side=tk.LEFT, padx=(0, 3))
+        bool_actions = tk.Frame(self._vector_edit)
+        bool_actions.pack(fill=tk.X, pady=(3, 0))
+        for label, operation in (("Union", "union"), ("Subtract", "subtract"),
+                                 ("Intersect", "intersect"),
+                                 ("Exclude", "exclude")):
+            tk.Button(
+                bool_actions, text=label,
+                command=lambda op=operation: self._vector_action(
+                    "boolean", {"op": op}),
+            ).pack(side=tk.LEFT, padx=(0, 3))
+        object_actions = tk.Frame(self._vector_edit)
+        object_actions.pack(fill=tk.X, pady=(3, 0))
+        for label, action in (("Copy", "duplicate"), ("Front", "front"),
+                              ("Back", "back")):
+            tk.Button(
+                object_actions, text=label,
+                command=lambda a=action: self._vector_action(a),
+            ).pack(side=tk.LEFT, padx=(0, 3))
+        align_actions = tk.Frame(self._vector_edit)
+        align_actions.pack(fill=tk.X, pady=(3, 0))
+        for label, action, edge in (
+                ("L", "align", "left"), ("C", "align", "hcenter"),
+                ("R", "align", "right"), ("T", "align", "top"),
+                ("M", "align", "vcenter"), ("B", "align", "bottom"),
+                ("Dist H", "distribute", "h"),
+                ("Dist V", "distribute", "v")):
+            tk.Button(
+                align_actions, text=label,
+                command=lambda a=action, e=edge: self._vector_action(
+                    a, {"edge": e}),
+            ).pack(side=tk.LEFT, padx=(0, 2))
         tk.Label(self._vector_edit, text="Lines", anchor="w").pack(
             fill=tk.X, pady=(6, 0))
         list_row = tk.Frame(self._vector_edit)
@@ -2534,6 +2598,14 @@ class ToolsPanel(tk.Frame):
         tk.Button(
             prop_row, text="No fill",
             command=lambda: self._vector_action("clear_fill"),
+        ).pack(side=tk.LEFT, padx=(4, 0))
+        tk.Button(
+            prop_row, text="Gradient",
+            command=lambda: self._vector_action("gradient"),
+        ).pack(side=tk.LEFT, padx=(4, 0))
+        tk.Button(
+            prop_row, text="No grad",
+            command=lambda: self._vector_action("clear_gradient"),
         ).pack(side=tk.LEFT, padx=(4, 0))
 
         # A zero-height marker the conditional rows are packed in front of, so
@@ -2589,6 +2661,10 @@ class ToolsPanel(tk.Frame):
         self.vector_detail = max(
             1, min(60, self._int_var(self._vector_detail_var, 15)))
         self.vector_antialias = bool(self._vector_aa_var.get())
+        self.vector_dash = self._vector_dash_var.get()
+        self.vector_arrow_start = self._vector_arrow_start_var.get()
+        self.vector_arrow_end = self._vector_arrow_end_var.get()
+        self.vector_blend = self._vector_blend_var.get()
 
     def _on_vector_edit(self, *_):
         self.vector_snap = bool(self._vector_snap_var.get())
@@ -2598,6 +2674,7 @@ class ToolsPanel(tk.Frame):
 
     def _on_vector_correct(self, *_):
         self.vector_width_mode = self._vector_width_mode_var.get()
+        self.vector_width_target = self._vector_width_target_var.get()
         self.vector_erase_mode = self._vector_erase_mode_var.get()
         self.vector_scale_width = bool(self._vector_scale_width_var.get())
 
@@ -2696,6 +2773,7 @@ class ToolsPanel(tk.Frame):
             "opacity": self._int_var(self._vector_prop_opacity_var, 100),
             "color": self._vector_prop_color or self._effective_vector_color(),
             "fill": self._vector_prop_fill,
+            "blend": self.vector_blend,
         }
 
     def _vector_action(self, action, data=None):
@@ -5040,6 +5118,10 @@ class DrawingController:
             return
         doc = self.app.current
         layer = self.app.active_layer()
+        if (not tools.shape_new_layer and layer is not None
+                and getattr(layer, "vector", False)):
+            if self._shape_add_vector(layer, start, x, y, shift, tools):
+                return
         self.app._push_undo("Shape")
         if tools.shape_new_layer:
             layer = doc.add_layer(
@@ -5115,6 +5197,65 @@ class DrawingController:
         layer.invalidate_filters()
         self.app.render()
         self.app.set_result(f"Added {tools.shape_kind} on '{layer.name}'.")
+
+    def _shape_add_vector(self, layer, start, x, y, shift, tools):
+        """Add the dragged primitive to a vector layer as an editable item."""
+        kind = tools.shape_kind
+        geometry = shape.vector_geometry(
+            kind, (start[0], start[1], x, y), shift=shift,
+            radius=tools.shape_radius)
+        if geometry is None:
+            return False
+        fill_color, stroke_color = self._shape_colors(tools)
+        mode = tools.shape_mode
+        opacity = max(1, min(100, int(tools.shape_opacity))) / 100.0
+        width = max(1, int(tools.brush_size))
+        blend = str(tools.shape_blend).lower()
+        points = geometry["points"]
+        handles_in = geometry["handles_in"]
+        handles_out = geometry["handles_out"]
+        if kind == "line":
+            color = stroke_color if mode in ("stroke", "both") else fill_color
+            spec = vector.new_stroke(
+                points, width, color, opacity=opacity, cap="round",
+                join="round", blend=blend,
+            )
+            target = layer.strokes
+        elif mode == "fill":
+            contour = {
+                "points": [list(point) for point in points],
+                "handles_in": [list(point) for point in handles_in],
+                "handles_out": [list(point) for point in handles_out],
+            }
+            spec = vector.new_fill(
+                [contour], fill_color, opacity=opacity, blend=blend)
+            target = layer.fills
+        else:
+            spec = vector.new_stroke(
+                points, width, stroke_color, opacity=opacity, closed=True,
+                handles_in=handles_in, handles_out=handles_out,
+                fill=fill_color if mode == "both" else None, blend=blend,
+            )
+            target = layer.strokes
+        if spec is None:
+            return False
+        self.app._push_undo("Shape")
+        target.append(spec)
+        if target is layer.fills:
+            index = len(layer.strokes) + len(layer.fills) - 1
+        else:
+            index = len(layer.strokes) - 1
+        layer.vector = True
+        layer.invalidate_vectors()
+        self._vector_cur = layer
+        self._vector_sel = index
+        self._vector_selection = [index]
+        self._sync_vector_selection()
+        self.app._refresh_layer_list()
+        self.app.render()
+        self.app.set_result(
+            f"Added editable {kind} on vector layer '{layer.name}'.")
+        return True
 
     def _shape_colors(self, tools):
         """Resolve the Shape tool's ``(fill, stroke)`` colours.
@@ -6372,6 +6513,41 @@ class DrawingController:
             "Select a vector layer to edit lines (Layer > New Vector Layer)."
         )
 
+    def select_vector_item(self, layer, index, edit=True):
+        """Select one of ``layer``'s vector objects and optionally edit it.
+
+        Used by the Layers panel so a shape or line row can be clicked directly
+        instead of hunting for it on the canvas. Selecting it opens the Vector
+        tool in Edit mode, where its anchors, handles, style and width are
+        editable.
+        """
+        items = self._vector_items(layer)
+        if not (0 <= index < len(items)):
+            return False
+        self._vector_cur = layer
+        self._vector_sel = index
+        self._vector_selection = [index]
+        self._vector_anchor = None
+        if edit:
+            tools = getattr(self.app, "tools", None)
+            if tools is not None and hasattr(tools, "set_vector_mode"):
+                if hasattr(tools, "_vector_mode_var"):
+                    tools._vector_mode_var.set("edit")
+                tools.set_vector_mode("edit")
+                if hasattr(tools, "_vector_apply_rows"):
+                    tools._vector_apply_rows()
+        self._sync_vector_selection()
+        self._update_vector_overlay()
+        return True
+
+    def clear_vector_selection(self):
+        """Drop the Vector tool's object selection (used when changing layers)."""
+        self._vector_selection = []
+        self._vector_sel = None
+        self._vector_anchor = None
+        self._update_vector_overlay()
+        self._sync_vector_selection()
+
     def _vector_items(self, layer):
         """Every editable vector item: the strokes, then the compound fills.
 
@@ -6466,6 +6642,17 @@ class DrawingController:
         self._update_vector_overlay(cursor=(x, y))
         self.app.render()
 
+    def _vector_dash_pattern(self, preset, width):
+        """The dash lengths for a draw-style preset, scaled to the brush size."""
+        size = max(1.0, float(width))
+        if preset == "dashed":
+            return [size * 4.0, size * 2.0]
+        if preset == "dotted":
+            return [max(1.0, size * 0.5), size * 2.0]
+        if preset == "dashdot":
+            return [size * 4.0, size * 2.0, max(1.0, size * 0.5), size * 2.0]
+        return []
+
     def _vector_finish_draw(self):
         points = self._vector_points
         self._vector_points = None
@@ -6486,6 +6673,11 @@ class DrawingController:
         aa = bool(getattr(tools, "vector_antialias", True))
         smooth = int(getattr(tools, "vector_smooth", 0))
         detail = max(1, int(getattr(tools, "vector_detail", 15))) / 10.0
+        dash = self._vector_dash_pattern(
+            getattr(tools, "vector_dash", "solid"), tools.brush_size)
+        arrow_start = getattr(tools, "vector_arrow_start", "none")
+        arrow_end = getattr(tools, "vector_arrow_end", "none")
+        blend = getattr(tools, "vector_blend", "normal")
         smoothed = vector.smooth(points, smooth)
         merged = vector.simplify(smoothed, distance=detail)
         mappings = symmetry.transforms(
@@ -6496,7 +6688,8 @@ class DrawingController:
             spec = vector.new_stroke(
                 [mapping(px, py) for px, py in merged],
                 tools.brush_size, color, opacity=opacity, cap=cap, join=join,
-                antialias=aa,
+                antialias=aa, dash=dash, arrow_start=arrow_start,
+                arrow_end=arrow_end, blend=blend,
             )
             if spec is not None:
                 specs.append(spec)
@@ -6510,6 +6703,7 @@ class DrawingController:
         self._vector_selection = [self._vector_sel]
         self._vector_cur = layer
         self._sync_vector_selection()
+        self.app._refresh_layer_list()
         self.app.render()
         if len(specs) > 1:
             self.app.set_result(
@@ -6810,8 +7004,20 @@ class DrawingController:
         layer = self._vector_cur
         current = self.app.current
         if layer is None or current is None or layer not in current.layers:
+            if hasattr(self.app, "_vector_sel"):
+                self.app._vector_sel = None
             panel([], [])
             return
+        if hasattr(self.app, "_vector_sel"):
+            self.app._vector_sel = (
+                (current.layers.index(layer), self._vector_sel)
+                if self._vector_sel is not None else None
+            )
+        layer_panel = getattr(self.app, "layer_panel", None)
+        if (self._vector_sel is not None and layer_panel is not None
+                and hasattr(layer_panel, "select_vector_row")):
+            layer_panel.select_vector_row(
+                current.layers.index(layer), self._vector_sel)
         items = self._vector_items(layer)
         labels = [
             vector.describe_fill(spec) if vector.is_fill(spec)
@@ -6890,6 +7096,7 @@ class DrawingController:
             self._vector_sel = None
             self._sync_vector_selection()
             self._update_vector_overlay()
+            self.app._refresh_layer_list()
             self.app.render()
             self.app.set_result(
                 f"Deleted {len(targets)} vector shape"
@@ -6912,6 +7119,7 @@ class DrawingController:
                 spec = self._vector_item(layer, index)
                 if spec is not None and not vector.is_fill(spec):
                     spec["fill"] = None
+                    spec["fill_gradient"] = None
             layer.invalidate_vectors()
             self._sync_vector_selection()
             self._update_vector_overlay()
@@ -6919,6 +7127,197 @@ class DrawingController:
             self.app.set_result(
                 f"Removed fill from {len(targets)} vector line"
                 f"{'s' if len(targets) != 1 else ''}.")
+            return
+        if action == "boolean":
+            if layer is None:
+                self._vector_missing_layer()
+                return
+            self._vector_cur = layer
+            targets = sorted(self._vector_selection_set())
+            items = [self._vector_item(layer, index) for index in targets]
+            items = [item for item in items if item is not None]
+            if len(items) < 2:
+                self.app.set_result("Select two or more shapes to combine.")
+                return
+            operation = data.get("op", "union")
+            result = vector.boolean(items, operation)
+            if result is None:
+                self.app.set_result("The shapes do not overlap that way.")
+                return
+            self._vector_cur = layer
+            self.app._push_undo("Vector boolean")
+            for index in sorted(targets, reverse=True):
+                self._vector_remove_item(layer, index)
+            layer.fills.append(result)
+            layer.vector = True
+            layer.invalidate_vectors()
+            self._vector_selection = [
+                len(layer.strokes) + len(layer.fills) - 1]
+            self._vector_sel = self._vector_selection[0]
+            self._vector_anchor = None
+            self._sync_vector_selection()
+            self._update_vector_overlay()
+            self.app._refresh_layer_list()
+            self.app.render()
+            verb = {
+                "union": "Combined",
+                "subtract": "Subtracted",
+                "intersect": "Intersected",
+                "exclude": "Excluded",
+            }.get(operation, "Combined")
+            self.app.set_result(f"{verb} {len(items)} vector shapes.")
+            return
+        if action == "duplicate":
+            if layer is None:
+                self._vector_missing_layer()
+                return
+            self._vector_cur = layer
+            targets = sorted(self._vector_selection_set())
+            if not targets and self._vector_sel is not None:
+                targets = [self._vector_sel]
+            if not targets:
+                self.app.set_result("Select a line to duplicate.")
+                return
+            self._vector_cur = layer
+            self.app._push_undo("Duplicate vector line")
+            created = []
+            for index in targets:
+                spec = self._vector_item(layer, index)
+                if spec is None:
+                    continue
+                copy = vector.duplicate_item(spec, 8.0, 8.0)
+                if copy is None:
+                    continue
+                if vector.is_fill(copy):
+                    layer.fills.append(copy)
+                    created.append(len(layer.strokes) + len(layer.fills) - 1)
+                else:
+                    layer.strokes.append(copy)
+                    created.append(len(layer.strokes) - 1)
+            layer.vector = True
+            layer.invalidate_vectors()
+            self._vector_selection = created
+            self._vector_sel = created[-1] if created else None
+            self._sync_vector_selection()
+            self._update_vector_overlay()
+            self.app._refresh_layer_list()
+            self.app.render()
+            self.app.set_result(
+                f"Duplicated {len(created)} vector shape"
+                f"{'s' if len(created) != 1 else ''}.")
+            return
+        if action in ("front", "back", "forward", "backward"):
+            if layer is None:
+                self._vector_missing_layer()
+                return
+            self._vector_cur = layer
+            targets = sorted(self._vector_selection_set())
+            if not targets:
+                self.app.set_result("Select a line first.")
+                return
+            self._vector_cur = layer
+            self.app._push_undo("Reorder vector lines")
+            stroke_count = len(layer.strokes)
+            stroke_indices = [index for index in targets
+                              if index < stroke_count]
+            fill_indices = [index - stroke_count for index in targets
+                            if index >= stroke_count]
+            moved = {id(self._vector_item(layer, index))
+                     for index in targets}
+            if stroke_indices:
+                layer.strokes = vector.reorder_items(
+                    layer.strokes, stroke_indices, action)
+            if fill_indices:
+                layer.fills = vector.reorder_items(
+                    layer.fills, fill_indices, action)
+            items = self._vector_items(layer)
+            self._vector_selection = [
+                index for index, spec in enumerate(items)
+                if id(spec) in moved]
+            self._vector_sel = (self._vector_selection[-1]
+                                if self._vector_selection else None)
+            layer.invalidate_vectors()
+            self._sync_vector_selection()
+            self._update_vector_overlay()
+            self.app._refresh_layer_list()
+            self.app.render()
+            self.app.set_result("Reordered vector lines.")
+            return
+        if action in ("align", "distribute"):
+            if layer is None:
+                self._vector_missing_layer()
+                return
+            self._vector_cur = layer
+            targets = sorted(self._vector_selection_set())
+            items = [self._vector_item(layer, index) for index in targets]
+            items = [item for item in items if item is not None]
+            if len(items) < 2:
+                self.app.set_result("Select two or more shapes first.")
+                return
+            self._vector_cur = layer
+            self.app._push_undo(
+                "Align vector lines" if action == "align"
+                else "Distribute vector lines")
+            edge = data.get("edge", "left")
+            if action == "align":
+                vector.align_items(items, edge)
+            else:
+                vector.distribute_items(items, edge)
+            layer.invalidate_vectors()
+            self._sync_vector_selection()
+            self._update_vector_overlay()
+            self.app.render()
+            self.app.set_result(
+                "Aligned vector lines." if action == "align"
+                else "Distributed vector lines.")
+            return
+        if action in ("gradient", "clear_gradient"):
+            if layer is None:
+                self._vector_missing_layer()
+                return
+            self._vector_cur = layer
+            targets = sorted(self._vector_selection_set())
+            if not targets and self._vector_sel is not None:
+                targets = [self._vector_sel]
+            if not targets:
+                self.app.set_result("Select a shape first.")
+                return
+            self._vector_cur = layer
+            self.app._push_undo(
+                "Add vector gradient" if action == "gradient"
+                else "Remove vector gradient")
+            second = data.get("fill") or "#ffffff"
+            for index in targets:
+                spec = self._vector_item(layer, index)
+                if spec is None:
+                    continue
+                if action == "clear_gradient":
+                    if vector.is_fill(spec):
+                        spec["gradient"] = None
+                    else:
+                        spec["fill_gradient"] = None
+                    continue
+                box = vector.item_bounds(spec)
+                if box is None:
+                    continue
+                color = spec.get("color") or "#000000"
+                gradient = {
+                    "type": "linear",
+                    "stops": [[0.0, color], [1.0, second]],
+                    "start": [box[0], (box[1] + box[3]) / 2.0],
+                    "end": [box[2], (box[1] + box[3]) / 2.0],
+                }
+                if vector.is_fill(spec):
+                    spec["gradient"] = vector.normalize_gradient(gradient)
+                else:
+                    spec["fill_gradient"] = vector.normalize_gradient(gradient)
+            layer.invalidate_vectors()
+            self._sync_vector_selection()
+            self._update_vector_overlay()
+            self.app.render()
+            self.app.set_result(
+                "Updated the vector gradient." if action == "gradient"
+                else "Removed the vector gradient.")
             return
         if action == "apply":
             if layer is None:
@@ -6940,9 +7339,14 @@ class DrawingController:
                 if not vector.is_fill(spec):
                     vector.correct_width(spec, data.get("width", spec["width"]))
                     spec["fill"] = data.get("fill")
+                    if not spec["fill"]:
+                        spec["fill_gradient"] = None
                 spec["opacity"] = max(
                     0.0, min(1.0, float(data.get("opacity", 100)) / 100.0))
                 spec["color"] = data.get("color", spec["color"])
+                blend = data.get("blend")
+                if blend in vector.BLEND_MODES:
+                    spec["blend"] = blend
             layer.invalidate_vectors()
             self._sync_vector_selection()
             self._update_vector_overlay()
@@ -7174,6 +7578,40 @@ class DrawingController:
         done = getattr(self, "_vector_width_done", None)
         if done is None:
             done = self._vector_width_done = set()
+        target_mode = getattr(self.app.tools, "vector_width_target", "line")
+        if target_mode == "point":
+            anchors = []
+            for spec in layer.strokes:
+                index, current = vector.width_at(spec, x, y)
+                if index is None:
+                    continue
+                anchor = spec["points"][index]
+                if math.hypot(x - anchor[0], y - anchor[1]) > tolerance * 3.0:
+                    continue
+                key = (id(spec), index)
+                if mode == "set" and abs(current - width) < 0.5:
+                    continue
+                if mode != "set" and key in done:
+                    continue
+                anchors.append((spec, index, current))
+            if not anchors:
+                return
+            if not self._vector_dirty:
+                self.app._push_undo("Correct line width")
+                self._vector_dirty = True
+            step = max(1, int(round(width / 4.0)))
+            for spec, index, current in anchors:
+                if mode == "thicken":
+                    vector.set_anchor_width(spec, index, current + step)
+                elif mode == "narrow":
+                    vector.set_anchor_width(spec, index, current - step)
+                else:
+                    vector.set_anchor_width(spec, index, width)
+                done.add((id(spec), index))
+            layer.invalidate_vectors()
+            self._update_vector_overlay()
+            self.app.render()
+            return
         targets = []
         for spec in layer.strokes:
             if not vector.hit_stroke(spec, x, y, tolerance):

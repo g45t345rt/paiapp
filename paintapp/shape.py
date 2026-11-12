@@ -8,6 +8,8 @@ circle and snaps a line to 45-degree increments.
 
 import math
 
+from . import svgimport
+
 SHAPES = [
     ("rectangle", "Rectangle"),
     ("ellipse", "Ellipse"),
@@ -136,3 +138,66 @@ def draw(pen, kind, box, fill=None, outline=None, width=1, shift=False, radius=0
             )
         else:
             pen.rectangle(box, fill=fill, outline=outline, width=width)
+
+
+def vector_geometry(kind, box, shift=False, radius=0):
+    """``box``'s geometry as ``{points, handles_in, handles_out, closed}``.
+
+    The primitive is converted through the SVG path importer, so ellipses and
+    rounded rectangles come back as true cubic segments and every shape can be
+    stored as an editable vector item instead of being baked into pixels.
+    """
+    left, top, right, bottom = constrain(box, kind, shift)
+    if kind == "line":
+        data = f"M {left} {top} L {right} {bottom}"
+    elif kind == "ellipse":
+        if right < left:
+            left, right = right, left
+        if bottom < top:
+            top, bottom = bottom, top
+        cx = (left + right) / 2.0
+        cy = (top + bottom) / 2.0
+        rx = abs(right - left) / 2.0
+        ry = abs(bottom - top) / 2.0
+        if rx <= 0 or ry <= 0:
+            return None
+        data = (f"M {cx - rx} {cy} A {rx} {ry} 0 1 0 {cx + rx} {cy} "
+                f"A {rx} {ry} 0 1 0 {cx - rx} {cy} Z")
+    elif kind in POLYGONS:
+        points = polygon_points(kind, box)
+        if len(points) < 3:
+            return None
+        data = "M " + " L ".join(f"{x} {y}" for x, y in points) + " Z"
+    else:
+        if right < left:
+            left, right = right, left
+        if bottom < top:
+            top, bottom = bottom, top
+        corner = corner_radius((left, top, right, bottom), radius)
+        if corner <= 0:
+            data = (f"M {left} {top} L {right} {top} L {right} {bottom} "
+                    f"L {left} {bottom} Z")
+        else:
+            data = (
+                f"M {left + corner} {top} L {right - corner} {top} "
+                f"A {corner} {corner} 0 0 1 {right} {top + corner} "
+                f"L {right} {bottom - corner} "
+                f"A {corner} {corner} 0 0 1 {right - corner} {bottom} "
+                f"L {left + corner} {bottom} "
+                f"A {corner} {corner} 0 0 1 {left} {bottom - corner} "
+                f"L {left} {top + corner} "
+                f"A {corner} {corner} 0 0 1 {left + corner} {top} Z")
+    subpaths = svgimport.parse_path_data(data)
+    if not subpaths:
+        return None
+    geometry = subpaths[0]
+    points = geometry["points"]
+    # A closed path ends on a duplicate of its first anchor; drop it so the
+    # shape has one editable node per corner (the closing segment supplies it).
+    if (geometry["closed"] and len(points) >= 3
+            and math.hypot(points[-1][0] - points[0][0],
+                           points[-1][1] - points[0][1]) < 1e-6):
+        geometry["points"] = points[:-1]
+        geometry["handles_in"] = geometry["handles_in"][:-1]
+        geometry["handles_out"] = geometry["handles_out"][:-1]
+    return geometry

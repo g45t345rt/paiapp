@@ -376,6 +376,43 @@ def test_art_already_within_paste_stays_put():
           doc["strokes"][0]["points"][0])
 
 
+def test_dash_array_round_trip():
+    spec = first('<svg><path d="M 0 0 L 50 0" fill="none" stroke="black" '
+                 'stroke-width="2" stroke-dasharray="4 2" '
+                 'stroke-dashoffset="1"/></svg>')
+    check("dash imported", spec["dash"], [4.0, 2.0])
+    check("dash offset imported", spec["dash_offset"], 1.0)
+    text = svgimport.export([spec], size=(60, 20))
+    check("dash exported", 'stroke-dasharray="4 2"' in text, True)
+    check("dash offset exported", 'stroke-dashoffset="1"' in text, True)
+    again = svgimport.parse(text)["strokes"][0]
+    check("dash round-trips", again["dash"], [4.0, 2.0])
+
+
+def test_gradient_and_marker_export():
+    gradient = {
+        "type": "linear", "stops": [[0, "#ff0000"], [1, "#0000ff"]],
+        "start": [0, 0], "end": [40, 0],
+    }
+    spec = vector.new_stroke(
+        [[0, 0], [40, 0], [40, 40], [0, 40]], 3, "#000000", closed=True,
+        fill_gradient=gradient, arrow_end="triangle")
+    text = svgimport.export([spec], size=(60, 60))
+    check("linear gradient defined", "<linearGradient" in text, True)
+    check("gradient referenced", "url(#gradient0)" in text, True)
+    check("marker defined", "<marker" in text, True)
+    check("marker referenced", "marker-end=" in text, True)
+
+
+def test_width_profile_exports_as_outline():
+    spec = vector.new_stroke([[0, 10], [40, 10]], 4, "#000000",
+                             widths=[2, 16])
+    text = svgimport.export([spec], size=(60, 60))
+    check("profiled stroke exported without stroke paint",
+          'stroke="none"' in text, True)
+    check("profiled stroke has an outline path", text.count("<path") >= 1, True)
+
+
 def main():
     for name, fn in sorted(globals().items()):
         if name.startswith("test_") and callable(fn):

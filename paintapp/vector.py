@@ -31,7 +31,8 @@ a spec into pixels, shared by compositing and the destructive rasterise.
 
 import math
 
-from PIL import Image, ImageDraw
+import numpy as np
+from PIL import Image, ImageChops, ImageDraw
 
 from . import antialias
 from .constants import rgba
@@ -43,6 +44,28 @@ DEFAULT_WIDTH = 6
 
 CAPS = ("round", "butt", "square")
 JOINS = ("round", "miter")
+
+# End-of-stroke markers. ``none`` draws nothing; the others are centred on the
+# stroke end and point outwards along its tangent.
+ARROW_STYLES = ("none", "triangle", "stealth", "circle", "square", "bar")
+
+# Dash patterns are absolute lengths in document pixels (SVG's stroke-dasharray).
+# A lone entry is repeated to make an even on/off pattern; values below this
+# epsilon are treated as gaps and dropped.
+DASH_EPSILON = 0.01
+
+# Gradient fill types for a closed stroke or a compound fill.
+GRADIENT_TYPES = ("linear", "radial")
+
+# Blend modes an item may carry. The actual maths lives in ``brush``; this list
+# only validates the stored id (kept in sync with brush.BLEND_MODES below).
+BLEND_MODES = (
+    "normal", "darken", "multiply", "color_burn", "linear_burn",
+    "darker_color", "lighten", "screen", "color_dodge", "add",
+    "lighter_color", "overlay", "soft_light", "hard_light", "vivid_light",
+    "linear_light", "pin_light", "hard_mix", "difference", "exclusion",
+    "subtract", "divide", "hue", "saturation", "color", "luminosity",
+)
 
 # Points closer than this to the previously kept point are dropped while a
 # freehand stroke is recorded, so a vector line stays a handful of nodes rather
@@ -126,7 +149,12 @@ def _stroke_sprite_key(spec):
         round(float(spec.get("opacity", 1.0)), 4),
         bool(spec.get("closed", False)), spec.get("cap"), spec.get("join"),
         bool(spec.get("antialias", True)),
-        repr(spec.get("fill")),
+        repr(spec.get("fill")), repr(spec.get("fill_gradient")),
+        tuple(round(float(value), 4) for value in anchor_widths(spec)),
+        tuple(round(float(value), 4) for value in dash_pattern(spec)),
+        round(float(spec.get("dash_offset", 0.0)), 4),
+        spec.get("arrow_start"), spec.get("arrow_end"),
+        round(float(spec.get("arrow_size", 0.0)), 4),
         _rel(points, shift),
         _rel(handles_in, shift),
         _rel(handles_out, shift),
@@ -151,6 +179,7 @@ def _fill_sprite_key(spec):
     return (
         spec.get("color"), round(float(spec.get("opacity", 1.0)), 4),
         bool(spec.get("antialias", True)), bool(spec.get("even_odd", True)),
+        repr(spec.get("gradient")),
         tuple(contours),
     ), shift
 
@@ -201,6 +230,135 @@ def handles(spec):
     )
 
 
+def _clamp_width(value):
+    return max(float(MIN_WIDTH), min(float(MAX_WIDTH), float(value)))
+
+
+def _clean_widths(raw, anchors, base):
+    """Per-anchor stroke widths, padded with the uniform ``base`` width."""
+    widths = []
+    for value in raw or []:
+        try:
+            widths.append(_clamp_width(value))
+        except (TypeError, ValueError):
+            continue
+    while len(widths) < len(anchors):
+        widths.append(float(base))
+    return widths[:len(anchors)]
+
+
+def anchor_widths(spec):
+    """The stroke's width at each anchor (uniform when no profile is stored)."""
+    points = spec.get("points") or []
+    try:
+        base = _clamp_width(spec.get("width", DEFAULT_WIDTH))
+    except (TypeError, ValueError):
+        base = float(DEFAULT_WIDTH)
+    return _clean_widths(spec.get("widths"), points, base)
+
+
+def has_width_profile(spec):
+    """True when the stroke's width varies along its anchors."""
+    widths = anchor_widths(spec)
+    if len(widths) < 2:
+        return False
+    first = widths[0]
+    return any(abs(width - first) > 1e-6 for width in widths[1:])
+
+
+def _clean_dash(raw):
+    """A non-negative dash pattern with an even number of entries."""
+    pattern = []
+    for value in raw or []:
+        try:
+            length = float(value)
+        except (TypeError, ValueError):
+            continue
+        if length > DASH_EPSILON:
+            pattern.append(length)
+    if not pattern:
+        return []
+    if len(pattern) % 2:
+        pattern = pattern + pattern
+    return pattern
+
+
+def dash_pattern(spec):
+    """The stroke's dash pattern (empty for a solid line)."""
+    pattern = spec.get("dash")
+    if pattern is None:
+        pattern = spec.get("dasharray")
+    return _clean_dash(pattern)
+
+
+def normalize_gradient(value):
+    """Coerce ``value`` to a valid gradient paint, or ``None``.
+
+    A gradient is a plain dict::
+
+        {"type": "linear", "stops": [[0.0, "#000000"], [1.0, "#ffffff"]],
+         "start": [x, y], "end": [x, y]}
+        {"type": "radial", ..., "center": [x, y], "radius": r}
+
+    Stops are sorted and clamped to ``0..1``; at least two are required. The
+    start/end (or centre/radius) live in document pixels, so gradients travel
+    with the geometry through moves, scales and rotations.
+    """
+    if not isinstance(value, dict):
+        return None
+    kind = str(value.get("type") or "linear").lower()
+    if kind not in GRADIENT_TYPES:
+        kind = "linear"
+    stops = []
+    for entry in value.get("stops") or []:
+        try:
+            offset = max(0.0, min(1.0, float(entry[0])))
+            color = str(entry[1])
+        except (TypeError, ValueError, IndexError):
+            continue
+        stops.append([offset, color])
+    if len(stops) < 2:
+        return None
+    stops.sort(key=lambda entry: entry[0])
+
+    def point(name, fallback):
+        raw = value.get(name)
+        try:
+            return [float(raw[0]), float(raw[1])]
+        except (TypeError, ValueError, IndexError):
+            return list(fallback)
+
+    if kind == "radial":
+        try:
+            radius = max(0.0, float(value.get("radius", 1.0)))
+        except (TypeError, ValueError):
+            radius = 1.0
+        return {
+            "type": "radial", "stops": stops,
+            "center": point("center", (0.0, 0.0)), "radius": radius,
+        }
+    start = point("start", (0.0, 0.0))
+    end = point("end", (start[0] + 1.0, start[1]))
+    return {"type": "linear", "stops": stops, "start": start, "end": end}
+
+
+def _clone_gradient(gradient):
+    if gradient is None:
+        return None
+    copy = {
+        "type": gradient.get("type", "linear"),
+        "stops": [[float(entry[0]), str(entry[1])]
+                  for entry in gradient.get("stops") or []],
+    }
+    for key in ("start", "end", "center"):
+        if key in gradient:
+            copy[key] = [float(gradient[key][0]), float(gradient[key][1])]
+    if "radius" in gradient:
+        copy["radius"] = float(gradient["radius"])
+    return copy
+
+
+
 def normalize(spec):
     """Coerce ``spec`` to a complete, valid stroke (or ``None`` when empty)."""
     if not isinstance(spec, dict):
@@ -220,17 +378,40 @@ def normalize(spec):
     fill = str(fill) if fill else None
     cap = spec.get("cap") if spec.get("cap") in CAPS else "round"
     join = spec.get("join") if spec.get("join") in JOINS else "round"
+    arrow_start = (spec.get("arrow_start")
+                   if spec.get("arrow_start") in ARROW_STYLES else "none")
+    arrow_end = (spec.get("arrow_end")
+                 if spec.get("arrow_end") in ARROW_STYLES else "none")
+    try:
+        arrow_size = max(0.0, float(spec.get("arrow_size", 0.0)))
+    except (TypeError, ValueError):
+        arrow_size = 0.0
+    blend = spec.get("blend")
+    blend = blend if blend in BLEND_MODES else "normal"
+    try:
+        dash_offset = float(spec.get("dash_offset", 0.0))
+    except (TypeError, ValueError):
+        dash_offset = 0.0
+    widths = _clean_widths(spec.get("widths"), points, width)
     return {
         "points": points,
         "handles_in": handles_in,
         "handles_out": handles_out,
         "width": width,
+        "widths": widths,
         "color": color,
         "fill": fill,
+        "fill_gradient": normalize_gradient(spec.get("fill_gradient")),
         "opacity": _opacity(spec),
         "closed": bool(spec.get("closed", False)),
         "cap": cap,
         "join": join,
+        "dash": _clean_dash(spec.get("dash")),
+        "dash_offset": dash_offset,
+        "arrow_start": arrow_start,
+        "arrow_end": arrow_end,
+        "arrow_size": arrow_size,
+        "blend": blend,
         "antialias": bool(spec.get("antialias", True)),
     }
 
@@ -243,29 +424,44 @@ def clone(spec):
     normalized["points"] = [[x, y] for x, y in normalized["points"]]
     normalized["handles_in"] = [[x, y] for x, y in normalized["handles_in"]]
     normalized["handles_out"] = [[x, y] for x, y in normalized["handles_out"]]
+    normalized["widths"] = [float(value) for value in normalized["widths"]]
+    normalized["dash"] = [float(value) for value in normalized["dash"]]
+    normalized["fill_gradient"] = _clone_gradient(
+        normalized.get("fill_gradient"))
     return normalized
 
 
 def new_stroke(points, width, color, opacity=1.0, closed=False,
                cap="round", join="round", antialias=True,
-               handles_in=None, handles_out=None, fill=None):
+               handles_in=None, handles_out=None, fill=None,
+               widths=None, dash=None, dash_offset=0.0,
+               arrow_start="none", arrow_end="none", arrow_size=0.0,
+               fill_gradient=None, blend="normal"):
     """Build a normalised stroke from ``points`` (document pixels).
 
     ``handles_in``/``handles_out`` are the optional cubic control points; omitting
     them builds the straight polyline a freehand stroke always was. ``fill`` is
-    an optional colour painted inside a closed stroke.
+    an optional colour painted inside a closed stroke. ``widths`` is an optional
+    per-anchor width profile, ``dash`` an SVG-style dash pattern, and the arrow
+    options draw a marker at either end.
     """
     return normalize({
         "points": points, "width": width, "color": color, "opacity": opacity,
         "closed": closed, "cap": cap, "join": join, "antialias": antialias,
         "handles_in": handles_in, "handles_out": handles_out, "fill": fill,
+        "widths": widths, "dash": dash, "dash_offset": dash_offset,
+        "arrow_start": arrow_start, "arrow_end": arrow_end,
+        "arrow_size": arrow_size, "fill_gradient": fill_gradient,
+        "blend": blend,
     })
 
 
 def describe(spec):
     """A short one-line label for a stroke, for the layer list."""
     count = len(spec.get("points", []))
-    return f"{count} pt  ({int(spec.get('width', DEFAULT_WIDTH))}px)"
+    width = int(spec.get("width", DEFAULT_WIDTH))
+    kind = "closed shape" if spec.get("closed") else "line"
+    return f"{count} pt {kind} ({width}px)"
 
 
 def simplify(points, distance=SIMPLIFY_DISTANCE):
@@ -321,10 +517,14 @@ def simplify_spec(spec, tolerance=SIMPLIFY_DISTANCE):
     points = flatten(spec)
     if len(points) < 3:
         return spec
+    profile = anchor_widths(spec)
     kept = _rdp(points, tolerance)
     spec["points"] = [[float(x), float(y)] for x, y in kept]
     spec["handles_in"] = [list(point) for point in spec["points"]]
     spec["handles_out"] = [list(point) for point in spec["points"]]
+    average = (sum(profile) / len(profile)) if profile else float(
+        spec.get("width", DEFAULT_WIDTH))
+    spec["widths"] = [average] * len(spec["points"])
     return spec
 
 
@@ -379,8 +579,249 @@ def bounds(spec):
         return None
     xs = [point[0] for point in points]
     ys = [point[1] for point in points]
-    pad = float(spec.get("width", DEFAULT_WIDTH)) / 2.0 + 1.0
+    widest = max(anchor_widths(spec) or [spec.get("width", DEFAULT_WIDTH)])
+    pad = float(widest) / 2.0 + 1.0
+    marker = max(_arrow_size(spec), 0.0)
+    if marker > 0.0 and (spec.get("arrow_start", "none") != "none"
+                         or spec.get("arrow_end", "none") != "none"):
+        pad = max(pad, marker + 1.0)
     return (min(xs) - pad, min(ys) - pad, max(xs) + pad, max(ys) + pad)
+
+
+def _arrow_size(spec):
+    """The marker size in document pixels (automatic when unset)."""
+    try:
+        size = float(spec.get("arrow_size", 0.0))
+    except (TypeError, ValueError):
+        size = 0.0
+    if size > 0.0:
+        return size
+    widest = max(anchor_widths(spec) or [spec.get("width", DEFAULT_WIDTH)])
+    return max(4.0, float(widest)) * 3.0
+
+
+def _centerline(spec, steps=CURVE_STEPS):
+    """Sample a stroke's centreline as ``(x, y, width)`` triples.
+
+    Straight segments contribute only their endpoint (as :func:`flatten` does),
+    while curved segments are sampled at ``steps``; the width is interpolated
+    between the two anchors' profile values.
+    """
+    points = spec.get("points") or []
+    if not points:
+        return [], bool(spec.get("closed", False))
+    widths = anchor_widths(spec)
+    closed = bool(spec.get("closed", False))
+    handles_in, handles_out = handles(spec)
+    samples = [(float(points[0][0]), float(points[0][1]), widths[0])]
+
+    def add_curve(p0, h0, h1, p1, w0, w1):
+        if _is_corner(p0, h0) and _is_corner(p1, h1):
+            samples.append((float(p1[0]), float(p1[1]), w1))
+            return
+        curve = _cubic(tuple(p0), tuple(h0), tuple(h1), tuple(p1), steps)
+        for index, point in enumerate(curve, start=1):
+            t = index / steps
+            samples.append((float(point[0]), float(point[1]),
+                            w0 + (w1 - w0) * t))
+
+    for index in range(len(points) - 1):
+        add_curve(points[index], handles_out[index],
+                  handles_in[index + 1], points[index + 1],
+                  widths[index], widths[index + 1])
+    if closed and len(points) >= 2:
+        add_curve(points[-1], handles_out[-1], handles_in[0], points[0],
+                  widths[-1], widths[0])
+        if len(samples) > 1 and math.hypot(
+                samples[-1][0] - samples[0][0],
+                samples[-1][1] - samples[0][1]) < 1e-9:
+            samples.pop()
+    return samples, closed
+
+
+def _lerp_sample(a, b, t):
+    return (a[0] + (b[0] - a[0]) * t,
+            a[1] + (b[1] - a[1]) * t,
+            a[2] + (b[2] - a[2]) * t)
+
+
+def _split_dash_samples(samples, pattern, offset=0.0):
+    """Cut a width-tagged centreline into the "on" runs of a dash pattern."""
+    if not pattern or len(samples) < 2:
+        return [samples]
+    cumulative = [0.0]
+    for first, second in zip(samples, samples[1:]):
+        cumulative.append(cumulative[-1] + math.hypot(
+            second[0] - first[0], second[1] - first[1]))
+    total = cumulative[-1]
+    if total <= 1e-9:
+        return [samples]
+
+    def at(distance):
+        distance = max(0.0, min(total, distance))
+        lo, hi = 0, len(cumulative) - 1
+        while lo + 1 < hi:
+            mid = (lo + hi) // 2
+            if cumulative[mid] <= distance:
+                lo = mid
+            else:
+                hi = mid
+        span = cumulative[hi] - cumulative[lo]
+        t = 0.0 if span <= 1e-12 else (distance - cumulative[lo]) / span
+        return _lerp_sample(samples[lo], samples[hi], t)
+
+    period = sum(pattern)
+    position = float(offset) % period
+    index = 0
+    while position >= pattern[index]:
+        position -= pattern[index]
+        index = (index + 1) % len(pattern)
+    remaining = pattern[index] - position
+    drawing = index % 2 == 0
+
+    runs = []
+    distance = 0.0
+    while distance < total - 1e-9:
+        step = min(remaining, total - distance)
+        end = distance + step
+        if drawing:
+            run = [at(distance)]
+            for point_index in range(1, len(samples) - 1):
+                if distance < cumulative[point_index] < end:
+                    run.append(samples[point_index])
+            run.append(at(end))
+            if len(run) >= 2:
+                runs.append(run)
+        distance = end
+        remaining -= step
+        if remaining <= 1e-9:
+            index = (index + 1) % len(pattern)
+            remaining = pattern[index]
+            drawing = index % 2 == 0
+    return runs
+
+
+def _dot_outline(x, y, width, cap):
+    """A closed polygon for a single-point (dot) stroke."""
+    radius = max(0.5, width / 2.0)
+    if cap == "square":
+        return [(x - radius, y - radius), (x + radius, y - radius),
+                (x + radius, y + radius), (x - radius, y + radius)]
+    points = []
+    for index in range(16):
+        angle = 2.0 * math.pi * index / 16.0
+        points.append((x + math.cos(angle) * radius,
+                       y + math.sin(angle) * radius))
+    return points
+
+
+def _cap_arc(center, tangent, radius, at_start, steps=7):
+    """Points around a round end cap, from the right side to the left side."""
+    tx, ty = tangent
+    length = math.hypot(tx, ty)
+    if length <= 1e-9:
+        tx, ty, length = 1.0, 0.0, 1.0
+    tx, ty = tx / length, ty / length
+    nx, ny = -ty, tx
+    points = []
+    for index in range(steps + 1):
+        if at_start:
+            angle = -math.pi / 2.0 + math.pi * index / steps
+            ax = nx * math.sin(angle) - tx * math.cos(angle)
+            ay = ny * math.sin(angle) - ty * math.cos(angle)
+        else:
+            angle = math.pi / 2.0 - math.pi * index / steps
+            ax = nx * math.sin(angle) + tx * math.cos(angle)
+            ay = ny * math.sin(angle) + ty * math.cos(angle)
+        points.append((center[0] + ax * radius, center[1] + ay * radius))
+    return points
+
+
+def _outline_run(samples, closed, cap="round"):
+    """A single outline polygon around a width-tagged polyline."""
+    if len(samples) < 2:
+        if samples:
+            x, y, width = samples[0]
+            return _dot_outline(x, y, width, cap)
+        return []
+    count = len(samples)
+    left = []
+    right = []
+    tangents = []
+    for index, (x, y, width) in enumerate(samples):
+        if closed:
+            previous = samples[(index - 1) % count]
+            following = samples[(index + 1) % count]
+        else:
+            previous = samples[max(0, index - 1)]
+            following = samples[min(count - 1, index + 1)]
+        dx = following[0] - previous[0]
+        dy = following[1] - previous[1]
+        length = math.hypot(dx, dy)
+        if length <= 1e-9:
+            dx, dy, length = 1.0, 0.0, 1.0
+        tx, ty = dx / length, dy / length
+        tangents.append((tx, ty))
+        radius = max(0.25, width / 2.0)
+        nx, ny = -ty * radius, tx * radius
+        left.append((x + nx, y + ny))
+        right.append((x - nx, y - ny))
+    if closed:
+        return left + list(reversed(right))
+
+    start_radius = max(0.25, samples[0][2] / 2.0)
+    end_radius = max(0.25, samples[-1][2] / 2.0)
+    start_tangent = tangents[0]
+    end_tangent = tangents[-1]
+    if cap == "square":
+        sx = start_tangent[0] * start_radius
+        sy = start_tangent[1] * start_radius
+        ex = end_tangent[0] * end_radius
+        ey = end_tangent[1] * end_radius
+        polygon = [(left[0][0] - sx, left[0][1] - sy)]
+        polygon.extend(left)
+        polygon.append((left[-1][0] + ex, left[-1][1] + ey))
+        polygon.append((right[-1][0] + ex, right[-1][1] + ey))
+        polygon.extend(reversed(right))
+        polygon.append((right[0][0] - sx, right[0][1] - sy))
+        return polygon
+    if cap == "round":
+        polygon = list(left)
+        polygon.extend(_cap_arc(samples[-1][:2], end_tangent, end_radius, False))
+        polygon.extend(reversed(right))
+        polygon.extend(_cap_arc(samples[0][:2], start_tangent, start_radius, True))
+        return polygon
+    polygon = list(left)
+    polygon.extend(reversed(right))
+    return polygon
+
+
+def outline_polygons(spec):
+    """The stroke's painted area as one closed polygon per dash run."""
+    samples, closed = _centerline(spec)
+    if not samples:
+        return []
+    if len(samples) == 1:
+        x, y, width = samples[0]
+        return [_dot_outline(x, y, width, spec.get("cap", "round"))]
+    cap = spec.get("cap", "round")
+    pattern = dash_pattern(spec)
+    if pattern:
+        runs = _split_dash_samples(
+            samples, pattern, float(spec.get("dash_offset", 0.0)))
+        return [_outline_run(run, False, cap) for run in runs if len(run) >= 2]
+    return [_outline_run(samples, closed, cap)]
+
+
+def stroke_area_paths(spec):
+    """Closed polygons covering what a stroke paints (for boolean operations)."""
+    polygons = list(outline_polygons(spec))
+    if bool(spec.get("closed", False)) and (
+            spec.get("fill") or spec.get("fill_gradient")):
+        interior = flatten(spec, closed=True)
+        if len(interior) >= 3:
+            polygons.append(interior)
+    return polygons
 
 
 def _distance_to_segment(px, py, ax, ay, bx, by):
@@ -480,13 +921,20 @@ def insert_point(spec, segment_index, x, y):
     """Insert a corner anchor on segment ``segment_index`` at ``(x, y)``."""
     points = spec.get("points") or []
     handles_in, handles_out = handles(spec)
+    widths = anchor_widths(spec)
     at = min(len(points), segment_index + 1)
     point = [float(x), float(y)]
     points.insert(at, point)
     handles_in.insert(at, list(point))
     handles_out.insert(at, list(point))
+    if at < len(widths):
+        width = (widths[at - 1] + widths[at]) / 2.0
+    else:
+        width = widths[min(at - 1, len(widths) - 1)] if widths else DEFAULT_WIDTH
+    widths.insert(at, width)
     spec["handles_in"] = handles_in
     spec["handles_out"] = handles_out
+    spec["widths"] = widths
     return at
 
 
@@ -528,6 +976,10 @@ def split_segment(spec, index, t):
     handles_in.insert(after, d)
     handles_out.insert(after, e)
     handles_out[index] = a
+    widths = anchor_widths(spec)
+    widths.insert(after, widths[index] + (widths[index + 1] - widths[index]) * t
+                 if after < len(widths) else widths[index])
+    spec["widths"] = widths
     if after < count:
         handles_in[after + 1] = c
     else:
@@ -671,6 +1123,7 @@ def split_at(spec, index):
     if count < 2 or not (0 <= index < count):
         return [spec]
     handles_in, handles_out = handles(spec)
+    widths = anchor_widths(spec)
     if bool(spec.get("closed", False)):
         order = list(range(index, count)) + list(range(0, index)) + [index]
         opened = clone(spec)
@@ -678,6 +1131,7 @@ def split_at(spec, index):
         opened["points"] = [list(points[i]) for i in order]
         opened["handles_in"] = [list(handles_in[i]) for i in order]
         opened["handles_out"] = [list(handles_out[i]) for i in order]
+        opened["widths"] = [float(widths[i]) for i in order]
         opened["handles_in"][0] = list(points[index])
         opened["handles_out"][-1] = list(points[index])
         return [opened]
@@ -687,10 +1141,12 @@ def split_at(spec, index):
     first["points"] = [list(points[i]) for i in range(0, index + 1)]
     first["handles_in"] = [list(handles_in[i]) for i in range(0, index + 1)]
     first["handles_out"] = [list(handles_out[i]) for i in range(0, index + 1)]
+    first["widths"] = [float(widths[i]) for i in range(0, index + 1)]
     second = clone(spec)
     second["points"] = [list(points[i]) for i in range(index, count)]
     second["handles_in"] = [list(handles_in[i]) for i in range(index, count)]
     second["handles_out"] = [list(handles_out[i]) for i in range(index, count)]
+    second["widths"] = [float(widths[i]) for i in range(index, count)]
     return [first, second]
 
 
@@ -706,21 +1162,58 @@ def remove_point(spec, index):
     del points[index]
     del handles_in[index]
     del handles_out[index]
+    widths = anchor_widths(spec)
+    if 0 <= index < len(widths):
+        del widths[index]
     spec["handles_in"] = handles_in
     spec["handles_out"] = handles_out
+    spec["widths"] = widths
     return True
 
 
 def correct_width(spec, width):
     """Set the stroke's uniform width (the line-width correction), in place."""
-    spec["width"] = max(MIN_WIDTH, min(MAX_WIDTH, int(round(width))))
+    value = max(MIN_WIDTH, min(MAX_WIDTH, int(round(width))))
+    spec["width"] = value
+    if spec.get("widths"):
+        spec["widths"] = [float(value)] * len(spec.get("points") or [])
+    return value
 
 
 def scale_width(spec, factor, minimum=MIN_WIDTH, maximum=MAX_WIDTH):
     """Multiply the stroke's width by ``factor`` (thicken/narrow), in place."""
     current = float(spec.get("width", DEFAULT_WIDTH))
     spec["width"] = max(minimum, min(maximum, int(round(current * factor))))
+    if spec.get("widths"):
+        spec["widths"] = [
+            max(float(minimum), min(float(maximum), float(value) * factor))
+            for value in spec["widths"]
+        ]
     return spec["width"]
+
+
+def set_anchor_width(spec, index, width):
+    """Set the width at one anchor, building a profile from the uniform width."""
+    points = spec.get("points") or []
+    if not (0 <= index < len(points)):
+        return False
+    widths = anchor_widths(spec)
+    widths[index] = _clamp_width(width)
+    spec["widths"] = widths
+    spec["width"] = int(round(max(widths)))
+    return True
+
+
+def width_at(spec, x, y):
+    """``(anchor_index, width)`` of the nearest anchor to ``(x, y)``."""
+    points = spec.get("points") or []
+    widths = anchor_widths(spec)
+    if not points:
+        return None, None
+    best = min(range(len(points)),
+               key=lambda index: math.hypot(
+                   x - points[index][0], y - points[index][1]))
+    return best, widths[best]
 
 
 def smooth(points, strength):
@@ -756,6 +1249,13 @@ def translate(spec, dx, dy):
         for point in spec.get(key) or []:
             point[0] += dx
             point[1] += dy
+    gradient = spec.get("fill_gradient")
+    if gradient:
+        for key in ("start", "end", "center"):
+            point = gradient.get(key)
+            if point:
+                point[0] += dx
+                point[1] += dy
     return spec
 
 
@@ -769,6 +1269,15 @@ def rotate(spec, angle, cx, cy):
             oy = point[1] - cy
             point[0] = cx + ox * cos_a - oy * sin_a
             point[1] = cy + ox * sin_a + oy * cos_a
+    gradient = spec.get("fill_gradient")
+    if gradient:
+        for key in ("start", "end", "center"):
+            point = gradient.get(key)
+            if point:
+                ox = point[0] - cx
+                oy = point[1] - cy
+                point[0] = cx + ox * cos_a - oy * sin_a
+                point[1] = cy + ox * sin_a + oy * cos_a
     return spec
 
 
@@ -778,6 +1287,23 @@ def scale(spec, sx, sy, cx, cy):
         for point in spec.get(key) or []:
             point[0] = cx + (point[0] - cx) * sx
             point[1] = cy + (point[1] - cy) * sy
+    gradient = spec.get("fill_gradient")
+    if gradient:
+        for key in ("start", "end", "center"):
+            point = gradient.get(key)
+            if point:
+                point[0] = cx + (point[0] - cx) * sx
+                point[1] = cy + (point[1] - cy) * sy
+        if "radius" in gradient:
+            gradient["radius"] = float(gradient["radius"]) * math.sqrt(
+                abs(sx * sy))
+    factor = math.sqrt(abs(sx * sy))
+    if abs(factor - 1.0) > 1e-9:
+        if spec.get("widths"):
+            spec["widths"] = [_clamp_width(value * factor)
+                              for value in spec["widths"]]
+        spec["width"] = max(MIN_WIDTH, min(
+            MAX_WIDTH, int(round(float(spec.get("width", DEFAULT_WIDTH)) * factor))))
     return spec
 
 
@@ -820,6 +1346,7 @@ def erase(stroke, cx, cy, radius, mode="touch"):
     if not survivors:
         return []
     handles_in, handles_out = handles(stroke)
+    widths = anchor_widths(stroke)
     runs = []
     current = [survivors[0]] if survivors else []
     for index in survivors[1:]:
@@ -839,6 +1366,7 @@ def erase(stroke, cx, cy, radius, mode="touch"):
         piece["points"] = [list(points[index]) for index in run]
         piece["handles_in"] = [list(handles_in[index]) for index in run]
         piece["handles_out"] = [list(handles_out[index]) for index in run]
+        piece["widths"] = [float(widths[index]) for index in run]
         pieces.append(piece)
     return pieces
 
@@ -847,8 +1375,11 @@ def _reverse(spec):
     """A clone of ``spec`` drawn from its other end (its handles are swapped)."""
     out = clone(spec)
     out["points"] = list(reversed(out["points"]))
-    out["handles_in"] = list(reversed(out["handles_out"]))
-    out["handles_out"] = list(reversed(out["handles_in"]))
+    old_in = out["handles_in"]
+    old_out = out["handles_out"]
+    out["handles_in"] = list(reversed(old_out))
+    out["handles_out"] = list(reversed(old_in))
+    out["widths"] = list(reversed(out.get("widths") or []))
     return out
 
 
@@ -864,6 +1395,8 @@ def _join(a, b, tolerance):
             merged["points"] = first["points"] + second["points"][1:]
             merged["handles_in"] = first["handles_in"] + second["handles_in"][1:]
             merged["handles_out"] = first["handles_out"] + second["handles_out"][1:]
+            merged["widths"] = ((first.get("widths") or [])
+                                + (second.get("widths") or [])[1:])
             merged["closed"] = False
             return merged
     return None
@@ -898,6 +1431,275 @@ def connect(strokes, tolerance=4.0):
     return result
 
 
+# ------------------------------------------------------- booleans and objects
+def _item_paint_paths(spec):
+    """Closed polygons covering an item's painted area."""
+    if is_fill(spec):
+        return fill_contour_paths(spec)
+    return stroke_area_paths(spec)
+
+
+def _trace_mask(mask):
+    """Link the boundary of a binary (``L``) mask into closed polygons.
+
+    Marching squares over pixel cells, joined at shared edge midpoints. The
+    result is in mask pixel coordinates and may contain several loops (outer
+    boundaries plus holes); callers convert and simplify.
+    """
+    width, height = mask.size
+    pixels = mask.load()
+
+    def inside(x, y):
+        return 0 <= x < width and 0 <= y < height and pixels[x, y] >= 128
+
+    segments = []
+    for y in range(-1, height):
+        for x in range(-1, width):
+            tl = inside(x, y)
+            tr = inside(x + 1, y)
+            br = inside(x + 1, y + 1)
+            bl = inside(x, y + 1)
+            code = (8 if tl else 0) | (4 if tr else 0) | (2 if br else 0) | (
+                1 if bl else 0)
+            if code in (0, 15):
+                continue
+            top = (x + 0.5, y)
+            right = (x + 1.0, y + 0.5)
+            bottom = (x + 0.5, y + 1.0)
+            left = (x, y + 0.5)
+            table = {
+                1: [(left, bottom)],
+                2: [(bottom, right)],
+                3: [(left, right)],
+                4: [(right, top)],
+                5: [(left, top), (bottom, right)],
+                6: [(bottom, top)],
+                7: [(left, top)],
+                8: [(top, left)],
+                9: [(top, bottom)],
+                10: [(top, right), (bottom, left)],
+                11: [(top, right)],
+                12: [(left, right)],
+                13: [(bottom, right)],
+                14: [(left, bottom)],
+            }
+            segments.extend(table.get(code, ()))
+
+    def key(point):
+        return (round(point[0], 6), round(point[1], 6))
+
+    adjacency = {}
+    for index, (start, end) in enumerate(segments):
+        adjacency.setdefault(key(start), []).append(index)
+        adjacency.setdefault(key(end), []).append(index)
+
+    used = [False] * len(segments)
+    loops = []
+    for index in range(len(segments)):
+        if used[index]:
+            continue
+        start, current = segments[index]
+        used[index] = True
+        loop = [start, current]
+        closed = False
+        while True:
+            if key(current) == key(loop[0]):
+                closed = True
+                break
+            next_index = None
+            for candidate in adjacency.get(key(current), ()):
+                if not used[candidate]:
+                    next_index = candidate
+                    break
+            if next_index is None:
+                break
+            used[next_index] = True
+            first, second = segments[next_index]
+            current = second if key(first) == key(current) else first
+            loop.append(current)
+        if closed and len(loop) >= 4:
+            loops.append(loop[:-1])
+    return loops
+
+
+def _polygon_area(points):
+    total = 0.0
+    for first, second in zip(points, points[1:] + points[:1]):
+        total += first[0] * second[1] - second[0] * first[1]
+    return abs(total) / 2.0
+
+
+def boolean(items, operation="union", max_dimension=1600, resolution=None):
+    """Combine selected items into one editable compound fill.
+
+    ``operation`` is ``"union"``, ``"subtract"``, ``"intersect"`` or
+    ``"exclude"``. The shapes are flattened, rasterised together at a bounded
+    resolution, then traced back into polyline contours, so the result stays
+    editable (anchors can be moved, the fill re-styled) if not mathematically
+    exact. Returns a fill spec, or ``None`` when nothing remains.
+    """
+    specs = [spec for spec in items if spec]
+    if len(specs) < 2:
+        return None
+    paths = [_item_paint_paths(spec) for spec in specs]
+    paths = [polygons for polygons in paths if polygons]
+    if len(paths) < 2:
+        return None
+    xs = [point[0] for polygons in paths for poly in polygons for point in poly]
+    ys = [point[1] for polygons in paths for poly in polygons for point in poly]
+    if not xs:
+        return None
+    left = math.floor(min(xs)) - 1
+    top = math.floor(min(ys)) - 1
+    span_x = max(1.0, math.ceil(max(xs)) + 1 - left)
+    span_y = max(1.0, math.ceil(max(ys)) + 1 - top)
+    if resolution is None:
+        resolution = min(2.0, max(0.5, max_dimension / max(span_x, span_y)))
+    size = (max(1, int(span_x * resolution)),
+            max(1, int(span_y * resolution)))
+    masks = []
+    for polygons in paths:
+        mask = Image.new("L", size, 0)
+        pen = ImageDraw.Draw(mask)
+        for polygon in polygons:
+            if len(polygon) >= 3:
+                pen.polygon(
+                    [((point[0] - left) * resolution,
+                      (point[1] - top) * resolution) for point in polygon],
+                    fill=255)
+        masks.append(mask)
+    combined = masks[0]
+    for mask in masks[1:]:
+        if operation == "union":
+            combined = ImageChops.lighter(combined, mask)
+        elif operation == "intersect":
+            combined = ImageChops.multiply(combined, mask)
+        elif operation == "subtract":
+            combined = ImageChops.subtract(combined, mask)
+        elif operation == "exclude":
+            combined = ImageChops.difference(combined, mask)
+        else:
+            return None
+    contours = []
+    for loop in _trace_mask(combined):
+        polygon = [[left + x / resolution, top + y / resolution]
+                   for x, y in loop]
+        polygon = _rdp(polygon, 0.75 / resolution)
+        if len(polygon) >= 3 and _polygon_area(polygon) >= 0.5:
+            contours.append({
+                "points": [[float(x), float(y)] for x, y in polygon],
+                "handles_in": [[float(x), float(y)] for x, y in polygon],
+                "handles_out": [[float(x), float(y)] for x, y in polygon],
+            })
+    if not contours:
+        return None
+    first = specs[0]
+    if is_fill(first):
+        color = first.get("color")
+        gradient = first.get("gradient")
+        opacity = first.get("opacity", 1.0)
+        blend = first.get("blend", "normal")
+    else:
+        color = first.get("color")
+        gradient = first.get("fill_gradient")
+        opacity = first.get("opacity", 1.0)
+        blend = first.get("blend", "normal")
+    return new_fill(contours, color, opacity=opacity, even_odd=True,
+                    gradient=gradient, blend=blend)
+
+
+def duplicate_item(spec, dx=0.0, dy=0.0):
+    """A translated deep copy of a vector item."""
+    copy = clone_fill(spec) if is_fill(spec) else clone(spec)
+    if copy is not None and (dx or dy):
+        item_translate(copy, dx, dy)
+    return copy
+
+
+def align_items(specs, edge):
+    """Align items to one edge of their combined bounds (in place)."""
+    specs = [spec for spec in specs if spec]
+    boxes = [(spec, item_bounds(spec)) for spec in specs]
+    boxes = [(spec, box) for spec, box in boxes if box]
+    if not boxes:
+        return specs
+    left = min(box[0] for _spec, box in boxes)
+    top = min(box[1] for _spec, box in boxes)
+    right = max(box[2] for _spec, box in boxes)
+    bottom = max(box[3] for _spec, box in boxes)
+    for spec, box in boxes:
+        dx = dy = 0.0
+        if edge == "left":
+            dx = left - box[0]
+        elif edge == "right":
+            dx = right - box[2]
+        elif edge == "top":
+            dy = top - box[1]
+        elif edge == "bottom":
+            dy = bottom - box[3]
+        elif edge == "hcenter":
+            dx = (left + right) / 2.0 - (box[0] + box[2]) / 2.0
+        elif edge == "vcenter":
+            dy = (top + bottom) / 2.0 - (box[1] + box[3]) / 2.0
+        if dx or dy:
+            item_translate(spec, dx, dy)
+    return specs
+
+
+def distribute_items(specs, axis="h"):
+    """Space items evenly between the first and last along ``axis`` (in place)."""
+    boxes = [(spec, item_bounds(spec)) for spec in specs if spec]
+    boxes = [(spec, box) for spec, box in boxes if box]
+    if len(boxes) < 3:
+        return [spec for spec, _box in boxes]
+    if axis == "v":
+        boxes.sort(key=lambda entry: (entry[1][1] + entry[1][3]) / 2.0)
+        start = (boxes[0][1][1] + boxes[0][1][3]) / 2.0
+        end = (boxes[-1][1][1] + boxes[-1][1][3]) / 2.0
+    else:
+        boxes.sort(key=lambda entry: (entry[1][0] + entry[1][2]) / 2.0)
+        start = (boxes[0][1][0] + boxes[0][1][2]) / 2.0
+        end = (boxes[-1][1][0] + boxes[-1][1][2]) / 2.0
+    step = (end - start) / (len(boxes) - 1)
+    for index, (spec, box) in enumerate(boxes[1:-1], start=1):
+        target = start + step * index
+        if axis == "v":
+            current = (box[1] + box[3]) / 2.0
+            if abs(target - current) > 1e-9:
+                item_translate(spec, 0.0, target - current)
+        else:
+            current = (box[0] + box[2]) / 2.0
+            if abs(target - current) > 1e-9:
+                item_translate(spec, target - current, 0.0)
+    return [spec for spec, _box in boxes]
+
+
+def reorder_items(items, indices, position):
+    """Return ``items`` with ``indices`` moved to ``position``.
+
+    ``position`` is ``"front"``, ``"back"``, ``"forward"`` or ``"backward"``.
+    ``items`` is any ordered list of specs (a layer's strokes or fills).
+    """
+    items = list(items)
+    selected = [index for index in sorted(set(indices))
+                if 0 <= index < len(items)]
+    if not selected:
+        return items
+    chosen = [items[index] for index in selected]
+    if position in ("front", "back"):
+        rest = [spec for index, spec in enumerate(items) if index not in selected]
+        return (rest + chosen) if position == "front" else (chosen + rest)
+    if position == "forward":
+        for index in reversed(selected):
+            if index + 1 < len(items) and (index + 1) not in selected:
+                items[index], items[index + 1] = items[index + 1], items[index]
+    elif position == "backward":
+        for index in selected:
+            if index - 1 >= 0 and (index - 1) not in selected:
+                items[index], items[index - 1] = items[index - 1], items[index]
+    return items
+
+
 # ------------------------------------------------------------- filled areas
 def normalize_fill(spec):
     """Coerce ``spec`` to a valid compound fill spec (or ``None``).
@@ -923,12 +1725,15 @@ def normalize_fill(spec):
         })
     if not contours:
         return None
+    blend = spec.get("blend")
     return {
         "contours": contours,
         "color": str(spec.get("color") or "#000000"),
+        "gradient": normalize_gradient(spec.get("gradient")),
         "opacity": _opacity(spec),
         "antialias": bool(spec.get("antialias", True)),
         "even_odd": bool(spec.get("even_odd", True)),
+        "blend": blend if blend in BLEND_MODES else "normal",
     }
 
 
@@ -941,14 +1746,17 @@ def clone_fill(spec):
         contour["points"] = [[x, y] for x, y in contour["points"]]
         contour["handles_in"] = [[x, y] for x, y in contour["handles_in"]]
         contour["handles_out"] = [[x, y] for x, y in contour["handles_out"]]
+    normalized["gradient"] = _clone_gradient(normalized.get("gradient"))
     return normalized
 
 
-def new_fill(contours, color, opacity=1.0, antialias=True, even_odd=True):
+def new_fill(contours, color, opacity=1.0, antialias=True, even_odd=True,
+             gradient=None, blend="normal"):
     """Build a normalised compound fill from ``contours``."""
     return normalize_fill({
         "contours": contours, "color": color, "opacity": opacity,
         "antialias": antialias, "even_odd": even_odd,
+        "gradient": gradient, "blend": blend,
     })
 
 
@@ -981,6 +1789,13 @@ def translate_fill(spec, dx, dy):
             for point in contour.get(key) or []:
                 point[0] += dx
                 point[1] += dy
+    gradient = spec.get("gradient")
+    if gradient:
+        for key in ("start", "end", "center"):
+            point = gradient.get(key)
+            if point:
+                point[0] += dx
+                point[1] += dy
     return spec
 
 
@@ -991,6 +1806,16 @@ def scale_fill(spec, sx, sy, cx, cy):
             for point in contour.get(key) or []:
                 point[0] = cx + (point[0] - cx) * sx
                 point[1] = cy + (point[1] - cy) * sy
+    gradient = spec.get("gradient")
+    if gradient:
+        for key in ("start", "end", "center"):
+            point = gradient.get(key)
+            if point:
+                point[0] = cx + (point[0] - cx) * sx
+                point[1] = cy + (point[1] - cy) * sy
+        if "radius" in gradient:
+            gradient["radius"] = float(gradient["radius"]) * math.sqrt(
+                abs(sx * sy))
     return spec
 
 
@@ -1005,12 +1830,22 @@ def rotate_fill(spec, angle, cx, cy):
                 oy = point[1] - cy
                 point[0] = cx + ox * cos_a - oy * sin_a
                 point[1] = cy + ox * sin_a + oy * cos_a
+    gradient = spec.get("gradient")
+    if gradient:
+        for key in ("start", "end", "center"):
+            point = gradient.get(key)
+            if point:
+                ox = point[0] - cx
+                oy = point[1] - cy
+                point[0] = cx + ox * cos_a - oy * sin_a
+                point[1] = cy + ox * sin_a + oy * cos_a
     return spec
 
 
 def describe_fill(spec):
     """A short one-line label for a fill, for the layer list."""
-    return f"{len(spec.get('contours') or [])} contour(s), fill"
+    count = len(spec.get("contours") or [])
+    return f"{count} contour fill"
 
 
 # --------------------------------------------------------------- item editing
@@ -1246,6 +2081,18 @@ def _matrix_points(container, matrix, keys=("points", "handles_in", "handles_out
 def transform(spec, matrix):
     """Map a stroke's anchors and handles through an affine ``matrix`` (in place)."""
     _matrix_points(spec, matrix)
+    gradient = spec.get("fill_gradient")
+    if gradient:
+        for key in ("start", "end", "center"):
+            point = gradient.get(key)
+            if point:
+                x = point[0]
+                y = point[1]
+                a, b, c, d, e, f = matrix
+                point[0] = a * x + c * y + e
+                point[1] = b * x + d * y + f
+        if "radius" in gradient:
+            gradient["radius"] = float(gradient["radius"]) * matrix_scale(matrix)
     factor = matrix_scale(matrix)
     if abs(factor - 1.0) > 1e-9:
         scale_width(spec, factor)
@@ -1256,6 +2103,18 @@ def transform_fill(spec, matrix):
     """Map every contour point and handle of a fill through ``matrix`` (in place)."""
     for contour in spec.get("contours") or []:
         _matrix_points(contour, matrix)
+    gradient = spec.get("gradient")
+    if gradient:
+        a, b, c, d, e, f = matrix
+        for key in ("start", "end", "center"):
+            point = gradient.get(key)
+            if point:
+                x = point[0]
+                y = point[1]
+                point[0] = a * x + c * y + e
+                point[1] = b * x + d * y + f
+        if "radius" in gradient:
+            gradient["radius"] = float(gradient["radius"]) * matrix_scale(matrix)
     return spec
 
 
@@ -1266,19 +2125,24 @@ def item_transform(spec, matrix):
 def item_snapshot(spec):
     """A restorable copy of the item's geometry (for a transform gesture)."""
     if is_fill(spec):
-        return {"contours": [
-            {
-                "points": [[p[0], p[1]] for p in contour.get("points") or []],
-                "handles_in": [[p[0], p[1]] for p in handles(contour)[0]],
-                "handles_out": [[p[0], p[1]] for p in handles(contour)[1]],
-            }
-            for contour in spec.get("contours") or []
-        ]}
+        return {
+            "contours": [
+                {
+                    "points": [[p[0], p[1]] for p in contour.get("points") or []],
+                    "handles_in": [[p[0], p[1]] for p in handles(contour)[0]],
+                    "handles_out": [[p[0], p[1]] for p in handles(contour)[1]],
+                }
+                for contour in spec.get("contours") or []
+            ],
+            "gradient": _clone_gradient(spec.get("gradient")),
+        }
     handles_in, handles_out = handles(spec)
     return {
         "points": [[p[0], p[1]] for p in spec.get("points") or []],
         "handles_in": [[p[0], p[1]] for p in handles_in],
         "handles_out": [[p[0], p[1]] for p in handles_out],
+        "widths": [float(value) for value in anchor_widths(spec)],
+        "fill_gradient": _clone_gradient(spec.get("fill_gradient")),
     }
 
 
@@ -1293,15 +2157,35 @@ def item_restore(spec, snapshot):
             }
             for contour in snapshot["contours"]
         ]
+        if "gradient" in snapshot:
+            spec["gradient"] = _clone_gradient(snapshot["gradient"])
     else:
         spec["points"] = [[p[0], p[1]] for p in snapshot["points"]]
         spec["handles_in"] = [[p[0], p[1]] for p in snapshot["handles_in"]]
         spec["handles_out"] = [[p[0], p[1]] for p in snapshot["handles_out"]]
+        if "widths" in snapshot:
+            spec["widths"] = [float(value) for value in snapshot["widths"]]
+        if "fill_gradient" in snapshot:
+            spec["fill_gradient"] = _clone_gradient(snapshot["fill_gradient"])
 
 
 def item_width(spec):
     """The item's width (a fill has none; used for width-preserving scaling)."""
     return spec.get("width")
+
+
+def item_set_anchor_width(spec, index, width):
+    """Set the width profile value at global anchor ``index``."""
+    if is_fill(spec):
+        return False
+    return set_anchor_width(spec, index, width)
+
+
+def item_width_at(spec, x, y):
+    """``(global_index, width)`` of the nearest anchor, or ``(None, None)``."""
+    if is_fill(spec):
+        return None, None
+    return width_at(spec, x, y)
 
 
 # ---------------------------------------------------------------- rendering
@@ -1358,6 +2242,140 @@ def _draw_polyline(pen, points, color, width, closed, cap, join):
             _square_cap(pen, x, y, dx, dy, radius, color)
 
 
+def _sample_stops(stops, t):
+    """The RGB colour at ``t`` (0..1) interpolated between gradient stops."""
+    if t <= stops[0][0]:
+        return rgba(stops[0][1])[:3]
+    if t >= stops[-1][0]:
+        return rgba(stops[-1][1])[:3]
+    for index in range(1, len(stops)):
+        left_offset, left_color = stops[index - 1]
+        right_offset, right_color = stops[index]
+        if t <= right_offset:
+            span = right_offset - left_offset
+            local = 0.0 if span <= 1e-9 else (t - left_offset) / span
+            first = rgba(left_color)
+            second = rgba(right_color)
+            return tuple(
+                first[channel] + (second[channel] - first[channel]) * local
+                for channel in range(3)
+            )
+    return rgba(stops[-1][1])[:3]
+
+
+def _gradient_image(gradient, size, left, top, scale=1.0):
+    """Render a gradient paint over a sprite-sized RGB image.
+
+    Pixel centres are mapped back to document coordinates through ``left`` /
+    ``top`` and ``scale`` so a linear or radial gradient stays locked to the
+    artwork, not to the sprite's clipped box.
+    """
+    width, height = size
+    if width <= 0 or height <= 0 or not gradient:
+        return Image.new("RGB", (max(1, width), max(1, height)), (0, 0, 0))
+    xs = (np.arange(width, dtype=np.float32) + 0.5) / float(scale) + left
+    ys = (np.arange(height, dtype=np.float32) + 0.5) / float(scale) + top
+    grid_x, grid_y = np.meshgrid(xs, ys)
+    if gradient.get("type") == "radial":
+        center = gradient.get("center") or (left, top)
+        radius = max(1e-6, float(gradient.get("radius", 1.0)))
+        t = np.sqrt((grid_x - center[0]) ** 2
+                    + (grid_y - center[1]) ** 2) / radius
+    else:
+        start = gradient.get("start") or (left, top)
+        end = gradient.get("end") or (start[0] + 1.0, start[1])
+        dx = end[0] - start[0]
+        dy = end[1] - start[1]
+        length_sq = max(1e-9, dx * dx + dy * dy)
+        t = ((grid_x - start[0]) * dx + (grid_y - start[1]) * dy) / length_sq
+    t = np.clip(t, 0.0, 1.0)
+    offsets = np.array([stop[0] for stop in gradient["stops"]], dtype=np.float32)
+    colors = np.array([rgba(stop[1])[:3] for stop in gradient["stops"]],
+                      dtype=np.float32)
+    index = np.clip(np.searchsorted(offsets, t, side="right") - 1,
+                    0, len(offsets) - 2)
+    span = np.maximum(1e-6, offsets[index + 1] - offsets[index])
+    local = ((t - offsets[index]) / span)[..., None]
+    rgb = colors[index] + (colors[index + 1] - colors[index]) * local
+    return Image.fromarray(np.clip(rgb, 0, 255).astype(np.uint8), "RGB")
+
+
+def _arrow_polygon(kind, tip, tangent, size):
+    """A marker polygon (or circle bounds) at ``tip`` pointing along ``tangent``."""
+    length = math.hypot(tangent[0], tangent[1])
+    if length <= 1e-9:
+        tx, ty = 1.0, 0.0
+    else:
+        tx, ty = tangent[0] / length, tangent[1] / length
+    nx, ny = -ty, tx
+    half = size / 2.0
+    if kind == "triangle":
+        return [
+            (tip[0], tip[1]),
+            (tip[0] - tx * size + nx * half, tip[1] - ty * size + ny * half),
+            (tip[0] - tx * size - nx * half, tip[1] - ty * size - ny * half),
+        ]
+    if kind == "stealth":
+        return [
+            (tip[0], tip[1]),
+            (tip[0] - tx * size + nx * half, tip[1] - ty * size + ny * half),
+            (tip[0] - tx * size * 0.62, tip[1] - ty * size * 0.62),
+            (tip[0] - tx * size - nx * half, tip[1] - ty * size - ny * half),
+        ]
+    if kind == "bar":
+        thickness = max(1.0, size * 0.25)
+        return [
+            (tip[0] + nx * size - tx * thickness / 2.0,
+             tip[1] + ny * size - ty * thickness / 2.0),
+            (tip[0] + nx * size + tx * thickness / 2.0,
+             tip[1] + ny * size + ty * thickness / 2.0),
+            (tip[0] - nx * size + tx * thickness / 2.0,
+             tip[1] - ny * size + ty * thickness / 2.0),
+            (tip[0] - nx * size - tx * thickness / 2.0,
+             tip[1] - ny * size - ty * thickness / 2.0),
+        ]
+    center = (tip[0] - tx * half, tip[1] - ty * half)
+    if kind == "circle":
+        return ("ellipse", (center[0] - half, center[1] - half,
+                            center[0] + half, center[1] + half))
+    return ("rect", (center[0] - half, center[1] - half,
+                     center[0] + half, center[1] + half))
+
+
+def _draw_arrows(pen, spec, left, top, scale, color):
+    """Draw the start/end markers onto a supersampled sprite."""
+    samples, closed = _centerline(spec)
+    if closed or len(samples) < 2:
+        return
+    size = _arrow_size(spec) * scale
+
+    def sprite_point(sample):
+        return ((sample[0] - left) * scale, (sample[1] - top) * scale)
+
+    start = sprite_point(samples[0])
+    after = sprite_point(samples[1])
+    end = sprite_point(samples[-1])
+    before = sprite_point(samples[-2])
+    markers = (
+        (spec.get("arrow_start", "none"), start,
+         (start[0] - after[0], start[1] - after[1])),
+        (spec.get("arrow_end", "none"), end,
+         (end[0] - before[0], end[1] - before[1])),
+    )
+    for kind, tip, tangent in markers:
+        if kind == "none":
+            continue
+        shape = _arrow_polygon(kind, tip, tangent, max(2.0, size))
+        if isinstance(shape, tuple):
+            label, box = shape
+            if label == "ellipse":
+                pen.ellipse(box, fill=color)
+            else:
+                pen.rectangle(box, fill=color)
+        else:
+            pen.polygon(shape, fill=color)
+
+
 def _render_sprite(spec):
     """Render ``spec`` to an RGBA sprite; return ``(sprite, left, top)`` in doc px."""
     key = _stroke_sprite_key(spec)
@@ -1383,18 +2401,96 @@ def _render_sprite(spec):
     sprite = Image.new("RGBA", (width_px * scale, height_px * scale), (0, 0, 0, 0))
     pen = ImageDraw.Draw(sprite)
     fill = spec.get("fill")
-    if fill and bool(spec.get("closed", False)) and len(points) >= 3:
-        pen.polygon(
-            points, fill=rgba(fill, int(round(255 * _opacity(spec)))))
-    _draw_polyline(
-        pen, points, color, max(1, width * scale),
-        bool(spec.get("closed", False)), spec.get("cap", "round"),
-        spec.get("join", "round"),
-    )
+    gradient = spec.get("fill_gradient")
+    closed = bool(spec.get("closed", False))
+    fill_points = [
+        ((x - left) * scale, (y - top) * scale)
+        for x, y in (points if closed else flatten(spec, closed=True))
+    ]
+    if (fill or gradient) and len(fill_points) >= 3:
+        if gradient:
+            mask = Image.new("L", sprite.size, 0)
+            ImageDraw.Draw(mask).polygon(fill_points, fill=255)
+            paint = _gradient_image(
+                gradient, sprite.size, left, top, scale).convert("RGBA")
+            paint.putalpha(mask)
+            sprite.alpha_composite(paint)
+        else:
+            pen.polygon(
+                fill_points,
+                fill=rgba(fill, int(round(255 * _opacity(spec)))))
+    variable = has_width_profile(spec)
+    dashed = bool(dash_pattern(spec))
+    arrows = (spec.get("arrow_start", "none") != "none"
+              or spec.get("arrow_end", "none") != "none")
+    if variable or dashed:
+        for polygon in outline_polygons(spec):
+            if len(polygon) >= 3:
+                pen.polygon(
+                    [((x - left) * scale, (y - top) * scale)
+                     for x, y in polygon],
+                    fill=color)
+    else:
+        _draw_polyline(
+            pen, points, color, max(1, width * scale), closed,
+            spec.get("cap", "round"), spec.get("join", "round"),
+        )
+    if arrows:
+        _draw_arrows(pen, spec, left, top, scale, color)
     if scale > 1:
         sprite = antialias.downscale(sprite, scale)
     _sprite_store(key, sprite, left, top)
     return sprite, left, top
+
+
+def _blend_over(base, overlay, mode):
+    """Source-over ``overlay`` onto ``base`` (RGBA) using a blend ``mode``."""
+    if mode in (None, "", "normal"):
+        return None
+    from . import brush
+    base = base.convert("RGBA")
+    overlay = overlay.convert("RGBA")
+    base_rgb = base.convert("RGB")
+    overlay_rgb = overlay.convert("RGB")
+    mixed = np.asarray(brush._blend(mode, base_rgb, overlay_rgb),
+                       dtype=np.float32)
+    base_arr = np.asarray(base_rgb, dtype=np.float32)
+    base_alpha = (np.asarray(base.getchannel("A"), dtype=np.float32)
+                  / 255.0)[..., None]
+    src_alpha = (np.asarray(overlay.getchannel("A"), dtype=np.float32)
+                 / 255.0)[..., None]
+    out_alpha = src_alpha + base_alpha * (1.0 - src_alpha)
+    rgb = (mixed * src_alpha + base_arr * base_alpha * (1.0 - src_alpha))
+    rgb = np.clip(rgb / np.maximum(out_alpha, 1e-6), 0.0, 255.0)
+    out = np.empty((base.height, base.width, 4), dtype=np.uint8)
+    out[..., :3] = rgb.astype(np.uint8)
+    out[..., 3] = np.clip(out_alpha[..., 0] * 255.0, 0, 255).astype(np.uint8)
+    return Image.fromarray(out, "RGBA")
+
+
+def _composite_sprite(image, sprite, left, top, offset, blend="normal"):
+    """Composite a sprite onto ``image`` at its document origin."""
+    ox, oy = offset
+    dest_x = left - int(round(ox))
+    dest_y = top - int(round(oy))
+    ix0 = max(0, dest_x)
+    iy0 = max(0, dest_y)
+    ix1 = min(image.width, dest_x + sprite.width)
+    iy1 = min(image.height, dest_y + sprite.height)
+    if ix1 <= ix0 or iy1 <= iy0:
+        return image
+    crop = sprite.crop((ix0 - dest_x, iy0 - dest_y,
+                        ix1 - dest_x, iy1 - dest_y))
+    if blend in (None, "", "normal"):
+        image.alpha_composite(crop, dest=(ix0, iy0))
+        return image
+    region = image.crop((ix0, iy0, ix1, iy1))
+    blended = _blend_over(region, crop, blend)
+    if blended is not None:
+        image.paste(blended, (ix0, iy0))
+    else:
+        image.alpha_composite(crop, dest=(ix0, iy0))
+    return image
 
 
 def paste(image, spec, offset=(0, 0)):
@@ -1410,18 +2506,8 @@ def paste(image, spec, offset=(0, 0)):
     if image.mode != "RGBA":
         image = image.convert("RGBA")
     sprite, left, top = _render_sprite(spec)
-    ox, oy = offset
-    dest_x = left - int(round(ox))
-    dest_y = top - int(round(oy))
-    ix0 = max(0, dest_x)
-    iy0 = max(0, dest_y)
-    ix1 = min(image.width, dest_x + sprite.width)
-    iy1 = min(image.height, dest_y + sprite.height)
-    if ix1 <= ix0 or iy1 <= iy0:
-        return image
-    crop = sprite.crop((ix0 - dest_x, iy0 - dest_y, ix1 - dest_x, iy1 - dest_y))
-    image.alpha_composite(crop, dest=(ix0, iy0))
-    return image
+    return _composite_sprite(image, sprite, left, top, offset,
+                             spec.get("blend", "normal"))
 
 
 def _fill_mask(polygons, size, scale, left, top, even_odd):
@@ -1520,9 +2606,15 @@ def _fill_sprite(spec):
     opacity = _opacity(spec)
     if opacity < 1.0:
         mask = mask.point(lambda value: int(value * opacity))
-    sprite = Image.new("RGBA", (width_px, height_px),
-                       rgba(spec.get("color", "#000000")))
-    sprite.putalpha(mask)
+    gradient = spec.get("gradient")
+    if gradient:
+        sprite = _gradient_image(
+            gradient, (width_px, height_px), left, top, 1.0).convert("RGBA")
+        sprite.putalpha(mask)
+    else:
+        sprite = Image.new("RGBA", (width_px, height_px),
+                           rgba(spec.get("color", "#000000")))
+        sprite.putalpha(mask)
     _sprite_store(key, sprite, left, top)
     return sprite, left, top
 
@@ -1537,15 +2629,5 @@ def paste_fill(image, spec, offset=(0, 0)):
     if rendered is None:
         return image
     sprite, left, top = rendered
-    ox, oy = offset
-    dest_x = left - int(round(ox))
-    dest_y = top - int(round(oy))
-    ix0 = max(0, dest_x)
-    iy0 = max(0, dest_y)
-    ix1 = min(image.width, dest_x + sprite.width)
-    iy1 = min(image.height, dest_y + sprite.height)
-    if ix1 <= ix0 or iy1 <= iy0:
-        return image
-    crop = sprite.crop((ix0 - dest_x, iy0 - dest_y, ix1 - dest_x, iy1 - dest_y))
-    image.alpha_composite(crop, dest=(ix0, iy0))
-    return image
+    return _composite_sprite(image, sprite, left, top, offset,
+                             spec.get("blend", "normal"))

@@ -528,6 +528,7 @@ class PaintApp:
         self._filter_sel = None
         self._text_sel = None
         self._path_sel = None
+        self._vector_sel = None
         self._group_sel = None
         self._group_filter_sel = None
         # Visibility captured by :meth:`isolate_layer` so it can be put back by
@@ -993,6 +994,11 @@ class PaintApp:
             on_path_edit=self._on_path_edit,
             on_path_remove=self.remove_selected_path,
             on_path_move=self.move_selected_path,
+            on_vector_select=self._on_vector_select,
+            on_vector_edit=self._on_vector_edit,
+            on_vector_remove=self.remove_selected_vector,
+            on_vector_duplicate=self.duplicate_selected_vector,
+            on_vector_move=self.move_selected_vector,
             on_apply_filters=self.bake_filters,
             on_rasterize_texts=self.rasterize_selected_texts,
             on_rasterize_paths=self.rasterize_selected_paths,
@@ -2564,6 +2570,7 @@ class PaintApp:
         self._validate_filter_sel()
         self._validate_text_sel()
         self._validate_path_sel()
+        self._validate_vector_sel()
         self._validate_group_sel()
         self._validate_group_filter_sel()
         self.layer_panel.refresh(
@@ -2571,6 +2578,7 @@ class PaintApp:
             filter_selection=self._filter_sel,
             text_selection=self._text_sel,
             path_selection=self._path_sel,
+            vector_selection=self._vector_sel,
             group_selection=self._group_sel,
             groups=self.current.groups,
             group_filter_selection=self._group_filter_sel,
@@ -2932,16 +2940,33 @@ class PaintApp:
         if not (0 <= path_index < len(self.layers[layer_index].paths)):
             self._path_sel = None
 
+    def _validate_vector_sel(self):
+        """Drop the vector selection when it no longer points at a real object."""
+        sel = self._vector_sel
+        if sel is None:
+            return
+        layer_index, item_index = sel
+        if not (0 <= layer_index < len(self.layers)):
+            self._vector_sel = None
+            return
+        layer = self.layers[layer_index]
+        total = len(getattr(layer, "strokes", None) or []) + len(
+            getattr(layer, "fills", None) or [])
+        if not (0 <= item_index < total):
+            self._vector_sel = None
+
     def _on_layer_select(self, index):
         self.active = index
         self._filter_sel = None
         self._text_sel = None
         self._path_sel = None
+        self._vector_sel = None
         self._group_sel = None
         self._group_filter_sel = None
         self.area.set_outline_group(None)
         self.drawing.commit_text()
         self.drawing.finish_path()
+        self.drawing.clear_vector_selection()
         self.layer_panel.set_opacity(self.active_layer().opacity)
         self.layer_panel.update_mask_state(self.active_layer())
         self._report_layer()
@@ -4732,6 +4757,7 @@ class PaintApp:
         """Select a text row in the layer panel and make its layer active."""
         self.active = layer_index
         self._text_sel = (layer_index, text_index)
+        self._vector_sel = None
         self._path_sel = None
         self._filter_sel = None
         self._group_sel = None
@@ -4861,6 +4887,7 @@ class PaintApp:
         """Select a path row in the layer panel and make its layer active."""
         self.active = layer_index
         self._path_sel = (layer_index, path_index)
+        self._vector_sel = None
         self._text_sel = None
         self._filter_sel = None
         self._group_sel = None
@@ -4982,6 +5009,108 @@ class PaintApp:
             spec["hidden"] = True
         layer.invalidate_paths()
         self._path_sel = (self.layers.index(layer), index)
+        self._refresh_layer_list()
+        self.render()
+
+    def _vector_target(self):
+        """The ``(layer, item_index)`` of the selected vector object, or ``None``."""
+        sel = self._vector_sel
+        if sel is None:
+            return None
+        layer_index, item_index = sel
+        if not (0 <= layer_index < len(self.layers)):
+            return None
+        layer = self.layers[layer_index]
+        total = len(getattr(layer, "strokes", None) or []) + len(
+            getattr(layer, "fills", None) or [])
+        if not (0 <= item_index < total):
+            return None
+        return layer, item_index
+
+    def _on_vector_select(self, layer_index, item_index):
+        """Select a vector object row and open the Vector tool's Edit mode."""
+        if not (0 <= layer_index < len(self.layers)):
+            return
+        layer = self.layers[layer_index]
+        self.active = layer_index
+        self._vector_sel = (layer_index, item_index)
+        self._path_sel = None
+        self._text_sel = None
+        self._filter_sel = None
+        self._group_sel = None
+        self._group_filter_sel = None
+        self.area.set_outline_group(None)
+        self.drawing.commit_text()
+        self.drawing.finish_path()
+        self.drawing.select_vector_item(layer, item_index, edit=True)
+        self.layer_panel.set_opacity(layer.opacity)
+        self.layer_panel.update_mask_state(layer)
+        # Do not rebuild the layer list here: this callback runs from a row's
+        # click/double-click, and replacing the row widgets would make Tk miss
+        # the second click (and can swallow the right-click menu). The panel
+        # already highlights the clicked row, and canvas selections call
+        # ``select_vector_row`` from the drawing controller instead.
+        if hasattr(self.layer_panel, "select_vector_row"):
+            self.layer_panel.select_vector_row(layer_index, item_index)
+        self._report_layer()
+        self.render()
+
+    def _on_vector_edit(self, layer_index, item_index):
+        """Double-clicking a vector row opens it for editing."""
+        self._on_vector_select(layer_index, item_index)
+
+    def remove_selected_vector(self):
+        """Remove the selected vector stroke/fill from its layer."""
+        target = self._vector_target()
+        if target is None:
+            self.set_result("Select a vector object first.")
+            return
+        layer, index = target
+        if layer.is_locked():
+            self._active_layer_locked()
+            return
+        self.drawing.commit_text()
+        self.drawing.finish_path()
+        self.drawing.select_vector_item(layer, index, edit=False)
+        self.drawing.on_vector_action("delete", {"source": "layers"})
+        self._vector_sel = None
+        self._refresh_layer_list()
+        self.render()
+
+    def duplicate_selected_vector(self):
+        """Copy the selected vector object, offset slightly from the original."""
+        target = self._vector_target()
+        if target is None:
+            self.set_result("Select a vector object first.")
+            return
+        layer, index = target
+        if layer.is_locked():
+            self._active_layer_locked()
+            return
+        self.drawing.select_vector_item(layer, index, edit=False)
+        self.drawing.on_vector_action("duplicate", {"source": "layers"})
+        if self.drawing._vector_sel is not None:
+            self._vector_sel = (self.layers.index(layer),
+                                self.drawing._vector_sel)
+        self._refresh_layer_list()
+        self.render()
+
+    def move_selected_vector(self, delta):
+        """Move the selected vector object forward (``1``) or backward (``-1``)."""
+        target = self._vector_target()
+        if target is None:
+            self.set_result("Select a vector object first.")
+            return
+        layer, index = target
+        if layer.is_locked():
+            self._active_layer_locked()
+            return
+        self.drawing.select_vector_item(layer, index, edit=False)
+        action = "forward" if delta >= 0 else "backward"
+        self.drawing.on_vector_action(action, {"source": "layers"})
+        if self.drawing._vector_sel is not None:
+            self._vector_sel = (self.layers.index(layer),
+                                self.drawing._vector_sel)
         self._refresh_layer_list()
         self.render()
 

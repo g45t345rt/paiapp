@@ -8,7 +8,7 @@ sys.path.insert(0, ROOT)
 
 import math  # noqa: E402
 
-from paintapp import vector  # noqa: E402
+from paintapp import shape, vector  # noqa: E402
 from paintapp.document import Canvas, Layer  # noqa: E402
 
 FAILED = []
@@ -556,6 +556,191 @@ def test_item_handle_pairs_from_a_curve():
     stubs = vector.item_handle_pairs(spec)
     check("one handle stub", len(stubs), 1)
     check("stub reaches the handle", stubs[0][2:], [0.0, 8.0])
+
+
+def test_variable_width_profile():
+    spec = vector.new_stroke([[8, 32], [56, 32]], 6, "#000000",
+                             widths=[2, 20])
+    check("profile stored", spec["widths"], [2.0, 20.0])
+    check("profile detected", vector.has_width_profile(spec), True)
+    left, top, right, bottom = vector.bounds(spec)
+    check("bounds use the widest anchor", bottom - top, 22.0)
+    layer = Layer("v", (64, 64), (0, 0, 0, 0))
+    vector.paste(layer.image, spec, (0, 0))
+    check("thin end is only on the line",
+          layer.image.getpixel((10, 26))[3], 0)
+    check("thick end reaches well off the line",
+          layer.image.getpixel((54, 26))[3], 255)
+
+
+def test_width_profile_survives_split():
+    spec = vector.new_stroke([[0, 0], [100, 0]], 6, "#000000",
+                             widths=[2, 20])
+    vector.split_segment(spec, 0, 0.5)
+    check("split interpolates width", spec["widths"][1], 11.0)
+
+
+def test_dash_runs_and_gaps():
+    spec = vector.new_stroke([[0, 10], [100, 10]], 4, "#000000",
+                             dash=[10, 10], cap="butt")
+    runs = vector.outline_polygons(spec)
+    check("dash yields separate runs", len(runs), 5)
+    layer = Layer("v", (120, 20), (0, 0, 0, 0))
+    vector.paste(layer.image, spec, (0, 0))
+    check("ink on a dash", layer.image.getpixel((5, 10))[3] > 0, True)
+    check("gap stays clear", layer.image.getpixel((15, 10))[3], 0)
+
+
+def test_arrow_marker_adds_ink():
+    plain = vector.new_stroke([[8, 32], [56, 32]], 4, "#000000")
+    marker = vector.new_stroke([[8, 32], [56, 32]], 4, "#000000",
+                               arrow_end="triangle")
+    a = Layer("v", (64, 64), (0, 0, 0, 0))
+    b = Layer("v", (64, 64), (0, 0, 0, 0))
+    vector.paste(a.image, plain, (0, 0))
+    vector.paste(b.image, marker, (0, 0))
+    check("marker widens the ink",
+          b.image.getchannel("A").getbbox()[3]
+          > a.image.getchannel("A").getbbox()[3], True)
+
+
+def test_gradient_fill_paints_stops():
+    gradient = {
+        "type": "linear", "stops": [[0, "#ff0000"], [1, "#0000ff"]],
+        "start": [10, 10], "end": [50, 10],
+    }
+    spec = vector.new_stroke([[10, 10], [50, 10], [50, 50], [10, 50]], 2,
+                             "#000000", closed=True, fill_gradient=gradient)
+    layer = Layer("v", (64, 64), (0, 0, 0, 0))
+    vector.paste(layer.image, spec, (0, 0))
+    left = layer.image.getpixel((14, 30))
+    right = layer.image.getpixel((46, 30))
+    check("gradient start is red", left[0] > left[2], True)
+    check("gradient end is blue", right[2] > right[0], True)
+
+
+def _square_fill_spec(left, top, right, bottom):
+    contour = {"points": [[left, top], [right, top], [right, bottom],
+                         [left, bottom]]}
+    return vector.new_fill([contour], "#000000")
+
+
+def test_boolean_operations():
+    first = _square_fill_spec(5, 5, 35, 35)
+    second = _square_fill_spec(20, 20, 50, 50)
+    union = vector.boolean([first, second], "union")
+    intersect = vector.boolean([first, second], "intersect")
+    subtract = vector.boolean([first, second], "subtract")
+    exclude = vector.boolean([first, second], "exclude")
+    check("union exists", union is not None, True)
+    check("intersect exists", intersect is not None, True)
+    check("subtract exists", subtract is not None, True)
+    check("exclude exists", exclude is not None, True)
+
+    def ink(spec, points):
+        layer = Layer("v", (64, 64), (0, 0, 0, 0))
+        vector.paste_fill(layer.image, spec, (0, 0))
+        return [layer.image.getpixel(point)[3] > 0 for point in points]
+
+    check("union covers both",
+          ink(union, [(10, 10), (30, 30), (45, 45)]), [True, True, True])
+    check("intersect is the overlap",
+          ink(intersect, [(10, 10), (30, 30), (45, 45)]),
+          [False, True, False])
+    check("subtract removes the overlap",
+          ink(subtract, [(10, 10), (30, 30), (45, 45)]),
+          [True, False, False])
+    check("exclude keeps only the non-overlap",
+          ink(exclude, [(10, 10), (30, 30), (45, 45)]),
+          [True, False, True])
+
+
+def test_duplicate_align_and_distribute():
+    items = [
+        vector.new_stroke([[0, 0], [10, 0]], 2, "#000000"),
+        vector.new_stroke([[40, 40], [50, 40]], 2, "#000000"),
+        vector.new_stroke([[80, 100], [90, 100]], 2, "#000000"),
+    ]
+    duplicate = vector.duplicate_item(items[0], 5, 7)
+    check("duplicate is independent", duplicate["points"][0], [5.0, 7.0])
+    vector.align_items(items, "left")
+    lefts = [vector.item_bounds(item)[0] for item in items]
+    check("aligned to one left edge", len(set(lefts)), 1)
+    vector.distribute_items(items, "v")
+    centres = [round((vector.item_bounds(item)[1]
+                      + vector.item_bounds(item)[3]) / 2.0, 2)
+               for item in items]
+    check("evenly distributed", centres, [0.0, 50.0, 100.0])
+
+
+def test_item_blend_mode_multiplies():
+    layer = Layer("v", (32, 32), (200, 200, 200, 255))
+    spec = vector.new_stroke([[2, 16], [30, 16]], 8, "#808080",
+                             blend="multiply")
+    vector.paste(layer.image, spec, (0, 0))
+    pixel = layer.image.getpixel((16, 16))
+    check("multiply darkens the backdrop", pixel[0] < 150, True)
+    check("multiply stays opaque", pixel[3], 255)
+
+
+def test_boolean_with_strokes():
+    first = vector.new_stroke([[0, 0], [30, 0]], 10, "#000000")
+    second = vector.new_stroke([[15, -10], [15, 20]], 10, "#000000")
+    result = vector.boolean([first, second], "union")
+    check("strokes can be unioned", result is not None, True)
+    check("result has anchors", vector.item_anchor_count(result) > 0, True)
+
+
+
+def test_shape_geometry_is_editable():
+    rect = shape.vector_geometry("rectangle", (5, 6, 35, 26))
+    check("rectangle has four anchors", len(rect["points"]), 4)
+    check("rectangle is closed", rect["closed"], True)
+    check("rectangle corners", rect["points"][0:2],
+          [[5.0, 6.0], [35.0, 6.0]])
+    rounded = shape.vector_geometry("rectangle", (0, 0, 40, 40), radius=8)
+    check("rounded rectangle has curve controls", len(rounded["points"]) > 4,
+          True)
+    ellipse = shape.vector_geometry("ellipse", (10, 10, 50, 30))
+    check("ellipse is four cubic anchors", len(ellipse["points"]), 4)
+    check("ellipse is closed", ellipse["closed"], True)
+    check("ellipse has off-anchor handles",
+          ellipse["handles_out"][0] != ellipse["points"][0], True)
+    line = shape.vector_geometry("line", (0, 0, 20, 7), shift=True)
+    check("shift constrains the line to an axis", line["points"][1][1], 0.0)
+
+
+def test_vector_item_selection_switches_tools_mode():
+    from types import SimpleNamespace
+    from paintapp.drawing import DrawingController
+
+    layer = Layer("v", (40, 40), (0, 0, 0, 0))
+    layer.vector = True
+    layer.strokes.append(vector.new_stroke([[0, 0], [20, 20]], 3, "#000000"))
+
+    class Tools:
+        vector_tool = False
+        vector_mode = "draw"
+
+        def set_vector_mode(self, mode):
+            self.vector_mode = mode
+
+    class App:
+        tools = Tools()
+        current = SimpleNamespace(layers=[layer])
+        layer_panel = None
+
+    controller = object.__new__(DrawingController)
+    controller.app = App()
+    controller._sync_vector_selection = lambda: None
+    controller._update_vector_overlay = lambda: None
+    controller._vector_cur = None
+    controller._vector_sel = None
+    controller._vector_selection = []
+    controller._vector_anchor = None
+    check("selection succeeds", controller.select_vector_item(layer, 0), True)
+    check("selection opens edit mode",
+          controller.app.tools.vector_mode, "edit")
 
 
 def main():

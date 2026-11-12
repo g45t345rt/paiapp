@@ -6,7 +6,7 @@ from tkinter import font as tkfont, ttk
 
 from PIL import Image, ImageTk
 
-from . import document, filters, icons, path, textrender, theme
+from . import document, filters, icons, path, textrender, theme, vector
 from .canvasarea import checkerboard
 from .scrollbar import ArrowScrollbar
 from .ui import PopupMenu, Tooltip
@@ -108,6 +108,8 @@ GHOST = 44
 FILTER_LEAD = ("color-filter", "\u2022", "muted", "Filter")
 TEXT_LEAD = ("typography", "T", "muted", "Text")
 PATH_LEAD = ("vector-bezier", "P", "muted", "Path")
+VECTOR_LINE_LEAD = ("vector-bezier", "V", "muted", "Vector line")
+VECTOR_FILL_LEAD = ("vector-polygon", "F", "muted", "Vector fill")
 
 # A group header's disclosure chevron, drawn as a small icon before the name in
 # place of the "\u25be"/"\u25b8" text glyph it used to lead with; the glyph stays
@@ -318,13 +320,21 @@ class LayerPanel(tk.Frame):
                  get_master_choices=None, on_move_to_canvas=None,
                  get_canvas_choices=None, on_group_duplicate=None,
                  on_text_duplicate=None, on_text_toggle=None,
-                 on_path_duplicate=None, on_path_toggle=None):
+                 on_path_duplicate=None, on_path_toggle=None,
+                 on_vector_select=None, on_vector_edit=None,
+                 on_vector_remove=None, on_vector_duplicate=None,
+                 on_vector_move=None):
         super().__init__(parent)
         self._on_group_duplicate = on_group_duplicate
         self._on_text_duplicate = on_text_duplicate
         self._on_text_toggle = on_text_toggle
         self._on_path_duplicate = on_path_duplicate
         self._on_path_toggle = on_path_toggle
+        self._on_vector_select = on_vector_select
+        self._on_vector_edit = on_vector_edit
+        self._on_vector_remove = on_vector_remove
+        self._on_vector_duplicate = on_vector_duplicate
+        self._on_vector_move = on_vector_move
         self._on_add = on_add
         self._on_delete = on_delete
         self._on_duplicate = on_duplicate
@@ -412,6 +422,7 @@ class LayerPanel(tk.Frame):
         self._selected_filter = None
         self._selected_text = None
         self._selected_path = None
+        self._selected_vector = None
         self._selected_group = None
         self._selected_group_filter = None
         self._mask_layer = None
@@ -567,7 +578,8 @@ class LayerPanel(tk.Frame):
     # ------------------------------------------------------------------ public
     def refresh(self, layers, active, selected=None, filter_selection=None,
                 text_selection=None, path_selection=None, group_selection=None,
-                groups=None, group_filter_selection=None):
+                groups=None, group_filter_selection=None,
+                vector_selection=None):
         """Rebuild the list from ``layers`` and select the ``active`` layer.
 
         Group members are shown indented beneath a group header row that can be
@@ -582,6 +594,8 @@ class LayerPanel(tk.Frame):
         ``group_selection`` is an optional group whose header row is selected
         instead, and ``group_filter_selection`` an optional
         ``(group, filter_index)`` selecting one of the group's filter rows.
+        ``vector_selection`` is an optional ``(layer_index, item_index)`` for
+        one of a vector layer's editable strokes/fills.
         """
         self._rows = []
         self._row_widgets = []
@@ -661,6 +675,7 @@ class LayerPanel(tk.Frame):
         self._selected_text = None
         self._selected_group = None
         self._selected_group_filter = None
+        self._selected_vector = None
         # A specific group filter row takes precedence over the bare group
         # header, so adding a filter leaves the new row selected (as it does for
         # a layer's filters).
@@ -696,6 +711,15 @@ class LayerPanel(tk.Frame):
                     self._anchor = row
                     self._selection_kind = "text"
                     self._selected_text = (layer_index, text_index)
+                    break
+        elif vector_selection is not None:
+            layer_index, item_index = vector_selection
+            for row, entry in enumerate(self._rows):
+                if entry == ("vector", layer_index, item_index):
+                    self._selected = [row]
+                    self._anchor = row
+                    self._selection_kind = "vector"
+                    self._selected_vector = (layer_index, item_index)
                     break
         elif path_selection is not None:
             layer_index, path_index = path_selection
@@ -1399,6 +1423,16 @@ class LayerPanel(tk.Frame):
             self._add_row(path.describe(spec), ("path", index, path_index),
                           indent + 1, leading=PATH_LEAD,
                           hidden=bool(spec.get("hidden")))
+        item_index = 0
+        for spec in getattr(layer, "strokes", None) or []:
+            self._add_row(vector.describe(spec), ("vector", index, item_index),
+                          indent + 1, leading=VECTOR_LINE_LEAD)
+            item_index += 1
+        for spec in getattr(layer, "fills", None) or []:
+            self._add_row(vector.describe_fill(spec),
+                          ("vector", index, item_index), indent + 1,
+                          leading=VECTOR_FILL_LEAD)
+            item_index += 1
 
     def _insert_group_filter_rows(self, group):
         """Insert indented rows for a group's non-destructive filters.
@@ -1828,6 +1862,16 @@ class LayerPanel(tk.Frame):
             self._selected_group_filter = None
             if self._on_text_select is not None:
                 self._on_text_select(entry[1], entry[2])
+        elif entry[0] == "vector":
+            self._selection_kind = "vector"
+            self._selected_vector = (entry[1], entry[2])
+            self._selected_path = None
+            self._selected_text = None
+            self._selected_filter = None
+            self._selected_group = None
+            self._selected_group_filter = None
+            if self._on_vector_select is not None:
+                self._on_vector_select(entry[1], entry[2])
         elif entry[0] == "path":
             self._selection_kind = "path"
             self._selected_path = (entry[1], entry[2])
@@ -1871,6 +1915,9 @@ class LayerPanel(tk.Frame):
         elif entry[0] == "path":
             if self._on_path_edit is not None:
                 self._on_path_edit(entry[1], entry[2])
+        elif entry[0] == "vector":
+            if self._on_vector_edit is not None:
+                self._on_vector_edit(entry[1], entry[2])
         elif self._on_filter_edit is not None:
             self._on_filter_edit(entry[1], entry[2])
 
@@ -1894,6 +1941,38 @@ class LayerPanel(tk.Frame):
         """True when a path row, not a layer row, is the current target."""
         return self._selection_kind == "path" and self._selected_path is not None
 
+    def _vector_active(self):
+        """True when an editable vector row is the current target."""
+        return (
+            self._selection_kind == "vector"
+            and self._selected_vector is not None
+        )
+
+    def select_vector_row(self, layer_index, item_index):
+        """Highlight a vector row without rebuilding the list.
+
+        Rebuilding from inside a row's click callback would destroy the widget
+        between the two halves of a double-click, so selection-only updates use
+        this method. Returns ``True`` when the row was found.
+        """
+        for row, entry in enumerate(self._rows):
+            if entry == ("vector", layer_index, item_index):
+                self._selection_kind = "vector"
+                self._selected_vector = (layer_index, item_index)
+                self._selected_path = None
+                self._selected_text = None
+                self._selected_filter = None
+                self._selected_group = None
+                self._selected_group_filter = None
+                self._selected = [row]
+                self._anchor = row
+                # Repaint only: routing the row again would call back into the
+                # app, which would re-enter this method through a canvas sync.
+                self._apply_selection_colors()
+                self._sync_button_state()
+                return True
+        return False
+
     def _visibility_state(self):
         """Whether the current target is visible, or ``None`` when it has none.
 
@@ -1903,6 +1982,8 @@ class LayerPanel(tk.Frame):
         there. A multi-layer selection counts as visible only when every layer
         is, matching how its other aggregate states are shown.
         """
+        if self._vector_active():
+            return None
         if self._text_active() or self._path_active():
             spec = self._selected_object_spec()
             if spec is None:
@@ -1923,7 +2004,8 @@ class LayerPanel(tk.Frame):
         is_filter = self._filter_active()
         is_text = self._text_active()
         is_path = self._path_active()
-        is_item = is_text or is_path
+        is_vector = self._vector_active()
+        is_item = is_text or is_path or is_vector
         is_group = self._selection_kind == "group" and self._selected_group is not None
         is_group_filter = self._group_filter_active()
         is_group_like = is_group or is_group_filter
@@ -1969,6 +2051,8 @@ class LayerPanel(tk.Frame):
                 target = "text"
             elif is_path:
                 target = "path"
+            elif is_vector:
+                target = "vector object"
             else:
                 target = "layer"
             self.eye_btn.config(state=tk.NORMAL)
@@ -1985,6 +2069,8 @@ class LayerPanel(tk.Frame):
             self.duplicate_tip.set_text("Duplicate text")
         elif is_path:
             self.duplicate_tip.set_text("Duplicate path")
+        elif is_vector:
+            self.duplicate_tip.set_text("Duplicate vector object")
         else:
             self.duplicate_tip.set_text("Duplicate layer")
         if is_group_filter:
@@ -2007,6 +2093,11 @@ class LayerPanel(tk.Frame):
             self.up_tip.set_text("Move path up")
             self.down_tip.set_text("Move path down")
             self.more_tip.set_text("More path actions")
+        elif is_vector:
+            self.delete_tip.set_text("Remove vector object")
+            self.up_tip.set_text("Move vector object up")
+            self.down_tip.set_text("Move vector object down")
+            self.more_tip.set_text("More vector object actions")
         elif is_filter:
             self.delete_tip.set_text("Remove filter")
             self.up_tip.set_text("Move filter up")
@@ -2035,6 +2126,8 @@ class LayerPanel(tk.Frame):
             self._on_text_edit(*self._selected_text)
         elif self._path_active() and self._on_path_edit is not None:
             self._on_path_edit(*self._selected_path)
+        elif self._vector_active() and self._on_vector_edit is not None:
+            self._on_vector_edit(*self._selected_vector)
         elif self._filter_active() and self._on_filter_edit is not None:
             self._on_filter_edit(*self._selected_filter)
         else:
@@ -2057,13 +2150,15 @@ class LayerPanel(tk.Frame):
             self._on_text_remove()
         elif self._path_active() and self._on_path_remove is not None:
             self._on_path_remove()
+        elif self._vector_active() and self._on_vector_remove is not None:
+            self._on_vector_remove()
         elif self._filter_active() and self._on_filter_remove is not None:
             self._on_filter_remove()
         else:
             self._on_delete()
 
     def _handle_clear(self):
-        if self._text_active() or self._path_active():
+        if self._text_active() or self._path_active() or self._vector_active():
             return
         if self._group_filter_active() and self._on_group_filter_clear is not None:
             self._on_group_filter_clear()
@@ -2083,6 +2178,8 @@ class LayerPanel(tk.Frame):
             self._on_text_move(delta)
         elif self._path_active() and self._on_path_move is not None:
             self._on_path_move(delta)
+        elif self._vector_active() and self._on_vector_move is not None:
+            self._on_vector_move(delta)
         elif self._filter_active() and self._on_filter_move is not None:
             self._on_filter_move(delta)
         else:
@@ -2105,6 +2202,8 @@ class LayerPanel(tk.Frame):
         elif self._path_active():
             if self._on_path_toggle is not None:
                 self._on_path_toggle()
+        elif self._vector_active():
+            return
         elif self._filter_active() and self._on_filter_toggle is not None:
             self._on_filter_toggle()
         else:
@@ -2118,6 +2217,16 @@ class LayerPanel(tk.Frame):
         elif self._path_active():
             layer_index, index = self._selected_path
             attr = "paths"
+        elif self._vector_active():
+            layer_index, index = self._selected_vector
+            if not (0 <= layer_index < len(self._layers)):
+                return None
+            layer = self._layers[layer_index]
+            items = (list(getattr(layer, "strokes", None) or [])
+                     + list(getattr(layer, "fills", None) or []))
+            if 0 <= index < len(items):
+                return items[index]
+            return None
         else:
             return None
         if not (0 <= layer_index < len(self._layers)):
@@ -2140,6 +2249,9 @@ class LayerPanel(tk.Frame):
         elif self._path_active():
             if self._on_path_duplicate is not None:
                 self._on_path_duplicate()
+        elif self._vector_active():
+            if self._on_vector_duplicate is not None:
+                self._on_vector_duplicate()
         elif self._on_duplicate is not None:
             self._on_duplicate()
 
@@ -2312,6 +2424,18 @@ class LayerPanel(tk.Frame):
                              command=lambda: self._handle_move(-1))
             menu.add_separator()
             menu.add_command("Remove Path", command=self.delete_current)
+            return menu
+        if self._vector_active():
+            menu.add_command("Edit Vector Object", command=self._handle_rename)
+            menu.add_command("Duplicate Vector Object",
+                             command=self._handle_duplicate)
+            menu.add_separator()
+            menu.add_command("Move Vector Object Up",
+                             command=lambda: self._handle_move(1))
+            menu.add_command("Move Vector Object Down",
+                             command=lambda: self._handle_move(-1))
+            menu.add_separator()
+            menu.add_command("Remove Vector Object", command=self.delete_current)
             return menu
         if self._filter_active():
             menu.add_command("Edit Filter...", command=self._handle_rename)

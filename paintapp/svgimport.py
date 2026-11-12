@@ -569,8 +569,24 @@ def _shape_to_path(element, tag):
 _STYLE_KEYS = (
     "color", "fill", "stroke", "stroke-width", "opacity", "fill-opacity",
     "stroke-opacity", "stroke-linecap", "stroke-linejoin", "fill-rule",
-    "display", "visibility",
+    "stroke-dasharray", "stroke-dashoffset", "display", "visibility",
 )
+
+
+def _parse_dash(value):
+    """A dash pattern from ``stroke-dasharray`` (empty for a solid line)."""
+    if value is None:
+        return []
+    text = str(value).strip().lower()
+    if not text or text == "none":
+        return []
+    values = []
+    for token in _SPLIT.split(text):
+        try:
+            values.append(float(token))
+        except ValueError:
+            continue
+    return values
 
 
 def _child_style(parent, element):
@@ -630,6 +646,11 @@ def _specs_from_subpaths(subpaths, style, fill_width):
     cap = cap if cap in vector.CAPS else "butt"
     join = (style.get("stroke-linejoin") or "miter").strip().lower()
     join = "round" if join == "round" else "miter"
+    dash = _parse_dash(style.get("stroke-dasharray"))
+    try:
+        dash_offset = float(style.get("stroke-dashoffset") or 0.0)
+    except (TypeError, ValueError):
+        dash_offset = 0.0
     width = _finite(width)
     width = max(vector.MIN_WIDTH, min(vector.MAX_WIDTH, int(round(width))))
     opacity = max(0.0, min(1.0, alpha))
@@ -658,7 +679,8 @@ def _specs_from_subpaths(subpaths, style, fill_width):
             points, width, color, opacity=opacity, closed=closed, cap=cap,
             join=join, handles_in=subpath["handles_in"],
             handles_out=subpath["handles_out"],
-            fill=fill_color if closed else None)
+            fill=fill_color if closed else None,
+            dash=dash, dash_offset=dash_offset)
         if spec is not None:
             strokes.append(spec)
     return strokes, []
@@ -879,14 +901,71 @@ def fill_data(spec):
     return " ".join(parts)
 
 
+def _polygon_data(points):
+    """An SVG round-tripable ``d`` for a closed polyline."""
+    if len(points) < 3:
+        return ""
+    parts = [f"M {_number(points[0][0])} {_number(points[0][1])}"]
+    for point in points[1:]:
+        parts.append(f"L {_number(point[0])} {_number(point[1])}")
+    parts.append("Z")
+    return " ".join(parts)
+
+
+def _gradient_markup(identifier, gradient):
+    """A ``<linearGradient>``/``<radialGradient>`` def for a vector gradient."""
+    stops = "".join(
+        f'<stop offset="{_number(offset)}" stop-color="{color}"/>'
+        for offset, color in gradient.get("stops") or []
+    )
+    if gradient.get("type") == "radial":
+        center = gradient.get("center") or (0.0, 0.0)
+        return (
+            f'<radialGradient id="{identifier}" gradientUnits="userSpaceOnUse" '
+            f'cx="{_number(center[0])}" cy="{_number(center[1])}" '
+            f'r="{_number(gradient.get("radius", 1.0))}">{stops}'
+            f'</radialGradient>'
+        )
+    start = gradient.get("start") or (0.0, 0.0)
+    end = gradient.get("end") or (start[0] + 1.0, start[1])
+    return (
+        f'<linearGradient id="{identifier}" gradientUnits="userSpaceOnUse" '
+        f'x1="{_number(start[0])}" y1="{_number(start[1])}" '
+        f'x2="{_number(end[0])}" y2="{_number(end[1])}">{stops}'
+        f'</linearGradient>'
+    )
+
+
+_MARKER_BODIES = {
+    "triangle": '<path d="M0,0 L10,5 L0,10 Z"/>',
+    "stealth": '<path d="M0,0 L10,5 L0,10 L3,5 Z"/>',
+    "circle": '<circle cx="5" cy="5" r="5"/>',
+    "square": '<rect x="0" y="0" width="10" height="10"/>',
+    "bar": '<rect x="4" y="0" width="2" height="10"/>',
+}
+
+
+def _marker_markup(identifier, kind, size):
+    body = _MARKER_BODIES.get(kind)
+    if body is None:
+        return None
+    ref = 5 if kind in ("circle", "square", "bar") else 10
+    return (
+        f'<marker id="{identifier}" markerUnits="userSpaceOnUse" '
+        f'markerWidth="{_number(size)}" markerHeight="{_number(size)}" '
+        f'refX="{ref}" refY="5" viewBox="0 0 10 10" '
+        f'orient="auto-start-reverse">{body}</marker>'
+    )
+
+
 def export(strokes, fills=None, size=None, padding=2.0):
     """Serialise vector ``strokes`` (and compound ``fills``) as SVG.
 
     With ``size`` the artwork is placed at the canvas origin with that viewport;
     otherwise the viewport hugs the geometry with ``padding`` pixels of margin.
-    Colours, widths, caps, joins and opacity round-trip; a closed stroke's fill
-    is written as its ``fill`` paint, and each compound fill as a ``fill``-only
-    path carrying its rule.
+    Colours, widths, caps, joins, dashes, gradients, arrow markers, opacity and
+    variable-width profiles round-trip where SVG can express them (a width
+    profile is written as its filled outline).
     """
     strokes = [spec for spec in strokes if spec.get("points")]
     fills = [spec for spec in (fills or []) if spec.get("contours")]
@@ -899,32 +978,74 @@ def export(strokes, fills=None, size=None, padding=2.0):
         min_y = box[1] - padding
         width = max(1.0, box[2] - box[0] + 2.0 * padding)
         height = max(1.0, box[3] - box[1] + 2.0 * padding)
-    lines = [
-        '<?xml version="1.0" encoding="UTF-8"?>',
-        (f'<svg xmlns="http://www.w3.org/2000/svg" '
-         f'width="{_number(width)}" height="{_number(height)}" '
-         f'viewBox="{_number(min_x)} {_number(min_y)} '
-         f'{_number(width)} {_number(height)}">'),
-    ]
+
+    defs = []
+    gradients = {}
+    markers = {}
+
+    def gradient_id(gradient):
+        key = repr(gradient)
+        if key not in gradients:
+            identifier = f"gradient{len(gradients)}"
+            markup = _gradient_markup(identifier, gradient)
+            gradients[key] = identifier
+            defs.append(markup)
+        return gradients[key]
+
+    def marker_id(kind, marker_size):
+        key = (kind, round(float(marker_size), 3))
+        if key not in markers:
+            identifier = f"marker_{kind}_{len(markers)}"
+            markup = _marker_markup(identifier, kind, marker_size)
+            if markup is None:
+                return None
+            markers[key] = identifier
+            defs.append(markup)
+        return markers[key]
+
+    body = []
     for spec in fills:
         data = fill_data(spec)
         if not data:
             continue
+        gradient = spec.get("gradient")
+        paint = (f"url(#{gradient_id(gradient)})" if gradient
+                 else spec.get("color") or "#000000")
         attrs = [
             f'd="{data}"',
-            f'fill="{spec.get("color") or "#000000"}"',
+            f'fill="{paint}"',
             f'fill-rule="{"evenodd" if spec.get("even_odd", True) else "nonzero"}"',
             'stroke="none"',
         ]
         opacity = float(spec.get("opacity", 1.0))
         if opacity < 1.0:
             attrs.append(f'opacity="{_number(opacity)}"')
-        lines.append("  <path " + " ".join(attrs) + "/>")
+        body.append("  <path " + " ".join(attrs) + "/>")
+
     for spec in strokes:
+        if vector.has_width_profile(spec):
+            for polygon in vector.outline_polygons(spec):
+                data = _polygon_data(polygon)
+                if not data:
+                    continue
+                attrs = [
+                    f'd="{data}"',
+                    f'fill="{spec.get("color") or "#000000"}"',
+                    'stroke="none"',
+                ]
+                opacity = float(spec.get("opacity", 1.0))
+                if opacity < 1.0:
+                    attrs.append(f'opacity="{_number(opacity)}"')
+                body.append("  <path " + " ".join(attrs) + "/>")
+            continue
         data = path_data(spec)
         if not data:
             continue
-        fill = spec.get("fill") or "none"
+        gradient = spec.get("fill_gradient")
+        if gradient and spec.get("closed"):
+            fill = f"url(#{gradient_id(gradient)})"
+        else:
+            fill = spec.get("fill") or "none"
         attrs = [
             f'd="{data}"',
             f'fill="{fill}"',
@@ -933,9 +1054,41 @@ def export(strokes, fills=None, size=None, padding=2.0):
             f'stroke-linecap="{spec.get("cap", "round")}"',
             f'stroke-linejoin="{spec.get("join", "round")}"',
         ]
+        dash = vector.dash_pattern(spec)
+        if dash:
+            attrs.append(
+                'stroke-dasharray="'
+                + " ".join(_number(value) for value in dash) + '"')
+            offset = float(spec.get("dash_offset", 0.0))
+            if offset:
+                attrs.append(f'stroke-dashoffset="{_number(offset)}"')
+        marker_size = vector._arrow_size(spec)
+        start_kind = spec.get("arrow_start", "none")
+        end_kind = spec.get("arrow_end", "none")
+        if start_kind != "none":
+            identifier = marker_id(start_kind, marker_size)
+            if identifier:
+                attrs.append(f'marker-start="url(#{identifier})"')
+        if end_kind != "none":
+            identifier = marker_id(end_kind, marker_size)
+            if identifier:
+                attrs.append(f'marker-end="url(#{identifier})"')
         opacity = float(spec.get("opacity", 1.0))
         if opacity < 1.0:
             attrs.append(f'opacity="{_number(opacity)}"')
-        lines.append("  <path " + " ".join(attrs) + "/>")
+        body.append("  <path " + " ".join(attrs) + "/>")
+
+    lines = [
+        '<?xml version="1.0" encoding="UTF-8"?>',
+        (f'<svg xmlns="http://www.w3.org/2000/svg" '
+         f'width="{_number(width)}" height="{_number(height)}" '
+         f'viewBox="{_number(min_x)} {_number(min_y)} '
+         f'{_number(width)} {_number(height)}">'),
+    ]
+    if defs:
+        lines.append("  <defs>")
+        lines.extend("    " + entry for entry in defs)
+        lines.append("  </defs>")
+    lines.extend(body)
     lines.append("</svg>")
     return "\n".join(lines) + "\n"
