@@ -436,6 +436,30 @@ def remove_background(image, model_name=None, progress=None, cancel=None):
     return result
 
 
+def restrict_to_mask(cutout, original, mask):
+    """Keep ``cutout`` inside ``mask`` and restore ``original`` outside it.
+
+    ``cutout`` is a :func:`remove_background` result and ``original`` the image
+    it was computed from, both RGBA at the same size. The optional ``mask`` (an
+    ``L`` image, resized if needed) selects where the cutout's alpha applies;
+    outside it the original alpha is kept, so a removal can be limited to a
+    selection. Returns the combined RGBA image.
+    """
+    source = original.convert("RGBA")
+    result = cutout.convert("RGBA")
+    if mask is None:
+        return result
+    mask = mask.convert("L")
+    if mask.size != source.size:
+        mask = mask.resize(source.size, Image.NEAREST)
+    alpha = Image.composite(
+        result.getchannel("A"), source.getchannel("A"), mask,
+    )
+    combined = source.copy()
+    combined.putalpha(alpha)
+    return combined
+
+
 def unload(key=None):
     """Drop cached background sessions/models; returns how many went away.
 

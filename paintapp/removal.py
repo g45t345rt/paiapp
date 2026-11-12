@@ -41,6 +41,16 @@ class BackgroundPanel(tk.Frame):
             anchor="w",
         ).pack(fill=tk.X, pady=(6, 0))
 
+        # Restrict the cutout to the active selection, so a removal can be
+        # limited to one region instead of clearing the whole layer.
+        self.selection_only_var = tk.BooleanVar(value=False)
+        tk.Checkbutton(
+            self,
+            text="Apply only inside selection",
+            variable=self.selection_only_var,
+            anchor="w",
+        ).pack(fill=tk.X, pady=(2, 0))
+
         buttons = tk.Frame(self)
         buttons.pack(fill=tk.X, pady=(6, 8))
         self.remove_btn = tk.Button(buttons, text="Remove Background", command=self._on_remove)
@@ -67,6 +77,10 @@ class BackgroundPanel(tk.Frame):
 
     def new_layer(self):
         return bool(self.new_layer_var.get())
+
+    def selection_only(self):
+        """Whether the removal should be limited to the active selection."""
+        return bool(self.selection_only_var.get())
 
     def set_busy(self, busy, cancellable=False):
         """Reflect the job queue state for this panel.

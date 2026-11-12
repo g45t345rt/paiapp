@@ -133,6 +133,76 @@ def test_modnet_in_catalog():
     check("u2net catalogued", "U2Net" in background.MODELS, True)
 
 
+def test_restrict_to_mask():
+    original = Image.new("RGBA", (4, 1), (10, 20, 30, 255))
+    cutout = original.copy()
+    cutout.putalpha(Image.new("L", (4, 1), 0))
+    mask = Image.new("L", (4, 1), 0)
+    mask.putpixel((0, 0), 255)
+    mask.putpixel((1, 0), 255)
+
+    result = background.restrict_to_mask(cutout, original, mask)
+    alpha = result.getchannel("A")
+    check("selection alpha removed", alpha.getpixel((0, 0)), 0)
+    check("unselected alpha kept", alpha.getpixel((3, 0)), 255)
+    check("unselected rgb kept", result.getpixel((3, 0)), (10, 20, 30, 255))
+
+    unresized = background.restrict_to_mask(cutout, original, None)
+    check("no mask keeps cutout", unresized.getchannel("A").getpixel((0, 0)), 0)
+
+
+def test_restrict_to_mask_soft_edge():
+    original = Image.new("RGBA", (2, 1), (0, 0, 0, 255))
+    cutout = original.copy()
+    cutout.putalpha(Image.new("L", (2, 1), 0))
+    mask = Image.new("L", (2, 1), 128)
+    alpha = background.restrict_to_mask(
+        cutout, original, mask
+    ).getchannel("A")
+    check("soft mask blends alpha", alpha.getpixel((0, 0)) in (127, 128), True)
+
+
+def test_restrict_to_mask_resizes():
+    original = Image.new("RGBA", (8, 8), (5, 5, 5, 255))
+    cutout = original.copy()
+    cutout.putalpha(Image.new("L", (8, 8), 0))
+    mask = Image.new("L", (4, 4), 0)
+    for x in range(2):
+        for y in range(4):
+            mask.putpixel((x, y), 255)
+
+    result = background.restrict_to_mask(cutout, original, mask)
+    check("mask resized to source", result.size, (8, 8))
+    check("left half removed", result.getchannel("A").getpixel((0, 0)), 0)
+    check("right half kept", result.getchannel("A").getpixel((7, 0)), 255)
+
+
+def test_layer_selection_mask():
+    from paintapp.app import PaintApp
+
+    class _Layer:
+        offset = (2, 3)
+        image = Image.new("RGBA", (4, 4))
+
+    document = Image.new("L", (10, 10), 0)
+    document.paste(255, (2, 3, 5, 5))
+    local = PaintApp._layer_selection_mask(None, _Layer(), document)
+    check("local mask size", local.size, (4, 4))
+    check("local mask offset hit", local.getpixel((0, 0)), 255)
+    check("local mask outside", local.getpixel((3, 3)), 0)
+
+    class _Shifted:
+        offset = (-1, -1)
+        image = Image.new("RGBA", (4, 4))
+
+    shifted_doc = Image.new("L", (10, 10), 0)
+    shifted_doc.paste(255, (0, 0, 2, 2))
+    shifted = PaintApp._layer_selection_mask(None, _Shifted(), shifted_doc)
+    check("negative offset hit", shifted.getpixel((2, 2)), 255)
+    check("negative offset miss", shifted.getpixel((0, 0)), 0)
+
+
+
 def main():
     for name, fn in sorted(globals().items()):
         if name.startswith("test_") and callable(fn):

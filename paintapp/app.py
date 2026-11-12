@@ -9546,27 +9546,64 @@ class PaintApp:
         new_layer = self.bg.new_layer()
         doc = self.current
         source = target.image.copy()
+        selection_mask = None
+        if self.bg.selection_only():
+            selection = self.selection
+            if selection is None or selection.is_empty():
+                self.set_result(
+                    "Select a region to limit background removal to.", "warn"
+                )
+                return
+            # Convert the document-space selection into the layer's own pixels
+            # and capture it now, so a later selection change cannot retarget a
+            # queued job. The selection may lie partly or wholly outside a
+            # smaller, offset layer.
+            selection_mask = self._layer_selection_mask(target, selection.mask)
+            if selection_mask.getbbox() is None:
+                self.set_result("The selection does not overlap the active layer.")
+                return
 
         def runner(progress, cancel):
-            from engine.background import remove_background
-            return remove_background(
+            from engine.background import remove_background, restrict_to_mask
+            cutout = remove_background(
                 source, model_name=model, progress=progress, cancel=cancel
             )
+            if selection_mask is not None:
+                cutout = restrict_to_mask(cutout, source, selection_mask)
+            return cutout
 
         def finisher(result, error, cancelled):
-            self._apply_background(doc, target, result, error, cancelled, new_layer)
+            self._apply_background(
+                doc, target, result, error, cancelled, new_layer,
+                selection_only=selection_mask is not None,
+            )
 
         self.submit_job(
             "background", "Remove background", runner, finisher, detail=model,
         )
         self.set_result("Background removal queued.")
 
+    def _layer_selection_mask(self, layer, selection_mask):
+        """``selection_mask`` (document pixels) in ``layer``'s own coordinates.
+
+        A layer can be smaller than the canvas and shifted by its offset, so a
+        document-space selection has to be re-anchored before it can limit an
+        edit to that layer. ``Image.paste`` clips whatever falls outside the
+        layer instead of growing it.
+        """
+        width, height = layer.image.size
+        local = Image.new("L", (width, height), 0)
+        ox, oy = layer.offset
+        local.paste(selection_mask, (-ox, -oy))
+        return local
+
     def cancel_remove_background(self):
         job = self.job_queue.running_or_last("background")
         if job is not None:
             self.job_queue.cancel(job.id)
 
-    def _apply_background(self, doc, target, result, error, cancelled, new_layer):
+    def _apply_background(self, doc, target, result, error, cancelled, new_layer,
+                          selection_only=False):
         """Apply a finished cutout to the layer it was queued against."""
         if cancelled:
             self.statusbar.set_status("cancelled")
@@ -9587,12 +9624,13 @@ class PaintApp:
             target.set_image(result)
         self._show_doc(doc)
         self.statusbar.set_status("background removed")
+        where = " inside the selection" if selection_only else ""
         if new_layer:
             self.set_result(
-                f"Removed background from '{target.name}' into a new layer."
+                f"Removed background{where} from '{target.name}' into a new layer."
             )
         else:
-            self.set_result(f"Removed background from '{target.name}'.")
+            self.set_result(f"Removed background{where} from '{target.name}'.")
 
     # ------------------------------------------------------------------ upscale
     def start_upscale(self):
