@@ -280,7 +280,6 @@ class ClassicCheckpoint:
             return_tensors="pt",
         )
         batch = tokens.input_ids.to(self.device)
-        mask = tokens.attention_mask.to(self.device)
 
         if self.is_sdxl:
             out1 = self.text_encoders[0](batch, output_hidden_states=True)
@@ -288,7 +287,7 @@ class ClassicCheckpoint:
             embeds = torch.cat([out1.hidden_states[-2], out2.hidden_states[-2]], dim=-1)
             pooled = out2[0]
         else:
-            out = self.text_encoders[0](batch, attention_mask=mask)
+            out = self.text_encoders[0](batch)
             embeds = out.last_hidden_state
             pooled = None
         return embeds, pooled, batch[0].tolist()
