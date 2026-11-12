@@ -466,8 +466,55 @@ class LayoutEditor(tk.Frame):
 
     def _remove_row(self, row):
         self.model.remove(row)
-        self._rebuild_rows()
+        self._drop_row(row)
         self._notify()
+
+    def _drop_row(self, row):
+        """Remove one row's widgets without rebuilding the whole list."""
+        for index, widgets in enumerate(self._row_widgets):
+            if widgets["row"] is row:
+                widgets["frame"].destroy()
+                del self._row_widgets[index]
+                break
+        if not self._row_widgets:
+            # Tk leaves a container's requested size stale when its last packed
+            # child is destroyed, so nudge it back down to empty.
+            self.rows_frame.configure(height=1)
+        else:
+            # The palette colour is positional, so the rows left behind may
+            # need a new swatch now that the list has shifted.
+            for widgets in self._row_widgets:
+                self._sync_color(widgets)
+        self._refresh_state()
+        self._update_hint()
+
+    def add_row(self, row):
+        """Add one row's widgets without rebuilding the existing rows."""
+        # The model may have been enabled by the caller (drawing a box arms the
+        # tool), so keep the switch in step before enabling the new row.
+        self.enabled_var.set(bool(self.model.enabled))
+        self.show_caption_var.set(bool(self.model.show_caption))
+        self._build_row(row)
+        theme.restyle(self)
+        self._refresh_state()
+        self._update_hint()
+
+    def refresh_boxes(self):
+        """Update the box readouts after the model's boxes move.
+
+        Dragging a box on the canvas only changes its ``bbox``, so the row
+        widgets stay in place; rebuilding them would reset the panel's scroll
+        position and throw away the widget state.
+        """
+        rows = list(self.model.rows)
+        if len(rows) != len(self._row_widgets) or any(
+                widgets["row"] is not row
+                for widgets, row in zip(self._row_widgets, rows)):
+            self._rebuild_rows()
+            return
+        for widgets in self._row_widgets:
+            self._set_box(widgets)
+        self._update_hint()
 
     def _rebuild_rows(self):
         for widgets in self._row_widgets:
@@ -572,8 +619,8 @@ class LayoutEditor(tk.Frame):
         box = self._on_capture()
         if box is None:
             return
-        self.model.add_box(box)
-        self._rebuild_rows()
+        row = self.model.add_box(box)
+        self.add_row(row)
         self._notify()
 
     # ------------------------------------------------------------------ state

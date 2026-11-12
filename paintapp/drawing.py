@@ -2054,6 +2054,29 @@ class ToolsPanel(tk.Frame):
         if self._layout_parent is not None:
             self._build_layout_editor()
 
+    def refresh_layout_boxes(self):
+        """Update the Layout Control box readouts without rebuilding rows."""
+        editor = self._layout_editor
+        if editor is None:
+            return
+        try:
+            if editor.winfo_exists():
+                editor.refresh_boxes()
+        except tk.TclError:
+            pass
+
+    def add_layout_box(self, box):
+        """Add a Layout Control row for ``box`` without rebuilding the panel."""
+        row = self.layout_model.add_box(box)
+        editor = self._layout_editor
+        if editor is not None:
+            try:
+                if editor.winfo_exists():
+                    editor.add_row(row)
+            except tk.TclError:
+                pass
+        return row
+
     def _on_layout_enabled(self, enabled):
         """Activate the canvas Layout tool while the panel's switch is on."""
         if enabled:
@@ -5955,7 +5978,7 @@ class DrawingController:
         if self._layout_edit is not None:
             self._layout_edit = None
             self.app._on_layout_change()
-            self.app.tools.refresh_layout_settings()
+            self.app.tools.refresh_layout_boxes()
             self.app.set_result("Moved layout item.", "success")
             return
         origin = self._layout_origin

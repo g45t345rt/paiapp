@@ -8720,8 +8720,7 @@ class PaintApp:
         if not hasattr(self, "tools"):
             return
         self.tools.layout_model.enabled = True
-        self.tools.layout_model.add_box(box)
-        self.tools.refresh_layout_settings()
+        self.tools.add_layout_box(box)
         self._on_layout_change()
         self.set_result("Added a layout item; fill in its fields.", "success")
 

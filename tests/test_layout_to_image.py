@@ -230,6 +230,43 @@ def test_editor_writes_back():
     root.destroy()
 
 
+def test_editor_updates_in_place():
+    model = layout.LayoutModel()
+    model.enabled = True
+    first = model.add_box((10, 10, 50, 50))
+    second = model.add_box((60, 60, 100, 100))
+    built = _build_editor(model)
+    if built[0] is None:
+        return
+    root, editor, calls = built
+    frame = editor._row_widgets[0]["frame"]
+    label = editor._row_widgets[0]["box_label"]
+
+    model.rows[0]["bbox"] = [20, 20, 40, 40]
+    editor.refresh_boxes()
+    root.update_idletasks()
+    check("refresh keeps the row widgets",
+          editor._row_widgets[0]["frame"] is frame, True)
+    check("refresh updates the box label",
+          label.cget("text"), "x 20  y 20  w 20  h 20")
+    check("refresh does not report a change", len(calls), 0)
+
+    editor._remove_row(second)
+    root.update_idletasks()
+    check("remove keeps the other row",
+          editor._row_widgets[0]["frame"] is frame, True)
+    check("remove drops the model row", len(model.rows), 1)
+
+    added = model.add_box((200, 200, 300, 300))
+    editor.add_row(added)
+    root.update_idletasks()
+    check("add keeps the existing row",
+          editor._row_widgets[0]["frame"] is frame, True)
+    check("add appends a row", len(editor._row_widgets), 2)
+    check("add syncs the enable switch", editor.enabled_var.get(), True)
+    root.destroy()
+
+
 def test_controller_move_and_resize():
     from types import SimpleNamespace
 
