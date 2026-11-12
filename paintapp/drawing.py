@@ -2797,9 +2797,10 @@ class ToolsPanel(tk.Frame):
             list_row, height=6, exportselection=False, activestyle="none")
         self._vector_list.pack(side=tk.LEFT, fill=tk.X, expand=True)
         self._vector_list.bind("<<ListboxSelect>>", self._on_vector_list_select)
-        scroll = tk.Scrollbar(list_row, command=self._vector_list.yview)
-        scroll.pack(side=tk.RIGHT, fill=tk.Y)
+        scroll = ArrowScrollbar(list_row, height=1)
+        scroll.set_command(self._vector_list.yview)
         self._vector_list.config(yscrollcommand=scroll.set)
+        scroll.pack(side=tk.RIGHT, fill=tk.Y)
         tk.Label(self._vector_edit, text="Selected line", anchor="w").pack(
             fill=tk.X, pady=(6, 0))
         self._slider_row(self._vector_edit, "Width",
