@@ -27,8 +27,8 @@ from . import textrender
 from . import theme
 from . import vector
 from .canvasarea import (
-    CanvasArea, DEFAULT_GRID_SIZE, DEFAULT_OFFCANVAS_BG, prompt_canvas_size,
-    prompt_new_canvas,
+    CanvasArea, DEFAULT_GRID_SIZE, DEFAULT_OFFCANVAS_BG,
+    CANVAS_ANCHOR_FRACTIONS, prompt_new_canvas, prompt_resize_canvas,
 )
 from .assets import AssetsPanel
 from .brushes import BrushLibraryPanel
@@ -1421,32 +1421,84 @@ class PaintApp:
         scene["y"] = float(scene.get("y", 0.0)) + dy
         layer.invalidate_poses()
 
+    def _shift_layer_objects(self, layer, dx, dy):
+        """Move the document-space objects that ride with a layer's pixels.
+
+        Text and path specs are anchored in document space (their compositing
+        subtracts the layer offset), so a canvas origin change has to move them
+        alongside the pixels. A link renders its master's objects, not its own,
+        so only plain layers are shifted, matching :meth:`crop_canvas`.
+        """
+        if layer.is_link:
+            return
+        for spec in layer.texts:
+            spec["x"] = spec.get("x", 0.0) + dx
+            spec["y"] = spec.get("y", 0.0) + dy
+        layer.invalidate_texts()
+        for spec in layer.paths:
+            path.translate(spec, dx, dy)
+        layer.invalidate_paths()
+        self._shift_pose_scene(layer, dx, dy)
+
+    def _remap_inpaint_mask(self, doc, new_size, dx, dy):
+        """Place a canvas's inpaint mask in a changed canvas rectangle.
+
+        ``dx``/``dy`` put the old canvas inside the new one. Pixels already
+        painted into the mask move with the content; the added border is left
+        unmarked so expanding the canvas is a plain resize, not an outpaint.
+        """
+        mask = Image.new("L", new_size, 0)
+        if doc.inpaint_mask is not None:
+            mask.paste(doc.inpaint_mask, (dx, dy))
+        doc.inpaint_mask = mask if mask.getbbox() is not None else None
+        doc._inpaint_mask_shared = False
+
+    def _shift_guides(self, doc, dx, dy, new_w, new_h):
+        """Move unshared guides with the content, dropping any left outside."""
+        if self.guides_shared:
+            return
+        shifted = []
+        for orient, pos in doc.guides:
+            pos = pos + (dx if orient == "v" else dy)
+            limit = new_w if orient == "v" else new_h
+            if 0 <= pos <= limit:
+                shifted.append((orient, pos))
+        doc.guides = shifted
+
     def resize_canvas(self):
-        """Resize the current canvas, keeping existing content centered."""
+        """Resize or expand the canvas, keeping content at the chosen anchor."""
         if self.current is None:
             self.set_result("There is no canvas to resize.")
             return
         width, height = self.current.size
-        size = prompt_canvas_size(
-            self.root, initial=(width, height), title="Resize Canvas"
+        choice = prompt_resize_canvas(
+            self.root, initial=(width, height),
+            title="Resize / Expand Canvas",
         )
-        if size is None or size == (width, height):
+        if choice is None:
             return
+        new_w, new_h, anchor = choice
+        if (new_w, new_h) == (width, height):
+            return
+        fx, fy = CANVAS_ANCHOR_FRACTIONS.get(anchor, (0.5, 0.5))
+        dx = int(round((new_w - width) * fx))
+        dy = int(round((new_h - height) * fy))
         self._push_undo("Resize canvas")
         doc = self.current
-        # Content is anchored at the canvas centre: growing shifts every layer
-        # out by half the delta so it stays put relative to the new middle.
-        dx = (size[0] - width) // 2
-        dy = (size[1] - height) // 2
         for layer in doc.layers:
             ox, oy = layer.offset
             layer.offset = (ox + dx, oy + dy)
-            self._shift_pose_scene(layer, dx, dy)
-        doc.width, doc.height = size
+            self._shift_layer_objects(layer, dx, dy)
+        self._remap_inpaint_mask(doc, (new_w, new_h), dx, dy)
+        self._shift_guides(doc, dx, dy, new_w, new_h)
+        doc.width, doc.height = new_w, new_h
+        view = self.area.current_view()
+        if view is not None:
+            view.set_selection(None)
         self._sync_gen_size()
         self._update_title()
         self.render()
-        self.set_result(f"Resized canvas to {size[0]} x {size[1]}.")
+        self.set_result(f"Resized canvas to {new_w} x {new_h}.")
 
     def crop_canvas(self, box):
         """Crop the current canvas to ``box`` ``(left, top, right, bottom)``.
@@ -1500,6 +1552,7 @@ class PaintApp:
                 if 0 <= pos <= limit:
                     shifted.append((orient, pos))
             doc.guides = shifted
+        self._remap_inpaint_mask(doc, (new_w, new_h), -left, -top)
         doc.width, doc.height = new_w, new_h
         view = self.area.current_view()
         if view is not None:
@@ -1744,7 +1797,9 @@ class PaintApp:
         menu.add_command(
             "Rename Canvas...", command=lambda: self._prompt_rename(index)
         )
-        menu.add_command("Resize Canvas...", command=self.resize_canvas)
+        menu.add_command(
+            "Resize / Expand Canvas\u2026", command=self.resize_canvas,
+        )
         menu.add_separator()
         menu.add_command(
             "Crop to Selection", command=self.crop_to_selection,

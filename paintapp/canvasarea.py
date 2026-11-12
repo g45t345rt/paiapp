@@ -308,8 +308,35 @@ def compose_region(composite, doc_size, origin, zoom, top_left, view_size,
     return board
 
 
-def prompt_canvas_size(root, initial=(CANVAS_W, CANVAS_H), title="New Canvas"):
-    """Ask for a canvas size. Returns ``(width, height)`` or ``None``."""
+# Where the old canvas sits inside a resized one. The fraction is the part of
+# the added space that goes before the old content: ``(0, 0)`` pins the content
+# to the top left and grows right/down, ``(0.5, 0.5)`` grows evenly around it.
+# The same fractions position content when the canvas is shrunk.
+CANVAS_ANCHORS = (
+    ("nw", 0.0, 0.0, "\u2196"),
+    ("n", 0.5, 0.0, "\u2191"),
+    ("ne", 1.0, 0.0, "\u2197"),
+    ("w", 0.0, 0.5, "\u2190"),
+    ("c", 0.5, 0.5, "\u25cf"),
+    ("e", 1.0, 0.5, "\u2192"),
+    ("sw", 0.0, 1.0, "\u2199"),
+    ("s", 0.5, 1.0, "\u2193"),
+    ("se", 1.0, 1.0, "\u2198"),
+)
+
+CANVAS_ANCHOR_FRACTIONS = {
+    name: (fx, fy) for name, fx, fy, _label in CANVAS_ANCHORS
+}
+
+
+def prompt_resize_canvas(root, initial=(CANVAS_W, CANVAS_H),
+                         title="Resize / Expand Canvas"):
+    """Ask for a canvas size and where the existing content sits.
+
+    Returns ``(width, height, anchor)`` or ``None``. ``anchor`` is one of
+    :data:`CANVAS_ANCHORS` and decides where the old canvas sits inside the
+    new one. The size may grow or shrink the canvas; no generation is implied.
+    """
     dialog = tk.Toplevel(root)
     dialog.title(title)
     dialog.transient(root)
@@ -320,14 +347,29 @@ def prompt_canvas_size(root, initial=(CANVAS_W, CANVAS_H), title="New Canvas"):
     frame.pack(fill=tk.BOTH, expand=True)
 
     size_input = SizeInput(frame, initial[0], initial[1], field_width=10)
-    size_input.grid(row=0, column=0, columnspan=2, sticky="w", pady=2)
+    size_input.grid(row=0, column=0, sticky="w", pady=2)
+
+    anchor_frame = tk.LabelFrame(frame, text="Keep content", padx=4, pady=4)
+    anchor_frame.grid(row=1, column=0, sticky="w", pady=(8, 0))
+    anchor_var = tk.StringVar(value="c")
+    for index, (value, _fx, _fy, label) in enumerate(CANVAS_ANCHORS):
+        row, column = divmod(index, 3)
+        tk.Radiobutton(
+            anchor_frame, text=label, variable=anchor_var, value=value,
+            indicatoron=False, width=3,
+        ).grid(row=row, column=column, padx=1, pady=1)
+
+    tk.Label(
+        frame, text="Shrinking crops content outside the new canvas.",
+        anchor="w",
+    ).grid(row=2, column=0, sticky="w", pady=(2, 0))
 
     error_var = tk.StringVar(value="")
     tk.Label(frame, textvariable=error_var, fg="red", anchor="w").grid(
-        row=1, column=0, columnspan=2, sticky="w", pady=(2, 0)
+        row=3, column=0, sticky="w", pady=(2, 0)
     )
 
-    result = {"size": None}
+    result = {"value": None}
 
     def on_ok(_event=None):
         width, height = size_input.values()
@@ -340,14 +382,14 @@ def prompt_canvas_size(root, initial=(CANVAS_W, CANVAS_H), title="New Canvas"):
         if width > MAX_CANVAS_SIZE or height > MAX_CANVAS_SIZE:
             error_var.set(f"Maximum size is {MAX_CANVAS_SIZE}.")
             return
-        result["size"] = (width, height)
+        result["value"] = (width, height, anchor_var.get())
         dialog.destroy()
 
     def on_cancel(_event=None):
         dialog.destroy()
 
     buttons = tk.Frame(frame)
-    buttons.grid(row=2, column=0, columnspan=2, sticky="e", pady=(8, 0))
+    buttons.grid(row=4, column=0, sticky="e", pady=(8, 0))
     tk.Button(buttons, text="OK", width=8, command=on_ok).pack(side=tk.RIGHT)
     tk.Button(buttons, text="Cancel", width=8, command=on_cancel).pack(
         side=tk.RIGHT, padx=(0, 6)
@@ -364,7 +406,7 @@ def prompt_canvas_size(root, initial=(CANVAS_W, CANVAS_H), title="New Canvas"):
 
     dialog.grab_set()
     root.wait_window(dialog)
-    return result["size"]
+    return result["value"]
 
 
 # Preset canvas sizes offered by the New Canvas dialog, as ``(label, (w, h))``.

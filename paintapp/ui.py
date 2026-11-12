@@ -1515,7 +1515,8 @@ def build_menus(app, parent):
         label="Rename Canvas...", command=app.rename_canvas, enabled=has_canvas,
     )
     canvas_menu.add_command(
-        label="Resize Canvas...", command=app.resize_canvas, enabled=has_canvas,
+        label="Resize / Expand Canvas\u2026", command=app.resize_canvas,
+        enabled=has_canvas,
     )
     canvas_menu.add_command(
         label="Color Management\u2026", command=app.open_color_management,
