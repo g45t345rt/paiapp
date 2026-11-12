@@ -846,11 +846,11 @@ class ToolsPanel(tk.Frame):
             return
         self.select("arrow")
 
-    def _sync_buttons(self, rebuild=False):
+    def _sync_buttons(self):
         """Update the tool buttons and render settings for the active tool.
 
         The settings panel is only rebuilt when the active tool actually
-        changes (or ``rebuild`` is set). Mode switches update their own rows in
+        changes. Mode switches and settings restores update their own rows in
         place, so they must not tear the panel down: doing so dropped the
         sidebar back to the top on every control change.
         """
@@ -858,7 +858,7 @@ class ToolsPanel(tk.Frame):
         for key, button in self._tool_buttons.items():
             button.config(relief=tk.SUNKEN if key == active else tk.RAISED)
             self._set_tool_icon(button, key, key == active)
-        if rebuild or active != self._rendered_tool:
+        if active != self._rendered_tool:
             self._render_settings(active)
 
     def _on_theme(self):
@@ -921,6 +921,143 @@ class ToolsPanel(tk.Frame):
         if active in self.SYMMETRY_TOOLS:
             self._symmetry_rows()
         theme.restyle(self.settings)
+
+    # Some control variables do not share their attribute's name; list them
+    # here so a settings refresh can mirror values into the existing widgets.
+    _SETTING_VAR_ALIASES = {
+        "_brush_aa_var": "brush_antialias",
+        "_brush_vel_size_var": "brush_velocity_size",
+        "_brush_vel_opacity_var": "brush_velocity_opacity",
+        "_brush_vel_flow_var": "brush_velocity_flow",
+        "_brush_vel_hardness_var": "brush_velocity_hardness",
+        "_brush_vel_spacing_var": "brush_velocity_spacing",
+        "_eraser_aa_var": "eraser_antialias",
+        "_eraser_vel_size_var": "eraser_velocity_size",
+        "_eraser_vel_opacity_var": "eraser_velocity_opacity",
+        "_eraser_vel_flow_var": "eraser_velocity_flow",
+        "_eraser_vel_hardness_var": "eraser_velocity_hardness",
+        "_eraser_vel_spacing_var": "eraser_velocity_spacing",
+        "_mask_show_var": "mask_overlay_show",
+        "_shape_aa_var": "shape_antialias",
+        "_path_aa_var": "path_antialias",
+        "_path_handles_var": "path_show_handles",
+        "_vector_aa_var": "vector_antialias",
+        "_vector_anchors_var": "vector_show_anchors",
+        "_pose_drag_var": "poses_drag",
+        "_pose_body_var": "poses_body",
+        "_pose_hand_var": "poses_hand",
+        "_pose_hand_side_var": "poses_hand_side",
+        "_pose_scale_var": "poses_scale",
+        "_pose_opacity_var": "poses_opacity",
+        "_pose_grid_var": "poses_grid",
+        "_t_uniform_var": "transform_uniform",
+        "_t_snap_var": "transform_snap_anchors",
+        "_t_rot_snap_var": "transform_rotation_snap",
+        "_t_pivot_var": "transform_pivot",
+        "_t_interp_var": "transform_interpolation",
+    }
+
+    # Variables that are editor state rather than project settings; a refresh
+    # must leave them alone.
+    _SETTING_VAR_SKIP = {
+        "size_var", "_size_slider_var", "_gradient_preset_var",
+        "_gradient_stop_pos_var", "_gradient_stop_alpha_var",
+        "_mask_feather_var", "_pose_scene_zoom_var",
+        "_vector_prop_width_var", "_vector_prop_opacity_var",
+        "_warp_grid_var", "_t_dx_var", "_t_dy_var", "_t_sx_var",
+        "_t_sy_var", "_t_angle_var", "_t_shear_var",
+    }
+
+    def _refresh_settings_controls(self):
+        """Mirror the current settings into the built controls in place.
+
+        Applying a preset or loading a project used to rebuild the whole
+        settings panel, which dropped the sidebar back to the top and destroyed
+        the widgets under the pointer. Updating the bound variables keeps the
+        same rows and scroll position.
+        """
+        for name, var in list(self.__dict__.items()):
+            if name in self._SETTING_VAR_SKIP or not name.endswith("_var"):
+                continue
+            if not isinstance(var, tk.Variable):
+                continue
+            attr = self._SETTING_VAR_ALIASES.get(name)
+            if attr is None:
+                base = name[1:] if name.startswith("_") else name
+                if not base.endswith("_var"):
+                    continue
+                base = base[:-4]
+                if not hasattr(self, base):
+                    continue
+                attr = base
+            if not hasattr(self, attr):
+                continue
+            value = getattr(self, attr)
+            try:
+                var.set("" if value is None else value)
+            except (tk.TclError, ValueError, TypeError):
+                pass
+
+        self.size_var.set(self.brush_size)
+        self._size_slider_var.set(min(self.brush_size, BRUSH_SLIDER_MAX))
+        self._refresh_settings_side_effects()
+        self._refresh_menu_displays()
+
+    def _walk_settings_widgets(self, widget):
+        yield widget
+        for child in widget.winfo_children():
+            yield from self._walk_settings_widgets(child)
+
+    def _refresh_menu_displays(self):
+        """Update combobox labels after their backing variables change."""
+        for widget in self._walk_settings_widgets(self.settings):
+            var = getattr(widget, "_setting_var", None)
+            display = getattr(widget, "_display_var", None)
+            if var is None or display is None:
+                continue
+            try:
+                display.set(self._option_label(
+                    var.get(), widget._setting_options))
+            except tk.TclError:
+                pass
+
+    def _refresh_settings_side_effects(self):
+        """Refresh swatches and mode rows after a settings restore."""
+        active = self._rendered_tool
+        if active == "brush":
+            self._refresh_brush_preview()
+        elif active == "eraser":
+            self._refresh_eraser_preview()
+            self._apply_eraser_swatch()
+        elif active == "mask":
+            self._apply_mask_swatch()
+        elif active == "shape":
+            self._shape_apply_rows()
+        elif active == "select":
+            self._select_apply_rows()
+        elif active == "path":
+            self._path_apply_rows()
+            self._apply_path_swatches()
+        elif active == "vector":
+            self._vector_apply_rows()
+            self._apply_vector_swatches()
+        elif active == "gradient":
+            editor = getattr(self, "_gradient_editor", None)
+            if editor is not None and editor.winfo_exists():
+                editor.set_stops(self._gradient_stop_list())
+                editor.set_selected(0)
+            if getattr(self, "_gradient_preset_var", None) is not None:
+                self._gradient_preset_var.set("custom")
+            self._refresh_gradient_stop_controls()
+        elif active == "poses":
+            button = getattr(self, "_pose_color_btn", None)
+            if button is not None:
+                color = self.poses_color or poses.DEFAULT_COLOR
+                button.config(bg=color, activebackground=color)
+        elif active == "warp":
+            var = getattr(self, "_warp_grid_var", None)
+            if var is not None:
+                var.set(f"{self.warp_cols}x{self.warp_rows}")
 
     def _size_row(self, parent):
         row = tk.Frame(parent)
@@ -1024,6 +1161,8 @@ class ToolsPanel(tk.Frame):
 
         combo.bind("<<ComboboxSelected>>", on_select)
         combo._display_var = display_var
+        combo._setting_var = var
+        combo._setting_options = options
         combo.pack(side=tk.LEFT, fill=tk.X, expand=True)
         return row
 
@@ -3964,8 +4103,7 @@ class ToolsPanel(tk.Frame):
                 0, min(180, int(self.transform_rotation_snap)))
         except (TypeError, ValueError):
             self.transform_rotation_snap = 15
-        self.size_var.set(self.brush_size)
-        self._sync_buttons(rebuild=True)
+        self._refresh_settings_controls()
 
     # ---------------------------------------------------------- brush presets
     # The tools that have a preset library, mapped to the settings prefix their
@@ -3987,7 +4125,7 @@ class ToolsPanel(tk.Frame):
         return params
 
     def apply_tool_params(self, tool, params):
-        """Apply a preset body to ``tool``'s settings and rebuild the panel."""
+        """Apply a preset body to ``tool``'s settings in place."""
         prefix = self.PRESET_TOOLS.get(tool)
         if prefix is None or not isinstance(params, dict):
             return
@@ -3999,10 +4137,9 @@ class ToolsPanel(tk.Frame):
             try:
                 self.brush_size = max(1, min(int(params["brush_size"]),
                                              MAX_BRUSH_SIZE))
-                self.size_var.set(self.brush_size)
             except (TypeError, ValueError):
                 pass
-        self._sync_buttons(rebuild=True)
+        self._refresh_settings_controls()
 
 
 class DrawingController:
