@@ -2250,7 +2250,7 @@ class CanvasView(tk.Canvas):
         x1, y1 = self._doc_to_view(box[2], box[3])
         accent = theme.color("accent") or "#3b82f6"
         self.create_rectangle(
-            x0, y0, x1, y1, outline=accent, width=1, dash=(4, 3),
+            x0, y0, x1, y1, outline=accent, width=2, dash=(6, 4),
             tags="docborder",
         )
 
