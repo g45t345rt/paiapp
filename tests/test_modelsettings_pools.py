@@ -148,6 +148,45 @@ def test_wizard_remote_fibo_adds_repo_entry():
     check("fibo no components", dialog.entries[0]["components"], {})
 
 
+def test_tool_wizard_result_curates_pools():
+    dialog = _dialog({})
+    for name in (
+        "_finish", "_new_pool_row", "_refresh_pool_count", "_expand_pool",
+    ):
+        setattr(dialog, name, mock.Mock(return_value=None))
+    dialog._pools_canvas = None
+
+    with tempfile.TemporaryDirectory() as folder:
+        background = os.path.join(folder, "birefnet-general.safetensors")
+        upscale = os.path.join(folder, "RealESRGAN_x4.pth")
+        for path in (background, upscale):
+            open(path, "wb").close()
+        payload = {
+            "tool": "background", "label": "BiRefNet (general)",
+            "path": background,
+            "files": [
+                {"path": background, "pool": "background",
+                 "label": "BiRefNet (general)"},
+                {"path": upscale, "pool": "upscale",
+                 "label": "Real-ESRGAN x4"},
+            ],
+            "warnings": [],
+        }
+        dialog._on_tool_wizard_ready(payload)
+        check("background tool curated",
+              [item["path"] for item in dialog.pools["background"]],
+              [background])
+        check("upscale tool curated",
+              [item["path"] for item in dialog.pools["upscale"]],
+              [upscale])
+        check("tool pool row added", dialog._new_pool_row.call_count, 2)
+
+        dialog._on_tool_wizard_ready(payload)
+        check("no duplicate background item",
+              len(dialog.pools["background"]), 1)
+        check("no duplicate upscale item", len(dialog.pools["upscale"]), 1)
+
+
 def main():
     for name, fn in sorted(globals().items()):
         if name.startswith("test_") and callable(fn):

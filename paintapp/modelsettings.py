@@ -84,7 +84,7 @@ from engine import component_kinds as engine_kinds
 from engine import paths as engine_paths
 from engine import settings as engine_settings
 
-from . import dialogs, hubdialog, modelwizard, theme
+from . import dialogs, hubdialog, modelwizard, theme, toolwizard
 from .constants import MAX_CANVAS_SIZE
 from .scrollbar import AutoScrollbar
 
@@ -200,6 +200,7 @@ _COMPONENT_DIRS = (
     ("adapters", ("adapters",)),
     ("controlnet", ("controlnet",)),
     ("upscale", ("upscale_models",)),
+    ("background", ("background",)),
 )
 
 # Pool -> its engine folder, as a ``component_path`` parts tuple. A model's
@@ -1821,6 +1822,9 @@ class ModelSettingsDialog:
         tk.Button(
             bar, text="Download model wizard\u2026", command=self._download_wizard,
         ).pack(side=tk.LEFT, padx=(6, 0))
+        tk.Button(
+            bar, text="Download tools\u2026", command=self._download_tools,
+        ).pack(side=tk.LEFT, padx=(6, 0))
         tk.Label(
             holder, text="Adds model files from a folder (and subfolders) or the Hub.", anchor="w",
             fg=theme.color("muted"),
@@ -2617,6 +2621,42 @@ class ModelSettingsDialog:
         modelwizard.ModelDownloadWizard(
             self.window, on_ready=self._on_wizard_ready,
         )
+
+    def _download_tools(self):
+        """Download a background, upscale or segmentation model into its folder."""
+        toolwizard.ToolDownloadWizard(
+            self.window, on_ready=self._on_tool_wizard_ready,
+        )
+
+    def _on_tool_wizard_ready(self, payload):
+        """Curate a completed tool download into its component pool.
+
+        Unlike a generation download there is no model row: background and
+        upscale models are selected by pool label alone, so the files simply
+        join the matching pool. Segmentation exports are support models that
+        :mod:`engine.segmentation` lists from their folder, so they are skipped
+        like :meth:`_on_hub_downloaded` does. Nothing is saved here; Save still
+        commits the tables, matching the other download paths.
+        """
+        changed = set()
+        for entry in payload.get("files") or ():
+            path = os.fspath(entry.get("path") or "")
+            pool_name = entry.get("pool")
+            if not path or not pool_name:
+                continue
+            if engine_paths.is_segmentation_model(path):
+                continue
+            pool = self.pools.setdefault(pool_name, [])
+            key = _path_key(path)
+            if any(_path_key(item.get("path")) == key for item in pool):
+                continue
+            item = {"label": entry.get("label") or _stem(path), "path": path}
+            pool.append(item)
+            self._finish(self._new_pool_row(pool_name, item), self._pools_canvas)
+            changed.add(pool_name)
+        for name in changed:
+            self._refresh_pool_count(name)
+            self._expand_pool(name)
 
     def _on_wizard_ready(self, payload):
         """File a completed wizard download into pools and one model row.

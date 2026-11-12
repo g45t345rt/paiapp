@@ -385,6 +385,7 @@ _COMPONENT_DIRS = {
     "loras": loras_dir,
     "adapters": adapters_dir,
     "controlnet": controlnet_dir,
+    "background": background_dir,
     "upscale_models": upscale_dir,
 }
 

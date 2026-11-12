@@ -4,8 +4,9 @@
 
 1. Open **Model Settings** and set the models root folder.
 2. Use **Download model wizard...** to pick a model and fetch the matching VAE
-   and text encoders in one step, or download the files for your chosen family
-   into the matching subfolders listed below.
+   and text encoders in one step, or **Download tools...** to install a
+   background-removal, upscale or segmentation model. You can also download the
+   files for your chosen family into the matching subfolders listed below.
 3. Optional: In Model Settings, use **Scan folder...** to point the models root at your ComfyUI `models` folder
 4. In Generate, select the model row and run.
 
@@ -112,9 +113,27 @@ working range is roughly 4–16 MP (2048×2048 is the default).
 | Component | File | Folder |
 | --- | --- | --- |
 | Upscale model | Any Real-ESRGAN `.safetensors`, `.pth`, or `.onnx` | `upscale_models/` |
+| SeedVR2 model | `seedvr2_ema_3b_fp8_e4m3fn.safetensors` | `upscale_models/` |
+| SeedVR2 VAE | `seedvr2_ema_vae_fp16.safetensors` | `vae/` |
+
+**Download tools...** offers Real-ESRGAN x2/x4/x8 and the SeedVR2 3B/7B
+restorers, and files them into the same pools.
 
 ### Background removal
 
 | Component | File | Folder |
 | --- | --- | --- |
-| Background removal model | `birefnet-general.onnx`, `u2net.onnx`, or `modnet_photographic_portrait_matting.onnx` | `background/` |
+| Background removal model | `birefnet-general.onnx`, `birefnet-general.safetensors`, `birefnet-lite.onnx`, `birefnet-portrait.onnx`, `rmbg-2.0.safetensors`, `u2net.onnx`, or `modnet_photographic_portrait_matting.onnx` | `background/` |
+
+**Download tools...** offers BiRefNet general, BiRefNet lite, BiRefNet portrait,
+U2Net, U2Net portrait, and MODNet, and files them into the background pool.
+
+### Segmentation
+
+| Component | File | Folder |
+| --- | --- | --- |
+| Click-to-segment model | A SAM ONNX encoder/decoder pair: `<label>_encoder.onnx` + `<label>_decoder.onnx`, or an extracted archive folder `<label>/encoder.onnx` + `<label>/decoder.onnx` | `segmentation/` |
+
+**Download tools...** offers MobileSAM, SAM ViT-B and SAM ViT-H (quantized ONNX
+archives), unpacks them into `segmentation/`, and lists them in the Segment
+tool.
