@@ -185,6 +185,44 @@ def _build_view(canvas, layout):
     return root, view
 
 
+def test_toggle_keeps_camera():
+    """Opening and closing the grid keeps the zoom and the stacked camera."""
+    import tkinter as tk
+
+    from paintapp.canvasarea import CanvasView
+
+    try:
+        root = tk.Tk()
+    except tk.TclError:
+        SKIPPED.append("exploded camera (no display)")
+        return
+    root.withdraw()
+    canvas = build_canvas()
+    layout = exploded.compute(canvas, columns=2)
+    view = CanvasView(root, canvas)
+    view.config(scrollregion=(0, 0, 4000, 4000))
+    view.zoom = 2.0
+    view.xview_moveto(0.3)
+    view.yview_moveto(0.4)
+    before = view.view_state()
+    canvas.active = 1
+    view.enter_exploded(layout)
+    sx, sy = view._active_shift()
+    shifted = view._pending_anchor
+    check("explode keeps zoom", view.zoom, before["zoom"])
+    check("explode maps anchor into the cell", (
+        shifted[0], shifted[1],
+    ), (
+        before["anchor"][0] - sx, before["anchor"][1] - sy,
+    ))
+    check("explode shows the grid", view.exploded, True)
+    view.leave_exploded()
+    check("collapse keeps zoom", view.zoom, before["zoom"])
+    check("collapse restores anchor", view._pending_anchor, before["anchor"])
+    check("collapse clears the grid", view.exploded, False)
+    root.destroy()
+
+
 def test_preview_maps_to_active_cell():
     """A pending generation preview is centred on the active layer's tile."""
     canvas = build_canvas()
@@ -233,6 +271,7 @@ def main():
     test_shift_round_trip()
     test_cells_fit_full_images()
     test_gaps_show_background()
+    test_toggle_keeps_camera()
     test_preview_maps_to_active_cell()
     test_preview_drawn_on_active_cell()
     print()

@@ -1148,6 +1148,12 @@ class CanvasView(tk.Canvas):
         self._layout = None
         self._shift = (0, 0)
         self._frame_size = (doc.width, doc.height)
+        # Camera saved on the way into the exploded view, restored on the way
+        # out (see :meth:`enter_exploded`). ``_exploded_camera_framed`` marks a
+        # view that already has an exploded camera, so a tab switch does not
+        # reframe it (see :meth:`paintapp.app.PaintApp._activate_canvas`).
+        self._stacked_view_state = None
+        self._exploded_camera_framed = False
         # Document pixel that should sit at the viewport's top-left on the next
         # successful render. Set when a view is recreated (see
         # :meth:`set_view_state`) so its camera survives an undo/redo rebuild.
@@ -1445,6 +1451,37 @@ class CanvasView(tk.Canvas):
         self._layout = None
         self._shift = (0, 0)
         self._frame_size = (self.doc.width, self.doc.height)
+
+    def enter_exploded(self, layout):
+        """Show ``layout``'s grid while keeping the current camera.
+
+        The stacked view's zoom is kept, and its top-left anchor is shifted
+        into the active layer's cell, so the artwork under the viewport stays
+        put when the grid opens instead of the whole board being reframed. The
+        stacked camera is saved for :meth:`leave_exploded`, which restores it
+        when the grid is closed.
+        """
+        if layout is None or self._layout is not None:
+            return
+        self._stacked_view_state = self.view_state()
+        self.set_layout(layout)
+        state = dict(self._stacked_view_state)
+        ax, ay = state.get("anchor", (0.0, 0.0))
+        sx, sy = self._active_shift()
+        state["anchor"] = (ax - sx, ay - sy)
+        self.set_view_state(state)
+        self._exploded_camera_framed = True
+
+    def leave_exploded(self):
+        """Return to the stacked view and restore the camera saved on entry."""
+        if self._layout is None:
+            return
+        self.clear_layout()
+        state = self._stacked_view_state
+        self._stacked_view_state = None
+        self._exploded_camera_framed = False
+        if state is not None:
+            self.set_view_state(state)
 
     def refresh_layout_shift(self):
         """Recompute the active-layer shift for the current exploded layout."""

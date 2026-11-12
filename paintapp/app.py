@@ -1287,15 +1287,19 @@ class PaintApp:
         if self._transform_mode_active():
             self.drawing.sync_transform()
         # The exploded view is a per-canvas mode: mirror the newly active
-        # canvas's choice, hide the (document-space) rulers there, and frame the
-        # grid so switching tabs lands on the whole board.
+        # canvas's choice and hide the (document-space) rulers there. Each tab
+        # keeps its own camera, so only a view that has never been framed (a
+        # project loaded while already exploded) is fitted to the board.
         if hasattr(self, "exploded_var"):
             self.exploded_var.set(self.show_exploded)
         if self.show_exploded:
             self.area.set_rulers_visible(False)
-            layout = self.current._exploded_layout if self.current else None
-            if view is not None and layout is not None and layout.size[0] > 0:
-                view.fit_document_rect((0, 0, layout.size[0], layout.size[1]))
+            if (view is not None and view.exploded
+                    and not view._exploded_camera_framed):
+                layout = self.current._exploded_layout if self.current else None
+                if layout is not None and layout.size[0] > 0:
+                    view.fit_document_rect((0, 0, layout.size[0], layout.size[1]))
+                    view._exploded_camera_framed = True
 
     def _refresh_canvas_tabs(self):
         self.area.refresh_titles(self.canvases)
@@ -2164,19 +2168,25 @@ class PaintApp:
             if self._transform_mode_active():
                 self.drawing.cancel_transform()
             self.area.set_rulers_visible(False)
+            # Keep the current document camera: the view shifts its zoom and
+            # anchor into the active layer's cell and remembers the stacked
+            # camera, so switching back restores the view instead of keeping
+            # the grid's fit-to-board framing.
+            if view is not None and self.current is not None and self.current.layers:
+                view.enter_exploded(self._ensure_exploded_layout())
         else:
             if self.current is not None:
                 self.current._exploded_layout = None
+            if view is not None:
+                view.leave_exploded()
             self.area.set_rulers_visible(self.show_rulers)
         self.render()
-        if enabled:
-            layout = self.current._exploded_layout if self.current else None
-            if view is not None and layout is not None and layout.size[0] > 0:
-                # Frame the tile a pending preview now sits on instead of the
-                # whole board, so it is the thing that fills the viewport.
-                rect = (0, 0, layout.size[0], layout.size[1])
-                if view.has_generation_preview():
-                    rect = view.preview_fit_bounds() or rect
+        if enabled and view is not None and view.exploded \
+                and view.has_generation_preview():
+            # A pending preview is framed so it fills the viewport; the stacked
+            # camera is still restored when the exploded view is turned off.
+            rect = view.preview_fit_bounds()
+            if rect is not None:
                 view.fit_document_rect(rect)
         self.set_result(
             "Exploded layers on \u2014 click a tile to edit that layer."
