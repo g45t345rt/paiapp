@@ -502,10 +502,11 @@ class HubFileDialog:
 
     def _refresh_dest(self):
         dest = self._selected_dest()
+        shown = engine_paths.shorten_path(dest, engine_paths.show_full_paths())
         if dest and os.path.isabs(dest):
-            self.dest_path.config(text=dest)
+            self.dest_path.config(text=shown)
         elif dest:
-            self.dest_path.config(text=f"(choose a models folder) {dest}")
+            self.dest_path.config(text=f"(choose a models folder) {shown}")
         else:
             self.dest_path.config(text="(no destination chosen)")
 
@@ -514,7 +515,11 @@ class HubFileDialog:
         chosen = filedialog.askdirectory(parent=self.window, initialdir=initial)
         if chosen:
             self._custom = os.path.normpath(chosen)
-            self.dest_path.config(text=self._custom)
+            self.dest_path.config(
+                text=engine_paths.shorten_path(
+                    self._custom, engine_paths.show_full_paths(),
+                )
+            )
 
     def _choose_root(self):
         """Set the models root from here, so a new user can organize downloads
@@ -532,7 +537,10 @@ class HubFileDialog:
         self._targets = _folder_targets()
         self._custom = None
         self._refresh_dest()
-        self.status.config(text=f"Models folder set to {chosen}.")
+        self.status.config(
+            text="Models folder set to "
+            f"{engine_paths.shorten_path(chosen, engine_paths.show_full_paths())}."
+        )
 
     def _selected_files(self):
         chosen = []
@@ -598,9 +606,24 @@ class HubFileDialog:
                 text="Pick a destination folder with Browse\u2026 or Models folder\u2026."
             )
             return
-        jobs = self._names_for(files)
-        window = _DownloadWindow(self.window, self.summary["id"], jobs, dest)
-        saved = window.run()
+        jobs = [
+            {
+                "repo": self.summary["id"],
+                "filename": item["path"],
+                "name": name,
+                "dest_dir": dest,
+                "size": item.get("size") or 0,
+            }
+            for item, name in self._names_for(files)
+        ]
+        window = _DownloadWindow(self.window, jobs, title=self.summary["id"])
+        results = window.run()
+        saved = []
+        for result in results:
+            if result.get("members"):
+                saved.extend(result["members"])
+            elif result.get("path"):
+                saved.append(result["path"])
         if not saved:
             return
         if self.on_downloaded is not None:
@@ -694,19 +717,25 @@ class _RenameDialog:
 
 
 class _DownloadWindow:
-    """A modal progress bar for downloading a list of files, one at a time."""
+    """A modal progress bar for downloading a list of files, one at a time.
 
-    def __init__(self, root, repo, jobs, dest_dir):
+    Each job is a dict with ``repo``, ``filename``, ``dest_dir`` and optional
+    ``name``, ``size`` and ``label``. Jobs may target different folders, which
+    the model download wizard needs (a diffusion model, a text encoder and a VAE
+    land in three folders). :meth:`run` returns one result per completed job:
+    ``{"job", "path", "members"}``.
+    """
+
+    def __init__(self, root, jobs, title="Downloading"):
         self.root = root
-        self.repo = repo
         self.jobs = jobs
-        self.dest_dir = dest_dir
         self.saved = []
+        self.results = []
         self._cancel = CancelToken()
         self._queue = queue.Queue()
         self._finished = False
         self.window = tk.Toplevel(root)
-        self.window.title("Downloading")
+        self.window.title(title)
         self.window.transient(root)
         self.window.resizable(False, False)
         self.window.withdraw()
@@ -749,11 +778,16 @@ class _DownloadWindow:
         )
 
     def run(self):
-        """Start the transfers and block until they finish; return saved paths."""
+        """Start the transfers and block until they finish.
+
+        Returns one result dict per completed job:
+        ``{"job", "path", "members"}``. ``members`` is non-empty when the
+        download was an archive that was unpacked into the destination.
+        """
         threading.Thread(target=self._work, daemon=True).start()
         self.window.after(80, self._poll)
         self.root.wait_window(self.window)
-        return self.saved
+        return self.results
 
     def _work(self):
         job_count = len(self.jobs)
@@ -763,9 +797,11 @@ class _DownloadWindow:
             self._queue.put(("progress", frac, label, read, total, index, rate))
 
         try:
-            for index, (item, name) in enumerate(self.jobs):
+            for index, job in enumerate(self.jobs):
                 self._cancel.throw_if_cancelled()
                 speed.update(time=None, read=0, value=0.0)
+                name = job.get("name") or job["filename"].rsplit("/", 1)[-1]
+                dest_dir = job["dest_dir"]
 
                 def on_file(frac, label, read=0, total=0, base=index):
                     now = time.monotonic()
@@ -788,10 +824,10 @@ class _DownloadWindow:
                     )
 
                 path = engine_hub.download_file(
-                    self.repo, item["path"], self.dest_dir, name=name,
+                    job["repo"], job["filename"], dest_dir, name=name,
                     progress=on_file, cancel=self._cancel,
                 )
-                members = engine_hub.extract_archive(path, self.dest_dir, name=name)
+                members = engine_hub.extract_archive(path, dest_dir, name=name)
                 if members:
                     # The archive held the model files (a SAM ONNX bundle, say);
                     # keep the unpacked files and drop the archive itself.
@@ -802,6 +838,7 @@ class _DownloadWindow:
                     self.saved.extend(members)
                 else:
                     self.saved.append(path)
+                self.results.append({"job": job, "path": path, "members": members})
         except Cancelled:
             self._queue.put(("cancelled", None))
             return
@@ -822,11 +859,12 @@ class _DownloadWindow:
             kind = message[0]
             if kind == "progress":
                 frac, label, read, size, index, rate = message[1:7]
+                job = self.jobs[index]
                 if not size:
-                    item = self.jobs[index][0]
-                    size = item.get("size") or 0
+                    size = job.get("size") or 0
                 self.bar.config(value=max(0.0, min(1.0, frac)) * 100)
-                self.name.config(text=label)
+                role = job.get("label")
+                self.name.config(text=f"{role}: {label}" if role else label)
                 detail = f"{index + 1} of {len(self.jobs)}"
                 if size:
                     detail += f"  \u00b7  {human_size(read)} / {human_size(size)}"
@@ -853,6 +891,7 @@ class _DownloadWindow:
         self._finished = True
         if error:
             self.saved = []
+            self.results = []
         self.status.config(text=text)
         if error:
             theme.register(self.status, fg="error")

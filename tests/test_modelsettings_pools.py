@@ -84,6 +84,70 @@ def test_detection_pass_includes_folder_file():
                   (vae, ms.engine_kinds.VAE) in pending, True)
 
 
+def test_wizard_result_creates_row_with_components():
+    dialog = _dialog({})
+    for name in (
+        "_finish", "_new_pool_row", "_refresh_pool_count", "_expand_pool",
+        "_new_entry_row", "_refresh_entry_count", "_expand_group",
+        "_remake_entry_row",
+    ):
+        setattr(dialog, name, mock.Mock(return_value=None))
+    dialog._pools_canvas = None
+    dialog._entries_canvas = None
+
+    with tempfile.TemporaryDirectory() as folder:
+        model = os.path.join(folder, "flux1-dev-Q4_K_S.gguf")
+        clip = os.path.join(folder, "clip_l.safetensors")
+        vae = os.path.join(folder, "flux_vae.safetensors")
+        for path in (model, clip, vae):
+            open(path, "wb").close()
+        payload = {
+            "family": "flux", "group": "Flux", "label": "FLUX.1 dev",
+            "path": model,
+            "components": {"clip": clip, "vae": vae},
+            "warnings": [],
+        }
+        dialog._on_wizard_ready(payload)
+        check("one entry", len(dialog.entries), 1)
+        entry = dialog.entries[0]
+        check("entry path", entry["path"], model)
+        check("entry family", entry["family"], "flux")
+        check("entry components", entry["components"],
+              {"clip": clip, "vae": vae})
+        check("clip curated",
+              [item["path"] for item in dialog.pools["text_encoders"]], [clip])
+        check("vae curated",
+              [item["path"] for item in dialog.pools["vaes"]], [vae])
+
+        dialog._on_wizard_ready(payload)
+        check("no duplicate entry", len(dialog.entries), 1)
+        check("no duplicate pool item",
+              len(dialog.pools["text_encoders"]), 1)
+        check("existing row rebuilt",
+              dialog._remake_entry_row.called, True)
+
+
+def test_wizard_remote_fibo_adds_repo_entry():
+    dialog = _dialog({})
+    for name in (
+        "_finish", "_new_pool_row", "_refresh_pool_count", "_expand_pool",
+        "_new_entry_row", "_refresh_entry_count", "_expand_group",
+        "_remake_entry_row",
+    ):
+        setattr(dialog, name, mock.Mock(return_value=None))
+    dialog._pools_canvas = None
+    dialog._entries_canvas = None
+
+    payload = {
+        "family": "fibo", "group": "Fibo 2.0", "label": "Fibo 2.0 Dev",
+        "path": "briaai/Fibo-2.0-dev", "components": {}, "warnings": [],
+    }
+    dialog._on_wizard_ready(payload)
+    check("fibo entry", len(dialog.entries), 1)
+    check("fibo repo id", dialog.entries[0]["path"], "briaai/Fibo-2.0-dev")
+    check("fibo no components", dialog.entries[0]["components"], {})
+
+
 def main():
     for name, fn in sorted(globals().items()):
         if name.startswith("test_") and callable(fn):

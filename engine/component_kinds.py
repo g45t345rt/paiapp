@@ -113,6 +113,49 @@ SLOT_KIND = {
     ("h3_image", "vae"): "h3_image_vae",
 }
 
+# Per-family component slots a model row can assign: ``(slot, label, pool)``.
+# Model Settings renders these rows, and :mod:`engine.model_catalog` uses the
+# same table to know which companion files a downloaded model needs. A family
+# with an empty tuple loads as one file (or one diffusers folder), so it has no
+# separate component slots.
+FAMILY_SLOTS = {
+    "anima": (
+        ("clip", "Text encoder", "text_encoders"),
+        ("vae", "VAE", "vaes"),
+    ),
+    "qwen_image": (
+        ("text", "Text encoder", "text_encoders"),
+        ("vae", "VAE", "vaes"),
+    ),
+    "flux": (
+        ("clip", "CLIP-L", "text_encoders"),
+        ("t5", "T5-XXL", "text_encoders"),
+        ("vae", "VAE", "vaes"),
+    ),
+    "z_image": (
+        ("text", "Text encoder", "text_encoders"),
+        ("vae", "VAE", "vaes"),
+    ),
+    "krea2": (
+        ("text", "Text encoder", "text_encoders"),
+        ("vae", "VAE", "vaes"),
+    ),
+    "moss_image": (
+        ("text", "Text encoder", "text_encoders"),
+        ("vae", "VAE", "vaes"),
+    ),
+    "h3": (
+        ("text", "Text encoder", "text_encoders"),
+        ("vae", "VAE", "vaes"),
+    ),
+    "h3_image": (
+        ("text", "Text encoder", "text_encoders"),
+        ("vae", "VAE", "vaes"),
+    ),
+    "fibo": (),
+    "stable_diffusion": (),
+}
+
 # Component slot -> the curated pool its default file is drawn from.
 SLOT_POOL = {
     "clip": "text_encoders",

@@ -3,9 +3,16 @@
 ## Quick start
 
 1. Open **Model Settings** and set the models root folder.
-2. Download the files for your chosen family into the matching subfolders listed below.
+2. Use **Download model wizard...** to pick a model and fetch the matching VAE
+   and text encoders in one step, or download the files for your chosen family
+   into the matching subfolders listed below.
 3. Optional: In Model Settings, use **Scan folder...** to point the models root at your ComfyUI `models` folder
 4. In Generate, select the model row and run.
+
+The wizard reads your GPU and RAM and preselects the largest quantization that
+fits. It never changes which VAE or text-encoder architecture a model needs --
+only how much of the model to download. If hardware cannot be detected it picks
+a balanced profile and lets you choose another one.
 
 No model is required for the paint tools. AI generation, upscaling, and background removal are optional.
 

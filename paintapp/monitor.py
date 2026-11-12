@@ -95,6 +95,52 @@ def gpu_memory():
     return None
 
 
+def gpu_adapters():
+    """Known hardware adapters as ``[{"name", "vram_gb"}, ...]``, largest first.
+
+    Unlike :func:`gpu_memory`, which sums usage across adapters for the status
+    bar, this reports each card separately: a model recommendation has to use
+    the largest *single* card, not the combined total, because one model loads
+    on one GPU. Returns an empty list when no source can name a card.
+    """
+    adapters = []
+    if os.name == "nt":
+        try:
+            found = _dxgi_adapters()
+        except Exception:
+            found = {}
+        for name, dedicated in found.values():
+            if dedicated:
+                adapters.append({"name": name, "vram_gb": dedicated / _GIB})
+    else:
+        exe = shutil.which("nvidia-smi")
+        if exe:
+            out = _run_command([
+                exe, "--query-gpu=name,memory.total",
+                "--format=csv,noheader,nounits",
+            ])
+            for line in (out or "").splitlines():
+                parts = [part.strip() for part in line.split(",")]
+                if len(parts) < 2:
+                    continue
+                try:
+                    total_mb = float(parts[1])
+                except ValueError:
+                    continue
+                if total_mb:
+                    adapters.append({
+                        "name": parts[0], "vram_gb": total_mb / 1024,
+                    })
+    adapters.sort(key=lambda item: item["vram_gb"], reverse=True)
+    return adapters
+
+
+def primary_gpu():
+    """The largest adapter as ``{"name", "vram_gb"}``, or ``None``."""
+    adapters = gpu_adapters()
+    return adapters[0] if adapters else None
+
+
 def _run_command(cmd):
     """Run a helper tool and return its stdout, or ``None`` on any failure."""
     try:

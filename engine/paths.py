@@ -279,6 +279,49 @@ def model(*parts):
     return os.path.join(models_root(), *parts)
 
 
+# How many trailing path segments the models UI shows when full paths are off.
+# Enough to tell two files apart, few enough that the user's home folder never
+# ends up on screen -- a full path in a screenshot or screen recording would
+# otherwise leak it.
+_TAIL_SEGMENTS = 2
+
+
+def show_full_paths():
+    """Whether the models UI may print whole paths.
+
+    A full path puts the user's home folder (``C:\\Users\\...``) on screen, where
+    it can end up in a screenshot or recording. Model Settings asks for the full
+    form, stored as ``models.show_full_paths``; every other window follows it.
+    """
+    return bool(_model_settings().get("show_full_paths"))
+
+
+def shorten_path(path, full=False):
+    """A path as the models UI shows it: the whole thing, or just its tail.
+
+    Unless full paths are asked for, the home folder is folded to ``~`` and only
+    the last couple of segments are kept, prefixed with an ellipsis. A Fibo 2.0
+    model can be a Hub repo id (``owner/name``) rather than a local path; that is
+    kept whole, since normpath would rewrite its slash.
+    """
+    if full or not path:
+        return path
+    raw = os.fspath(path)
+    if "/" in raw and "\\" not in raw and not os.path.isabs(raw) and not os.path.exists(raw):
+        return raw
+    text = os.path.normpath(raw)
+    home = os.path.normpath(os.path.expanduser("~"))
+    folded = text
+    if os.path.normcase(text) == os.path.normcase(home):
+        folded = "~"
+    elif os.path.normcase(text).startswith(os.path.normcase(home + os.sep)):
+        folded = "~" + text[len(home):]
+    parts = [part for part in folded.replace("\\", "/").split("/") if part]
+    if len(parts) > _TAIL_SEGMENTS:
+        return "\u2026" + os.sep + os.sep.join(parts[-_TAIL_SEGMENTS:])
+    return folded
+
+
 def _dir(key, default_parts):
     override = _model_settings().get(key)
     if override:

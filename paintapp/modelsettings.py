@@ -84,7 +84,7 @@ from engine import component_kinds as engine_kinds
 from engine import paths as engine_paths
 from engine import settings as engine_settings
 
-from . import dialogs, hubdialog, theme
+from . import dialogs, hubdialog, modelwizard, theme
 from .constants import MAX_CANVAS_SIZE
 from .scrollbar import AutoScrollbar
 
@@ -143,46 +143,10 @@ _DUPLICATE_GLYPH = "\u29c9"
 
 # Per-family component slots a model row can assign: (slot, label, pool key).
 # Every family also gets a LoRA list (see ``_render_loras``); it is kept out of
-# this table because it is a repeatable, strength-bearing list.
-_FAMILY_SLOTS = {
-    "anima": (
-        ("clip", "Text encoder", "text_encoders"),
-        ("vae", "VAE", "vaes"),
-    ),
-    "qwen_image": (
-        ("text", "Text encoder", "text_encoders"),
-        ("vae", "VAE", "vaes"),
-    ),
-    "flux": (
-        ("clip", "CLIP-L", "text_encoders"),
-        ("t5", "T5-XXL", "text_encoders"),
-        ("vae", "VAE", "vaes"),
-    ),
-    "z_image": (
-        ("text", "Text encoder", "text_encoders"),
-        ("vae", "VAE", "vaes"),
-    ),
-    "krea2": (
-        ("text", "Text encoder", "text_encoders"),
-        ("vae", "VAE", "vaes"),
-    ),
-    "moss_image": (
-        ("text", "Text encoder", "text_encoders"),
-        ("vae", "VAE", "vaes"),
-    ),
-    "h3": (
-        ("text", "Text encoder", "text_encoders"),
-        ("vae", "VAE", "vaes"),
-    ),
-    "h3_image": (
-        ("text", "Text encoder", "text_encoders"),
-        ("vae", "VAE", "vaes"),
-    ),
-    # Fibo 2.0 loads as one diffusers-format directory (or repo id), so it has no
-    # per-component slots -- the model's own path is the whole pipeline.
-    "fibo": (),
-    "stable_diffusion": (),
-}
+# this table because it is a repeatable, strength-bearing list. The table lives
+# in the engine so the download wizard and the Model Settings rows agree on what
+# a family needs.
+_FAMILY_SLOTS = engine_kinds.FAMILY_SLOTS
 
 # The kind (see :mod:`engine.component_kinds`) each family's component slot is
 # meant to hold. It seeds the slot's "Kind" dropdown and is marked
@@ -286,13 +250,6 @@ _RECIPE_COLUMNS = (
 # stutter.
 _SCROLLBAR_WIDTH = 12
 
-# How many trailing path segments Model Settings shows when full paths are off.
-# Enough to tell two files apart, few enough that the user's home folder never
-# ends up on screen -- a full path in a screenshot or screen recording would
-# otherwise leak it.
-_TAIL_SEGMENTS = 2
-
-
 def _format_path(path, full):
     """A path as shown in Model Settings: the whole thing, or just its tail.
 
@@ -300,26 +257,9 @@ def _format_path(path, full):
     but a full path puts the user's home folder (``C:\\Users\\...``) on screen,
     which then shows up in screenshots and recordings. Unless full paths are
     asked for, the home folder is folded to ``~`` and only the last couple of
-    segments are kept, prefixed with an ellipsis.
+    segments are kept (see :func:`engine.paths.shorten_path`).
     """
-    if full or not path:
-        return path
-    # A Fibo 2.0 model can be a Hub repo id (``owner/name``) rather than a local
-    # path; keep it whole, since normpath would rewrite its slash.
-    raw = os.fspath(path)
-    if "/" in raw and "\\" not in raw and not os.path.isabs(raw) and not os.path.exists(raw):
-        return raw
-    text = os.path.normpath(raw)
-    home = os.path.normpath(os.path.expanduser("~"))
-    folded = text
-    if os.path.normcase(text) == os.path.normcase(home):
-        folded = "~"
-    elif os.path.normcase(text).startswith(os.path.normcase(home + os.sep)):
-        folded = "~" + text[len(home):]
-    parts = [part for part in folded.replace("\\", "/").split("/") if part]
-    if len(parts) > _TAIL_SEGMENTS:
-        return "\u2026" + os.sep + os.sep.join(parts[-_TAIL_SEGMENTS:])
-    return folded
+    return engine_paths.shorten_path(path, full)
 
 
 def _stem(path):
@@ -821,9 +761,10 @@ class ModelSettingsDialog:
             self._recipe_model_var.set(next(iter(self._recipe_model_choices)))
         tk.Button(bar, text="Add recipe", command=self._add_recipe).pack(side=tk.LEFT)
         tk.Label(
-            bar, text="Recipes are picked per model in the Generate panel.",
+            self.table, text="Recipes are picked per model in the Generate panel.",
             anchor="w", fg=theme.color("muted"),
-        ).pack(side=tk.LEFT, padx=(8, 0))
+        ).grid(row=self._row, column=0, columnspan=4, sticky="we", pady=(0, 2))
+        self._row += 1
 
         self._recipes_body = tk.Frame(self.table)
         self._recipes_body.grid(
@@ -1445,9 +1386,9 @@ class ModelSettingsDialog:
             values=["Auto-detect"] + list(self._scan_pool_choices),
         ).pack(side=tk.LEFT)
         tk.Label(
-            bar, text="Adds component files from a folder (and subfolders) or the Hub.", anchor="w",
+            holder, text="Adds component files from a folder (and subfolders) or the Hub.", anchor="w",
             fg=theme.color("muted"),
-        ).pack(side=tk.LEFT, padx=(8, 0))
+        ).pack(fill=tk.X, pady=(0, 2))
 
         self._pools_body = tk.Frame(holder)
         self._pools_body.pack(fill=tk.X, pady=(2, 0))
@@ -1877,10 +1818,13 @@ class ModelSettingsDialog:
         tk.Button(
             bar, text="Browse Hugging Face\u2026", command=self._browse_hub,
         ).pack(side=tk.LEFT, padx=(6, 0))
+        tk.Button(
+            bar, text="Download model wizard\u2026", command=self._download_wizard,
+        ).pack(side=tk.LEFT, padx=(6, 0))
         tk.Label(
-            bar, text="Adds model files from a folder (and subfolders) or the Hub.", anchor="w",
+            holder, text="Adds model files from a folder (and subfolders) or the Hub.", anchor="w",
             fg=theme.color("muted"),
-        ).pack(side=tk.LEFT, padx=(8, 0))
+        ).pack(fill=tk.X, pady=(0, 2))
 
         self._entries_body = tk.Frame(holder)
         self._entries_body.pack(fill=tk.X, pady=(2, 0))
@@ -2667,6 +2611,73 @@ class ModelSettingsDialog:
     def _browse_hub(self):
         """Search Hugging Face and file any downloaded files into the tables."""
         hubdialog.HubBrowserDialog(self.window, on_downloaded=self._on_hub_downloaded)
+
+    def _download_wizard(self):
+        """Download a model together with the VAE/text encoders it needs."""
+        modelwizard.ModelDownloadWizard(
+            self.window, on_ready=self._on_wizard_ready,
+        )
+
+    def _on_wizard_ready(self, payload):
+        """File a completed wizard download into pools and one model row.
+
+        Unlike :meth:`_on_hub_downloaded`, which only sees paths, the wizard
+        knows each file's role, so the new row is created with its component
+        slots already assigned. Nothing is saved here; Save still commits the
+        tables, matching the other download paths.
+        """
+        path = os.fspath(payload.get("path") or "")
+        if not path:
+            return
+        components = {
+            slot: os.fspath(value)
+            for slot, value in (payload.get("components") or {}).items()
+            if value
+        }
+        pool_for = {
+            "clip": "text_encoders", "t5": "text_encoders",
+            "text": "text_encoders", "vae": "vaes",
+        }
+        for slot, value in components.items():
+            pool_name = pool_for.get(slot)
+            if not pool_name:
+                continue
+            pool = self.pools.setdefault(pool_name, [])
+            key = _path_key(value)
+            if any(_path_key(item.get("path")) == key for item in pool):
+                continue
+            item = {"label": _stem(value), "path": value}
+            pool.append(item)
+            self._finish(self._new_pool_row(pool_name, item), self._pools_canvas)
+            self._refresh_pool_count(pool_name)
+            self._expand_pool(pool_name)
+
+        group = payload.get("group") or _GROUP_ORDER[0]
+        family = payload.get("family") or _GROUP_TO_FAMILY.get(group, "anima")
+        label = payload.get("label") or _stem(path)
+        key = _path_key(path)
+        entry = next(
+            (item for item in self.entries
+             if _path_key(item.get("path")) == key),
+            None,
+        )
+        if entry is None:
+            entry = {
+                "id": engine_paths.new_entry_id(),
+                "label": label, "family": family, "group": group,
+                "path": path, "components": dict(components), "loras": [],
+            }
+            self.entries.append(entry)
+            row = self._new_entry_row(entry)
+            self._finish(row, self._entries_canvas)
+        else:
+            entry.update({
+                "label": label, "family": family, "group": group,
+                "components": dict(components),
+            })
+            self._remake_entry_row(entry)
+        self._refresh_entry_count(group)
+        self._expand_group(group)
 
     def _folder_role(self, folder):
         """Which known model folder ``folder`` is (``""`` for an unknown one)."""
