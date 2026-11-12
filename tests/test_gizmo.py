@@ -107,6 +107,65 @@ def test_failed_begin_drops_the_previous_session():
     check("a failed begin keeps no layer", instance.layer, None)
 
 
+def test_switching_view_releases_the_previous_overlay():
+    # Each canvas view draws its own copy of the frame while the session lives
+    # on the controller. Moving the session to another view (a canvas switch)
+    # must clear the frame on the view it left, or that canvas keeps redrawing
+    # a stale transform frame when the user switches back.
+    first = FakeView()
+    second = FakeView()
+    instance = gizmo.TransformGizmo()
+    check("session on the first view",
+          instance.begin(FakeApp(photo_layer(), (320, 240)), first), True)
+    first.set_gizmo("frame")
+    check("the first view draws the frame", first.geometry, "frame")
+    check("session moves to the second view",
+          instance.begin(FakeApp(photo_layer(), (320, 240)), second), True)
+    check("the view it left drops its frame", first.geometry, None)
+    instance.clear()
+    check("the current view drops its frame", second.geometry, None)
+
+
+def test_switching_view_ends_the_previous_drag_preview():
+    # A live drag preview is stored on the session's layer. Beginning a session
+    # on another canvas must clear it while the old layer is still current,
+    # otherwise that canvas returns showing the drag-time snapshot forever.
+    first_layer = photo_layer()
+    second_layer = photo_layer(seed=5)
+    instance = gizmo.TransformGizmo()
+    check("session on the first layer",
+          instance.begin(FakeApp(first_layer, first_layer.size), FakeView()), True)
+    instance.start("se", 320.0, 240.0)
+    instance.update(360.0, 270.0, draft=True)
+    check("a live preview is painted on the first layer",
+          first_layer._live_preview is not None, True)
+    check("session moves to the second layer",
+          instance.begin(FakeApp(second_layer, second_layer.size), FakeView()), True)
+    check("the layer it left drops the live preview",
+          first_layer._live_preview, None)
+
+
+def test_destroyed_view_is_not_touched():
+    # A project load or undo rebuilds the canvas tabs, destroying the widget the
+    # gizmo last drew on. Moving away from it (or clearing) must not call into
+    # the dead widget.
+    class DeadView(FakeView):
+        def winfo_exists(self):
+            return False
+
+        def set_gizmo(self, geometry):
+            raise AssertionError("a destroyed view must not be drawn on")
+
+    instance = gizmo.TransformGizmo()
+    check("session on a destroyed view",
+          instance.begin(FakeApp(photo_layer(), (320, 240)), DeadView()), True)
+    check("moving to a live view skips the destroyed one",
+          instance.begin(FakeApp(photo_layer(), (320, 240)), FakeView()), True)
+    instance.view = DeadView()
+    instance.clear()
+    check("clear drops the destroyed view", instance.view, None)
+
+
 
 def test_move_commits_the_source_shifted():
     # A drag at whole-pixel offsets samples the source at its own texel centres,

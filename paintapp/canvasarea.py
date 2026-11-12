@@ -4061,6 +4061,30 @@ class CanvasView(tk.Canvas):
                 tags="croppreview",
             )
 
+    def clear_tool_overlays(self):
+        """Drop controller-owned tool overlays from this view.
+
+        Overlay snapshots live on the view, but the drawing controller is
+        global and its session moves to whichever canvas is active. A hidden
+        tab must not keep drawing a session that no longer belongs to it, so
+        the view being left is cleared when switching canvases (and every view
+        is cleared when an undo re-points them at fresh documents). Per-canvas
+        state - the selection, layout boxes and generation preview - is
+        intentionally kept.
+        """
+        self.set_cursor_overlay(None)
+        self.set_selection_label(None)
+        self.set_gizmo(None)
+        self.set_path(None)
+        self.set_vector_overlay(None)
+        self.set_poses_overlay(None)
+        self.set_warp_grid(None)
+        self.set_puppet_overlay(None)
+        self.set_text_session(None)
+        self.set_shape_preview(None)
+        self.set_gradient_preview(None)
+        self.set_crop_preview(None)
+
 
 def _shifted_index(index, from_index, to_index):
     """Where ``index`` lands once the item at ``from_index`` moves to ``to_index``."""
@@ -4190,6 +4214,9 @@ class CanvasArea(tk.Frame):
             # A selection belongs to the document it was drawn on; drop it so a
             # restored document never inherits the previous one's mask.
             view.set_selection(None)
+            # Tool overlays describe a controller session for the document it
+            # was started on; the restored document must not redraw them.
+            view.clear_tool_overlays()
         self.refresh_titles(documents)
 
     def _show_page(self, index):
@@ -4200,6 +4227,11 @@ class CanvasArea(tk.Frame):
             return
         if self._packed is not None and 0 <= self._packed < len(self._pages):
             self._pages[self._packed].pack_forget()
+            # Tool sessions are controller-global; a hidden page must not keep
+            # drawing the overlay of a session that now belongs to the page we
+            # are switching to (see :meth:`CanvasView.clear_tool_overlays`).
+            if 0 <= self._packed < len(self._views):
+                self._views[self._packed].clear_tool_overlays()
         self._packed = index
         self._pages[index].pack(fill=tk.BOTH, expand=True)
 

@@ -9758,7 +9758,7 @@ class DrawingController:
         if not self.sel_gizmo.begin_selection(selection, self.app.current.size):
             self.sel_gizmo.clear()
             return
-        self.sel_gizmo.view = view
+        self.sel_gizmo.adopt_view(view)
         self.sel_gizmo.on_change = self._set_selection
         view.set_gizmo(self.sel_gizmo.geometry())
         self.app.render()

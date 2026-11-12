@@ -268,15 +268,42 @@ class TransformGizmo:
         self.snap_anchors = True
         self.interpolation = "bicubic"
 
+    @staticmethod
+    def _view_alive(view):
+        """Whether ``view`` can still be drawn on.
+
+        A project load or an undo may have destroyed the canvas widgets the
+        gizmo last drew on, in which case there is no overlay left to clear.
+        """
+        exists = getattr(view, "winfo_exists", None)
+        return exists is None or bool(exists())
+
+    def adopt_view(self, view):
+        """Draw this session on ``view``, clearing the frame on the one it left.
+
+        The gizmo lives on the controller, but every canvas view keeps its own
+        copy of the frame geometry and outlives a tab switch. Handing the old
+        view its overlay back is what keeps a stale transform frame from being
+        redrawn on a canvas the user has already left.
+        """
+        if (self.view is not None and self.view is not view
+                and self._view_alive(self.view)):
+            self.view.set_gizmo(None)
+        self.view = view
+
     # -------------------------------------------------------------- lifecycle
     def begin(self, app, view):
         """Start a session for ``app``'s active layer. False when unavailable."""
+        # Finish the previous session's drag while ``self.layer`` still names
+        # its layer: the drag's live preview lives on that layer, so adopting
+        # the new layer first would strand the preview there.
+        self.adopt_view(view)
+        self._end_drag()
         layer = app.active_layer()
         # A failed begin (no layer, locked/empty content) must not leave a
         # previous session reported as active.
         self.active = False
         self.layer = None
-        self.view = view
         if layer is None or (layer.is_locked() and not layer.is_link):
             return False
         self._release_textures()
@@ -331,7 +358,6 @@ class TransformGizmo:
                            float(box[0] + ox), float(box[1] + oy))
         self._base_matrix = self.matrix
         self.rot_pivot_local = None
-        self._end_drag()
         self.active = True
         return True
 
@@ -351,7 +377,7 @@ class TransformGizmo:
         self._base_matrix = IDENTITY
         self._release_textures()
         self._end_drag()
-        if self.view is not None:
+        if self.view is not None and self._view_alive(self.view):
             self.view.set_gizmo(None)
         self.view = None
 
