@@ -622,6 +622,9 @@ class ToolsPanel(tk.Frame):
         self._grid.pack(fill=tk.X)
         self._compact = False
         self._columns = self.TOOL_COLUMNS
+        # The tool whose settings are currently built, so a mode switch can
+        # update rows in place instead of rebuilding the panel.
+        self._rendered_tool = None
         self._tool_buttons = {}
         self._tool_labels = {}
         for key, label in self.TOOL_BUTTONS:
@@ -749,6 +752,9 @@ class ToolsPanel(tk.Frame):
             self.select("select")
         else:
             self._sync_buttons()
+            if hasattr(self, "_select_mode_var"):
+                self._select_mode_var.set(mode)
+                self._select_apply_rows()
             self._on_mode_change()
 
     def toggle_path(self):
@@ -774,6 +780,9 @@ class ToolsPanel(tk.Frame):
             self.select("vector")
         else:
             self._sync_buttons()
+            if hasattr(self, "_vector_mode_var"):
+                self._vector_mode_var.set(self.vector_mode)
+                self._vector_apply_rows()
             self._on_mode_change()
 
     def toggle_poses(self):
@@ -837,12 +846,20 @@ class ToolsPanel(tk.Frame):
             return
         self.select("arrow")
 
-    def _sync_buttons(self):
+    def _sync_buttons(self, rebuild=False):
+        """Update the tool buttons and render settings for the active tool.
+
+        The settings panel is only rebuilt when the active tool actually
+        changes (or ``rebuild`` is set). Mode switches update their own rows in
+        place, so they must not tear the panel down: doing so dropped the
+        sidebar back to the top on every control change.
+        """
         active = self._active_tool()
         for key, button in self._tool_buttons.items():
             button.config(relief=tk.SUNKEN if key == active else tk.RAISED)
             self._set_tool_icon(button, key, key == active)
-        self._render_settings(active)
+        if rebuild or active != self._rendered_tool:
+            self._render_settings(active)
 
     def _on_theme(self):
         """Re-render the tool-button icons with the new theme's colors."""
@@ -886,6 +903,7 @@ class ToolsPanel(tk.Frame):
     # --------------------------------------------------------------- settings
     def _render_settings(self, active):
         """Rebuild the settings panel for the active tool."""
+        self._rendered_tool = active
         for child in self.settings.winfo_children():
             child.destroy()
         self._brush_preview = None
@@ -930,6 +948,7 @@ class ToolsPanel(tk.Frame):
             row, from_=low, to=high, width=4, textvariable=var,
             command=command,
         ).pack(side=tk.LEFT, padx=(2, 0))
+        return row
 
     def _check_row(self, parent, label, var, command):
         row = tk.Frame(parent)
@@ -937,6 +956,7 @@ class ToolsPanel(tk.Frame):
         tk.Checkbutton(
             row, text=label, variable=var, command=command, anchor="w",
         ).pack(fill=tk.X)
+        return row
 
     def _entry_row(self, parent, label, fields, command=None):
         """A label plus one or more small numeric entries.
@@ -1005,7 +1025,7 @@ class ToolsPanel(tk.Frame):
         combo.bind("<<ComboboxSelected>>", on_select)
         combo._display_var = display_var
         combo.pack(side=tk.LEFT, fill=tk.X, expand=True)
-        return combo
+        return row
 
     @staticmethod
     def _option_label(value, options):
@@ -1609,8 +1629,6 @@ class ToolsPanel(tk.Frame):
         self._shape_blend_var = tk.StringVar(value=self.shape_blend)
         self._shape_radius_var = tk.IntVar(value=self.shape_radius)
         self._shape_aa_var = tk.BooleanVar(value=self.shape_antialias)
-        # Drop stale swatch handles so a mode change cannot restyle a widget
-        # that the rebuild destroyed.
         self._shape_fill_btn = None
         self._shape_stroke_btn = None
         self._menu_row(self.settings, "Shape", self._shape_kind_var,
@@ -1637,30 +1655,33 @@ class ToolsPanel(tk.Frame):
         ).pack(fill=tk.X, pady=(4, 0))
 
     def _shape_swatches(self):
-        """The Shape tool's colour boxes, shown below the Draw control.
+        """The Shape tool's colour boxes, below the Draw control.
 
-        Fill shows for the fill/both modes and Stroke for stroke/both, so the
-        ``both`` mode shows the pair side by side.
+        Both boxes are built once and shown or hidden in place by
+        :meth:`_shape_apply_rows`, so changing Draw updates the panel without
+        tearing it down and rebuilding it (which reset the sidebar's scroll).
         """
-        mode = self.shape_mode
-        show_fill = mode in ("fill", "both")
-        show_stroke = mode in ("stroke", "both")
-        if show_fill or show_stroke:
-            row = self._swatch_row(self.settings)
-            if show_fill:
-                self._shape_fill_btn = tk.Button(
-                    row, width=3,
-                    command=lambda: self._choose_shape_paint("fill"),
-                )
-                theme.skip(self._shape_fill_btn)
-                self._shape_fill_btn.pack(side=tk.LEFT, padx=(0, 6))
-            if show_stroke:
-                self._shape_stroke_btn = tk.Button(
-                    row, width=3,
-                    command=lambda: self._choose_shape_paint("stroke"),
-                )
-                theme.skip(self._shape_stroke_btn)
-                self._shape_stroke_btn.pack(side=tk.LEFT, padx=(0, 6))
+        self._shape_swatch_row = self._swatch_row(self.settings)
+        self._shape_fill_btn = tk.Button(
+            self._shape_swatch_row, width=3,
+            command=lambda: self._choose_shape_paint("fill"),
+        )
+        theme.skip(self._shape_fill_btn)
+        self._shape_stroke_btn = tk.Button(
+            self._shape_swatch_row, width=3,
+            command=lambda: self._choose_shape_paint("stroke"),
+        )
+        theme.skip(self._shape_stroke_btn)
+        self._shape_apply_rows()
+
+    def _shape_apply_rows(self):
+        """Show the colour boxes the current Draw mode uses, in place."""
+        self._shape_fill_btn.pack_forget()
+        self._shape_stroke_btn.pack_forget()
+        if self.shape_mode in ("fill", "both"):
+            self._shape_fill_btn.pack(side=tk.LEFT, padx=(0, 6))
+        if self.shape_mode in ("stroke", "both"):
+            self._shape_stroke_btn.pack(side=tk.LEFT, padx=(0, 6))
         self._apply_shape_swatches()
 
     def _sync_shape(self, *_):
@@ -1673,7 +1694,7 @@ class ToolsPanel(tk.Frame):
 
     def _on_shape_mode(self):
         self._sync_shape()
-        self._render_settings("shape")
+        self._shape_apply_rows()
 
     def _apply_shape_swatches(self):
         fill = self.shape_fill_color or self._current_color()
@@ -1822,65 +1843,118 @@ class ToolsPanel(tk.Frame):
         self.burn_protect = bool(self._burn_protect_var.get())
 
     # ----------------------------------------------------- selection settings
+    SELECT_HINTS = {
+        "rect": "Drag a rectangle to select.",
+        "lasso": "Drag a freeform outline to select.",
+        "wand": "Click to select a region by colour.",
+        "segment": "Click an object to select it with AI segmentation.",
+    }
+
     def _settings_for_select(self):
+        """Build every mode's rows once; the mode switch shows/hides them.
+
+        Rebuilding the panel on a mode change destroyed the combobox the user
+        was clicking and reset the sidebar's scroll, so the rows live here
+        permanently and :meth:`_select_apply_rows` only packs the active set.
+        """
         self._select_mode_var = tk.StringVar(value=self.select_mode)
-        hints = {
-            "rect": "Drag a rectangle to select.",
-            "lasso": "Drag a freeform outline to select.",
-            "wand": "Click to select a region by colour.",
-            "segment": "Click an object to select it with AI segmentation.",
-        }
-        tk.Label(self.settings,
-                 text=hints.get(self.select_mode, hints["rect"]),
-                 anchor="w", fg="#888888", wraplength=210,
-                 justify="left").pack(fill=tk.X)
+        self._select_hint = tk.Label(
+            self.settings,
+            text=self.SELECT_HINTS.get(self.select_mode,
+                                       self.SELECT_HINTS["rect"]),
+            anchor="w", fg="#888888", wraplength=210, justify="left",
+        )
+        self._select_hint.pack(fill=tk.X)
         self._menu_row(self.settings, "Mode", self._select_mode_var,
                        self.SELECT_MODES, self._sync_select_mode)
-        if self.select_mode == "rect":
-            self._select_radius_var = tk.IntVar(value=self.select_radius)
-            self._slider_row(self.settings, "Corners", self._select_radius_var,
-                             0, 200, self._sync_select_radius)
-        if self.select_mode == "wand":
-            self._wand_tolerance_var = tk.IntVar(value=self.wand_tolerance)
-            self._wand_contiguous_var = tk.BooleanVar(value=self.wand_contiguous)
-            self._wand_sample_var = tk.StringVar(value=self.wand_sample)
+
+        # Rectangle mode.
+        self._select_radius_var = tk.IntVar(value=self.select_radius)
+        self._select_rect_rows = [self._slider_row(
+            self.settings, "Corners", self._select_radius_var,
+            0, 200, self._sync_select_radius,
+        )]
+
+        # Magic Wand mode.
+        self._wand_tolerance_var = tk.IntVar(value=self.wand_tolerance)
+        self._wand_contiguous_var = tk.BooleanVar(value=self.wand_contiguous)
+        self._wand_sample_var = tk.StringVar(value=self.wand_sample)
+        self._select_wand_rows = [
             self._slider_row(self.settings, "Tolerance",
-                             self._wand_tolerance_var, 0, 255, self._sync_wand)
+                             self._wand_tolerance_var, 0, 255, self._sync_wand),
             self._menu_row(self.settings, "Sample", self._wand_sample_var,
-                           [("layer", "Active layer"), ("image", "All layers")],
-                           self._sync_wand)
+                           [("layer", "Active layer"),
+                            ("image", "All layers")], self._sync_wand),
             self._check_row(self.settings, "Contiguous",
-                            self._wand_contiguous_var, self._sync_wand)
-        if self.select_mode == "segment":
-            models = self._segment_models()
-            if self.segment_model not in models:
-                self.segment_model = models[0] if models else None
-            self._segment_model_var = tk.StringVar(
-                value=self.segment_model or "")
-            self._segment_sample_var = tk.StringVar(value=self.segment_sample)
-            if models:
-                self._menu_row(self.settings, "Model", self._segment_model_var,
-                               [(name, name) for name in models],
-                               self._sync_segment)
-            else:
-                tk.Label(
-                    self.settings,
-                    text=("No segmentation model found. Add a SAM ONNX "
-                          "'<name>_encoder.onnx' and '<name>_decoder.onnx' pair "
-                          "to the segmentation folder."),
-                    anchor="w", fg="#888888", wraplength=210, justify="left",
-                ).pack(fill=tk.X)
+                            self._wand_contiguous_var, self._sync_wand),
+        ]
+
+        # Segment AI mode. The model list is fixed for the life of the panel,
+        # so choosing between the picker and its "no model" note can be made
+        # once here; the whole group is shown or hidden as one.
+        models = self._segment_models()
+        if self.segment_model not in models:
+            self.segment_model = models[0] if models else None
+        self._segment_model_var = tk.StringVar(value=self.segment_model or "")
+        self._segment_sample_var = tk.StringVar(value=self.segment_sample)
+        if models:
+            model_row = self._menu_row(
+                self.settings, "Model", self._segment_model_var,
+                [(name, name) for name in models], self._sync_segment,
+            )
+        else:
+            model_row = tk.Frame(self.settings)
+            tk.Label(
+                model_row,
+                text=("No segmentation model found. Add a SAM ONNX "
+                      "'<name>_encoder.onnx' and '<name>_decoder.onnx' pair "
+                      "to the segmentation folder."),
+                anchor="w", fg="#888888", wraplength=210, justify="left",
+            ).pack(fill=tk.X)
+        self._select_segment_rows = [
+            model_row,
             self._menu_row(self.settings, "Sample", self._segment_sample_var,
                            [("image", "All layers"), ("layer", "Active layer")],
-                           self._sync_segment)
-        if self.select_mode not in ("wand", "segment"):
-            self._select_transform_var = tk.BooleanVar(
-                value=self.select_transform)
-            tk.Checkbutton(
-                self.settings, text="Transform selection", anchor="w",
-                variable=self._select_transform_var,
-                command=self._sync_select_transform,
-            ).pack(fill=tk.X, pady=(4, 0))
+                           self._sync_segment),
+        ]
+
+        # Transform selection (rect and lasso only).
+        self._select_transform_var = tk.BooleanVar(value=self.select_transform)
+        self._select_transform_row = tk.Frame(self.settings)
+        tk.Checkbutton(
+            self._select_transform_row, text="Transform selection", anchor="w",
+            variable=self._select_transform_var,
+            command=self._sync_select_transform,
+        ).pack(fill=tk.X)
+
+        # A zero-height marker every conditional row is packed in front of, so
+        # re-showing a mode keeps the rows in their declared order.
+        self._select_rows_anchor = tk.Frame(self.settings, height=0)
+        self._select_rows_anchor.pack(fill=tk.X)
+        self._select_apply_rows()
+
+    def _select_apply_rows(self):
+        """Show only the rows the current Select mode uses, in place."""
+        mode = self.select_mode
+        self._select_hint.config(
+            text=self.SELECT_HINTS.get(mode, self.SELECT_HINTS["rect"]))
+        groups = []
+        if mode == "rect":
+            groups.append((self._select_rect_rows, (3, 0)))
+        elif mode == "wand":
+            groups.append((self._select_wand_rows, (3, 0)))
+        elif mode == "segment":
+            groups.append((self._select_segment_rows, (3, 0)))
+        if mode not in ("wand", "segment"):
+            groups.append(([self._select_transform_row], (4, 0)))
+
+        for rows in (self._select_rect_rows, self._select_wand_rows,
+                     self._select_segment_rows, [self._select_transform_row]):
+            for row in rows:
+                row.pack_forget()
+        for rows, pady in groups:
+            for row in rows:
+                row.pack(fill=tk.X, pady=pady, before=self._select_rows_anchor)
 
     @staticmethod
     def _segment_models():
@@ -1902,12 +1976,8 @@ class ToolsPanel(tk.Frame):
         self.select_mode = mode
         if mode in ("wand", "segment"):
             self.select_transform = False
-        # Rebuilding the panel destroys the mode combobox, so defer the rebuild
-        # until its selection event has finished dispatching.
-        self.after_idle(self._rebuild_select_settings)
-
-    def _rebuild_select_settings(self):
-        self._render_settings("select")
+            self._select_transform_var.set(False)
+        self._select_apply_rows()
         self._on_mode_change()
 
     def _sync_select_radius(self, *_):
@@ -1917,9 +1987,7 @@ class ToolsPanel(tk.Frame):
 
     def _sync_select_transform(self):
         self.select_transform = bool(self._select_transform_var.get())
-        # Rebuilding the panel resets the toggle's own hint and refreshes the
-        # gizmo via the tool-change hook, so defer until the click finishes.
-        self.after_idle(self._rebuild_select_settings)
+        self._on_mode_change()
 
     def _sync_wand(self, *_):
         self.wand_tolerance = max(
@@ -1985,8 +2053,6 @@ class ToolsPanel(tk.Frame):
         """Rebuild the Layout Control editor from the model."""
         if self._layout_parent is not None:
             self._build_layout_editor()
-        elif self.layout_tool:
-            self._render_settings("layout")
 
     def _on_layout_enabled(self, enabled):
         """Activate the canvas Layout tool while the panel's switch is on."""
@@ -3876,7 +3942,7 @@ class ToolsPanel(tk.Frame):
         except (TypeError, ValueError):
             self.transform_rotation_snap = 15
         self.size_var.set(self.brush_size)
-        self._sync_buttons()
+        self._sync_buttons(rebuild=True)
 
     # ---------------------------------------------------------- brush presets
     # The tools that have a preset library, mapped to the settings prefix their
@@ -3913,7 +3979,7 @@ class ToolsPanel(tk.Frame):
                 self.size_var.set(self.brush_size)
             except (TypeError, ValueError):
                 pass
-        self._sync_buttons()
+        self._sync_buttons(rebuild=True)
 
 
 class DrawingController:
