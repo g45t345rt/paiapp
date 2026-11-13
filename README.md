@@ -28,7 +28,7 @@ Built with Python and Tkinter.
 
 **Vector, text, and shapes**
 - Path and Vector tools, Shape tool with fill/stroke, and a Text tool
-- Gradient tool with linear, reflected, radial, square, diamond, and conical types
+- Gradient tool with live editable gradient objects (linear, reflected, radial, square, diamond, and conical types)
 
 **Transform**
 - Move, Crop, and Transform, plus canvas-level transforms

@@ -298,6 +298,7 @@ class ToolsPanel(tk.Frame):
                  on_poses_action=None, on_vector_action=None,
                  on_vector_settings=None, on_layout_change=None,
                  get_layout_family=None, on_layout_capture=None,
+                 on_gradient_change=None,
                  on_transform_action=None):
         super().__init__(parent)
         self._on_mode_change = on_mode_change
@@ -316,6 +317,8 @@ class ToolsPanel(tk.Frame):
         self._on_poses_action = on_poses_action
         self._on_vector_action = on_vector_action
         self._on_vector_settings = on_vector_settings
+        self._on_gradient_change = on_gradient_change
+        self._gradient_loading = False
         self._on_layout_change = on_layout_change
         self._get_layout_family = get_layout_family
         self._on_layout_capture = on_layout_capture
@@ -1749,6 +1752,7 @@ class ToolsPanel(tk.Frame):
             1, self._int_var(self._gradient_opacity_var, 100)
         )
         self.gradient_blend = self._gradient_blend_var.get()
+        self._notify_gradient_change()
 
     def _on_gradient_stops_changed(self):
         """Editor edited its stops: mirror them and refresh the stop controls."""
@@ -1763,6 +1767,54 @@ class ToolsPanel(tk.Frame):
         if getattr(self, "_gradient_preset_var", None) is not None:
             self._gradient_preset_var.set("custom")
         self._refresh_gradient_stop_controls()
+        self._notify_gradient_change()
+
+    def _notify_gradient_change(self):
+        """Tell the controller a live gradient's settings changed."""
+        if self._gradient_loading or self._on_gradient_change is None:
+            return
+        self._on_gradient_change()
+
+    def set_gradient_spec(self, spec):
+        """Point the built Gradient panel at a gradient object's settings.
+
+        Used when a gradient row is opened for editing so the panel shows that
+        object's own axis type, stops, spread, opacity and blend. Loading does
+        not notify the controller, so merely selecting a gradient never mutates
+        it.
+        """
+        if not self.gradient_tool or not hasattr(self, "_gradient_mode_var"):
+            return
+        self._gradient_loading = True
+        try:
+            mode = str(spec.get("mode") or "linear")
+            spread = str(spec.get("spread") or "clamp")
+            opacity = max(1, min(100, int(spec.get("opacity", 100) or 100)))
+            blend = str(spec.get("blend") or "normal")
+            self.gradient_mode = mode if mode in dict(gradient.MODES) else "linear"
+            self.gradient_spread = (
+                spread if spread in dict(gradient.SPREADS) else "clamp"
+            )
+            self.gradient_opacity = opacity
+            self.gradient_blend = gradient._blend_key(blend)
+            self.gradient_stops = gradient.normalize_stops(spec.get("stops"))
+            if self.gradient_stops:
+                self.gradient_from = self.gradient_stops[0][1]
+                self.gradient_to = self.gradient_stops[-1][1]
+            self._gradient_mode_var.set(self.gradient_mode)
+            self._gradient_spread_var.set(self.gradient_spread)
+            self._gradient_opacity_var.set(self.gradient_opacity)
+            self._gradient_blend_var.set(self.gradient_blend)
+            editor = getattr(self, "_gradient_editor", None)
+            if editor is not None:
+                editor.set_stops(self._gradient_stop_list())
+                editor.set_selected(0)
+            if getattr(self, "_gradient_preset_var", None) is not None:
+                self._gradient_preset_var.set("custom")
+            self._refresh_gradient_stop_controls()
+            self._refresh_menu_displays()
+        finally:
+            self._gradient_loading = False
 
     def _refresh_gradient_stop_controls(self):
         editor = getattr(self, "_gradient_editor", None)
@@ -1824,6 +1876,7 @@ class ToolsPanel(tk.Frame):
         self.gradient_from = self.gradient_stops[0][1]
         self.gradient_to = self.gradient_stops[-1][1]
         self._refresh_gradient_stop_controls()
+        self._notify_gradient_change()
 
     # --------------------------------------------------------- shape settings
     def _settings_for_shape(self):
@@ -4367,6 +4420,8 @@ class DrawingController:
         self._text_drag = None
         self._blink_on = True
         self._gradient_start = None
+        self._gradient_target = None
+        self._gradient_edit_pushed = False
         self._shape_start = None
         self._crop_start = None
         self._crop_box = None
@@ -5449,28 +5504,125 @@ class DrawingController:
         tools = self.app.tools
         doc = self.app.current
         layer = self.app.active_layer()
+        if layer is None:
+            return
+        target = self._gradient_spec_target()
         self.app._push_undo("Gradient")
         doc.align_for_painting(layer)
         ox, oy = layer.offset
-        size = layer.image.size
-        rgb, alpha = gradient.gradient_layers(
-            size, (start[0] - ox, start[1] - oy), (x - ox, y - oy),
-            tools.gradient_mode,
-            stops=tools._gradient_stop_list(),
-            spread=tools.gradient_spread,
-        )
-        coverage = Image.new("L", size, 255)
-        selection = self._selection()
-        if selection is not None and not selection.is_empty():
-            coverage = Image.new("L", size, 0)
-            coverage.paste(selection.mask, (-ox, -oy))
-        gradient.apply(
-            layer, rgb, coverage, tools.gradient_opacity,
-            tools.gradient_blend.lower(), alpha=alpha,
-        )
-        layer.invalidate_filters()
+        settings = self._gradient_settings_from_tools()
+        if target is not None:
+            spec = target[1]
+            spec["start"] = (start[0], start[1])
+            spec["end"] = (x, y)
+            spec.update(settings)
+            index = next(
+                i for i, item in enumerate(layer.gradients) if item is spec
+            )
+            self._gradient_edit_pushed = False
+        else:
+            spec = gradient.normalize({
+                "start": (start[0], start[1]),
+                "end": (x, y),
+                **settings,
+            })
+            if spec is None:
+                self.app._drop_undo()
+                return
+            selection = self._selection()
+            if selection is not None and not selection.is_empty():
+                coverage = Image.new("L", layer.image.size, 0)
+                coverage.paste(selection.mask, (-ox, -oy))
+                spec["mask"] = coverage
+            layer.gradients.append(spec)
+            index = len(layer.gradients) - 1
+            self._gradient_target = (layer, spec)
+            self._gradient_edit_pushed = False
+        layer.invalidate_gradients()
+        self.app._gradient_sel = (self.app.layers.index(layer), index)
+        self._show_gradient_axis(spec)
+        self.app._refresh_layer_list()
         self.app.render()
-        self.app.set_result("Applied gradient.")
+        self.app.set_result(
+            "Added live gradient; drag again or change its settings to edit it."
+            if target is None else "Updated live gradient."
+        )
+
+    def _gradient_settings_from_tools(self):
+        """The current Gradient panel settings as gradient-object fields."""
+        tools = self.app.tools
+        return {
+            "mode": tools.gradient_mode,
+            "stops": tools._gradient_stop_list(),
+            "spread": tools.gradient_spread,
+            "opacity": tools.gradient_opacity,
+            "blend": gradient._blend_key(tools.gradient_blend),
+        }
+
+    def _gradient_spec_target(self):
+        """The live gradient object the panel currently edits, or ``None``."""
+        target = self._gradient_target
+        if target is None:
+            return None
+        layer, spec = target
+        if layer is not self.app.active_layer():
+            return None
+        gradients = getattr(layer, "gradients", None) or []
+        if not any(item is spec for item in gradients):
+            self._gradient_target = None
+            return None
+        return target
+
+    def on_gradient_settings_changed(self):
+        """Apply edited Gradient panel settings to the selected live object."""
+        target = self._gradient_spec_target()
+        if target is None:
+            return
+        layer, spec = target
+        if layer.is_locked():
+            return
+        settings = self._gradient_settings_from_tools()
+        if all(spec.get(key) == value for key, value in settings.items()):
+            return
+        if not self._gradient_edit_pushed:
+            self.app._push_undo("Edit gradient")
+            self._gradient_edit_pushed = True
+        spec.update(settings)
+        layer.invalidate_gradients()
+        self.app.render()
+        self.app.set_result("Updated live gradient.")
+
+    def edit_gradient_object(self, layer, index):
+        """Open a committed gradient object for live editing."""
+        if not (0 <= index < len(getattr(layer, "gradients", None) or [])):
+            return
+        spec = layer.gradients[index]
+        self._gradient_target = (layer, spec)
+        self._gradient_edit_pushed = False
+        self._show_gradient_axis(spec)
+
+    def clear_gradient_target(self):
+        """Stop routing panel edits to a live gradient object."""
+        self._gradient_target = None
+        self._gradient_edit_pushed = False
+        view = None
+        area = getattr(self.app, "area", None)
+        if area is not None:
+            view = area.current_view()
+        if view is not None:
+            view.set_gradient_preview(None)
+
+    def _show_gradient_axis(self, spec):
+        """Show ``spec``'s drag axis on the canvas as the live selection."""
+        view = self.app.area.current_view()
+        if view is None:
+            return
+        color = (spec.get("stops") or [["", "#0078d7"]])[0][1]
+        view.set_gradient_preview({
+            "start": spec.get("start", (0, 0)),
+            "end": spec.get("end", (0, 0)),
+            "color": color,
+        })
 
     def _update_gradient_preview(self, end):
         view = self.app.area.current_view()

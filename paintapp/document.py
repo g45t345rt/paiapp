@@ -5,7 +5,7 @@ import math
 
 from PIL import Image, ImageChops, ImageDraw
 
-from . import brush, filters, path, poses, textrender, vector
+from . import brush, filters, gradient, path, poses, textrender, vector
 from .history import History
 
 # Largest content area (in pixels) for which the below/above backdrop cache is
@@ -32,7 +32,7 @@ def next_token():
 
 _LAYER_TOKENS = (
     "_image_token", "_text_token", "_vector_token", "_path_token",
-    "_poses_token", "_mask_token",
+    "_poses_token", "_gradient_token", "_mask_token",
 )
 
 # Per-layer render caches an undo restore hands from the replaced layer object
@@ -44,6 +44,7 @@ _LAYER_CACHES = (
     "_vector_cache", "_vector_key",
     "_path_cache", "_path_key",
     "_poses_cache", "_poses_key",
+    "_gradient_cache", "_gradient_key",
     "_composite_cache", "_composite_key",
     "_transform_cache", "_transform_key",
     "_instance_mask_cache", "_instance_mask_key",
@@ -451,7 +452,8 @@ def _mip_region(layer, left, top, ix0, iy0, ix1, iy1, scale, ax, ay, ox, oy):
     key = (
         source.uid, source._image_token, filters.chain_key(source.filters),
         source._text_token, source._vector_token, source._poses_token,
-        source._path_token, source._mask_token, tuple(layer.content_offset()),
+        source._path_token, source._gradient_token, source._mask_token,
+        tuple(layer.content_offset()),
         None if layer.transform is None else tuple(layer.transform),
         layer._mask_token,
     )
@@ -689,6 +691,11 @@ class Layer:
         # pixels at composite time. Keeping the specs rather than only pixels
         # lets the text tool re-edit them; ``rasterize_texts`` folds them in.
         self.texts = []
+        # Editable gradient fills (see ``gradient``) drawn over the filtered
+        # pixels at composite time. The Gradient tool keeps its output as a
+        # spec so its axis, colours, type and blend can be edited live;
+        # ``rasterize_gradients`` folds them into the pixels.
+        self.gradients = []
         # Editable vector strokes (see ``vector``) drawn over the filtered pixels
         # at composite time. ``vector`` marks a layer created (or converted) as a
         # vector layer; the strokes are its content, kept editable so the vector
@@ -773,6 +780,11 @@ class Layer:
         self._poses_token = next_token()
         self._poses_cache = None
         self._poses_key = None
+        # Version of the gradient list and its rendered overlay, bumped whenever
+        # a gradient object changes so the composited-image cache invalidates.
+        self._gradient_token = next_token()
+        self._gradient_cache = None
+        self._gradient_key = None
         # Version of the mask's pixels, bumped whenever the mask is replaced or
         # handed out for an in-place edit. The composited-image cache keys on it
         # so a mask edit invalidates the cache without a full pixel comparison.
@@ -847,6 +859,10 @@ class Layer:
             clone for clone in (textrender.clone(spec) for spec in self.texts)
             if clone is not None
         ]
+        duplicate.gradients = [
+            clone for clone in (gradient.clone(spec) for spec in self.gradients)
+            if clone is not None
+        ]
         duplicate.vector = self.vector
         duplicate.strokes = [
             clone for clone in (vector.clone(spec) for spec in self.strokes)
@@ -907,6 +923,10 @@ class Layer:
             clone for clone in (textrender.clone(spec) for spec in other.texts)
             if clone is not None
         ]
+        self.gradients = [
+            clone for clone in (gradient.clone(spec) for spec in other.gradients)
+            if clone is not None
+        ]
         self.vector = bool(getattr(other, "vector", False))
         self.strokes = [
             clone for clone in (vector.clone(spec) for spec in other.strokes)
@@ -938,6 +958,7 @@ class Layer:
         self.invalidate_vectors()
         self.invalidate_poses()
         self.invalidate_paths()
+        self.invalidate_gradients()
 
     def _adopt_instance_mask(self, instance_mask):
         """``instance_mask`` (buffer frame) folded into this layer's mask.
@@ -971,7 +992,7 @@ class Layer:
         return (
             id(source.image), source._image_token, source._mask_token,
             source._text_token, source._vector_token, source._poses_token,
-            source._path_token,
+            source._path_token, source._gradient_token,
             # A link's own mask shapes its composite on top of the master's, so
             # its version belongs in the token (a no-op for a plain layer, whose
             # mask is already the source's).
@@ -1026,6 +1047,12 @@ class Layer:
         self._path_token = next_token()
         self._path_cache = None
         self._path_key = None
+
+    def invalidate_gradients(self):
+        """Drop the cached gradient overlay (call after editing ``gradients``)."""
+        self._gradient_token = next_token()
+        self._gradient_cache = None
+        self._gradient_key = None
 
     def effective_image(self):
         """The layer's base pixels with the mask folded into the alpha channel."""
@@ -1132,7 +1159,7 @@ class Layer:
         return (
             source.uid, source._image_token, filters.chain_key(source.filters),
             source._text_token, source._vector_token, source._poses_token,
-            source._path_token, source._mask_token,
+            source._path_token, source._gradient_token, source._mask_token,
         )
 
     def _transformed_image(self, source, matrix, include_mask=True):
@@ -1164,6 +1191,7 @@ class Layer:
             source._vector_token,
             source._poses_token,
             source._path_token,
+            source._gradient_token,
             source._mask_token,
             tuple(round(v, 9) for v in matrix),
             left_i,
@@ -1239,6 +1267,8 @@ class Layer:
         With ``include_mask=False`` the mask is left out of the alpha channel.
         """
         image = self.filtered_image()
+        if self.gradients:
+            image = self._gradient_overlay(image, offset)
         if self.texts:
             image = self._text_overlay(image, offset)
         if self.strokes or self.fills:
@@ -1256,6 +1286,7 @@ class Layer:
             self._vector_token,
             self._poses_token,
             self._path_token,
+            self._gradient_token,
             self._mask_token,
             tuple(offset),
         )
@@ -1302,6 +1333,8 @@ class Layer:
         if getattr(self, "_transform_draft", False):
             return self._composited_region_draft(box, offset)
         image = self.filtered_image()
+        if self.gradients:
+            image = self._gradient_overlay(image, offset)
         if self.texts:
             image = self._text_overlay(image, offset)
         if self.strokes or self.fills:
@@ -1335,6 +1368,8 @@ class Layer:
         # ``point - offset - box_origin`` in the crop, so add the origin back.
         ox = offset[0] + box[0]
         oy = offset[1] + box[1]
+        for spec in self.gradients:
+            sub = gradient.paste(sub, spec, (ox, oy))
         for spec in self.texts:
             sub = textrender.paste(sub, spec, (ox, oy))
         for spec in self.fills:
@@ -1353,12 +1388,28 @@ class Layer:
             )
         return sub
 
+    def _gradient_overlay(self, image, offset=None):
+        """``image`` with every gradient object drawn over it (cached)."""
+        offset = self.content_offset() if offset is None else offset
+        key = (
+            self._image_token, filters.chain_key(self.filters),
+            self._gradient_token, tuple(offset),
+        )
+        if self._gradient_cache is not None and self._gradient_key == key:
+            return self._gradient_cache
+        result = image.copy()
+        for spec in self.gradients:
+            result = gradient.paste(result, spec, offset)
+        self._gradient_cache = result
+        self._gradient_key = key
+        return result
+
     def _text_overlay(self, image, offset=None):
         """``image`` with every text object drawn over it (cached)."""
         offset = self.content_offset() if offset is None else offset
         key = (
             self._image_token, filters.chain_key(self.filters), self._text_token,
-            tuple(offset),
+            self._gradient_token, tuple(offset),
         )
         if self._text_cache is not None and self._text_key == key:
             return self._text_cache
@@ -1374,7 +1425,8 @@ class Layer:
         offset = self.content_offset() if offset is None else offset
         key = (
             self._image_token, filters.chain_key(self.filters),
-            self._text_token, self._vector_token, tuple(offset),
+            self._text_token, self._gradient_token, self._vector_token,
+            tuple(offset),
         )
         if self._vector_cache is not None and self._vector_key == key:
             return self._vector_cache
@@ -1392,8 +1444,8 @@ class Layer:
         offset = self.content_offset() if offset is None else offset
         key = (
             self._image_token, filters.chain_key(self.filters),
-            self._text_token, self._vector_token, self._poses_token,
-            tuple(offset),
+            self._text_token, self._gradient_token, self._vector_token,
+            self._poses_token, tuple(offset),
         )
         if self._poses_cache is not None and self._poses_key == key:
             return self._poses_cache
@@ -1410,8 +1462,8 @@ class Layer:
         offset = self.content_offset() if offset is None else offset
         key = (
             self._image_token, filters.chain_key(self.filters),
-            self._text_token, self._vector_token, self._poses_token,
-            self._path_token, tuple(offset),
+            self._text_token, self._gradient_token, self._vector_token,
+            self._poses_token, self._path_token, tuple(offset),
         )
         if self._path_cache is not None and self._path_key == key:
             return self._path_cache
@@ -1499,6 +1551,24 @@ class Layer:
         # set_image rebinds the draw handle and drops the filter cache.
         self.set_image(image)
         self.invalidate_paths()
+        return True
+
+    def rasterize_gradients(self):
+        """Fold every gradient object into the base pixels and clear the list.
+
+        Returns ``True`` when something was rasterized, so callers can decide
+        whether to report the layer as changed.
+        """
+        if not self.gradients:
+            return False
+        offset = self.offset
+        image = self.begin_write()
+        for spec in self.gradients:
+            image = gradient.paste(image, spec, offset)
+        self.gradients = []
+        # set_image rebinds the draw handle and drops the filter cache.
+        self.set_image(image)
+        self.invalidate_gradients()
         return True
 
     def is_locked(self):
@@ -1967,6 +2037,10 @@ class Canvas:
                     clone for clone in (textrender.clone(spec) for spec in layer.texts)
                     if clone is not None
                 ],
+                "gradients": [
+                    clone for clone in (gradient.clone(spec) for spec in layer.gradients)
+                    if clone is not None
+                ],
                 "vector": bool(layer.vector),
                 "strokes": [
                     clone for clone in (vector.clone(spec) for spec in layer.strokes)
@@ -2093,6 +2167,14 @@ class Canvas:
                 for spec in (
                     textrender.normalize(entry)
                     for entry in layer_entry.get("texts", [])
+                )
+                if spec is not None
+            ]
+            layer.gradients = [
+                spec
+                for spec in (
+                    gradient.normalize(entry)
+                    for entry in layer_entry.get("gradients", [])
                 )
                 if spec is not None
             ]
@@ -2867,6 +2949,7 @@ class Canvas:
             content._vector_token,
             content._poses_token,
             content._path_token,
+            content._gradient_token,
             content._mask_token,
             layer._mask_token,
             tuple(layer.offset),

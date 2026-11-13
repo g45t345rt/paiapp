@@ -6,7 +6,7 @@ from tkinter import font as tkfont, ttk
 
 from PIL import Image, ImageTk
 
-from . import document, filters, icons, path, textrender, theme, vector
+from . import document, filters, gradient, icons, path, textrender, theme, vector
 from .canvasarea import checkerboard
 from .scrollbar import ArrowScrollbar
 from .ui import PopupMenu, Tooltip
@@ -108,6 +108,7 @@ GHOST = 44
 FILTER_LEAD = ("color-filter", "\u2022", "muted", "Filter")
 TEXT_LEAD = ("typography", "T", "muted", "Text")
 PATH_LEAD = ("vector-bezier", "P", "muted", "Path")
+GRADIENT_LEAD = ("color-filter", "G", "muted", "Gradient")
 VECTOR_LINE_LEAD = ("vector-bezier", "V", "muted", "Vector line")
 VECTOR_FILL_LEAD = ("vector-polygon", "F", "muted", "Vector fill")
 
@@ -332,6 +333,10 @@ class LayerPanel(tk.Frame):
                  get_canvas_choices=None, on_group_duplicate=None,
                  on_text_duplicate=None, on_text_toggle=None,
                  on_path_duplicate=None, on_path_toggle=None,
+                 on_gradient_select=None, on_gradient_edit=None,
+                 on_gradient_remove=None, on_gradient_move=None,
+                 on_gradient_duplicate=None, on_gradient_toggle=None,
+                 on_rasterize_gradients=None, on_rasterize_gradient=None,
                  on_vector_select=None, on_vector_edit=None,
                  on_vector_remove=None, on_vector_duplicate=None,
                  on_vector_move=None, on_layer_collapse=None,
@@ -342,6 +347,14 @@ class LayerPanel(tk.Frame):
         self._on_text_toggle = on_text_toggle
         self._on_path_duplicate = on_path_duplicate
         self._on_path_toggle = on_path_toggle
+        self._on_gradient_select = on_gradient_select
+        self._on_gradient_edit = on_gradient_edit
+        self._on_gradient_remove = on_gradient_remove
+        self._on_gradient_move = on_gradient_move
+        self._on_gradient_duplicate = on_gradient_duplicate
+        self._on_gradient_toggle = on_gradient_toggle
+        self._on_rasterize_gradients = on_rasterize_gradients
+        self._on_rasterize_gradient = on_rasterize_gradient
         self._on_vector_select = on_vector_select
         self._on_vector_edit = on_vector_edit
         self._on_vector_remove = on_vector_remove
@@ -437,6 +450,7 @@ class LayerPanel(tk.Frame):
         self._selected_filter = None
         self._selected_text = None
         self._selected_path = None
+        self._selected_gradient = None
         self._selected_vector = None
         self._selected_group = None
         self._selected_group_filter = None
@@ -597,7 +611,7 @@ class LayerPanel(tk.Frame):
     def refresh(self, layers, active, selected=None, filter_selection=None,
                 text_selection=None, path_selection=None, group_selection=None,
                 groups=None, group_filter_selection=None,
-                vector_selection=None):
+                vector_selection=None, gradient_selection=None):
         """Rebuild the list from ``layers`` and select the ``active`` layer.
 
         Group members are shown indented beneath a group header row that can be
@@ -613,7 +627,9 @@ class LayerPanel(tk.Frame):
         instead, and ``group_filter_selection`` an optional
         ``(group, filter_index)`` selecting one of the group's filter rows.
         ``vector_selection`` is an optional ``(layer_index, item_index)`` for
-        one of a vector layer's editable strokes/fills.
+        one of a vector layer's editable strokes/fills. ``gradient_selection``
+        is an optional ``(layer_index, gradient_index)`` for one of the layer's
+        editable gradient fills.
         """
         # Keep the existing rows alive so unchanged entries can be reused in
         # place. Collapsing, deleting or toggling one row then only touches the
@@ -724,6 +740,8 @@ class LayerPanel(tk.Frame):
         self._anchor = None
         self._selected_filter = None
         self._selected_text = None
+        self._selected_path = None
+        self._selected_gradient = None
         self._selected_group = None
         self._selected_group_filter = None
         self._selected_vector = None
@@ -793,6 +811,15 @@ class LayerPanel(tk.Frame):
                     self._anchor = row
                     self._selection_kind = "path"
                     self._selected_path = (layer_index, path_index)
+                    break
+        elif gradient_selection is not None:
+            layer_index, gradient_index = gradient_selection
+            for row, entry in enumerate(self._rows):
+                if entry == ("gradient", layer_index, gradient_index):
+                    self._selected = [row]
+                    self._anchor = row
+                    self._selection_kind = "gradient"
+                    self._selected_gradient = (layer_index, gradient_index)
                     break
         else:
             for index in selected if selected is not None else [active]:
@@ -1613,14 +1640,14 @@ class LayerPanel(tk.Frame):
     def _layer_object_count(self, layer):
         """How many object rows ``layer`` lists beneath it.
 
-        Filters, texts, paths, vector strokes and vector fills are all kept as
-        editable specs and each gets an indented row, so the badge counts every
-        one of them. The same total applies to vector and ordinary raster
-        layers, which both may carry any of these kinds.
+        Filters, texts, paths, gradient fills, vector strokes and vector fills
+        are all kept as editable specs and each gets an indented row, so the
+        badge counts every one of them. The same total applies to vector and
+        ordinary raster layers, which both may carry any of these kinds.
         """
         return sum(len(getattr(layer, attr, None) or ())
-                   for attr in ("filters", "texts", "paths", "strokes",
-                                "fills"))
+                   for attr in ("filters", "texts", "paths", "gradients",
+                                "strokes", "fills"))
 
     def _insert_layer_row(self, layers, index, layer_row, indent):
         """Insert one layer row (and its indented object rows) into the list.
@@ -1663,6 +1690,13 @@ class LayerPanel(tk.Frame):
                           indent + 1, leading=PATH_LEAD,
                           hidden=bool(spec.get("hidden")),
                           key=("path", _uid(layer), path_index))
+        for gradient_index, spec in enumerate(
+                getattr(layer, "gradients", None) or []):
+            self._add_row(gradient.describe(spec),
+                          ("gradient", index, gradient_index), indent + 1,
+                          leading=GRADIENT_LEAD,
+                          hidden=bool(spec.get("hidden")),
+                          key=("gradient", _uid(layer), gradient_index))
         item_index = 0
         for spec in getattr(layer, "strokes", None) or []:
             self._add_row(vector.describe(spec), ("vector", index, item_index),
@@ -1759,6 +1793,7 @@ class LayerPanel(tk.Frame):
         self._selected_filter = None
         self._selected_text = None
         self._selected_path = None
+        self._selected_gradient = None
         self._selected_group = None
         self._selected_group_filter = None
         self._apply_selection_colors()
@@ -2105,6 +2140,7 @@ class LayerPanel(tk.Frame):
             self._selected_filter = None
             self._selected_text = None
             self._selected_path = None
+            self._selected_gradient = None
             self._selected_group_filter = None
             if self._on_group_select is not None:
                 self._on_group_select(entry[1])
@@ -2115,6 +2151,7 @@ class LayerPanel(tk.Frame):
             self._selected_filter = None
             self._selected_text = None
             self._selected_path = None
+            self._selected_gradient = None
             if self._on_group_filter_select is not None:
                 self._on_group_filter_select(entry[1], entry[2])
         elif entry[0] == "layer":
@@ -2122,6 +2159,7 @@ class LayerPanel(tk.Frame):
             self._selected_filter = None
             self._selected_text = None
             self._selected_path = None
+            self._selected_gradient = None
             self._selected_group = None
             self._selected_group_filter = None
             self._on_select(entry[1])
@@ -2129,6 +2167,7 @@ class LayerPanel(tk.Frame):
             self._selection_kind = "text"
             self._selected_text = (entry[1], entry[2])
             self._selected_path = None
+            self._selected_gradient = None
             self._selected_filter = None
             self._selected_group = None
             self._selected_group_filter = None
@@ -2138,6 +2177,7 @@ class LayerPanel(tk.Frame):
             self._selection_kind = "vector"
             self._selected_vector = (entry[1], entry[2])
             self._selected_path = None
+            self._selected_gradient = None
             self._selected_text = None
             self._selected_filter = None
             self._selected_group = None
@@ -2147,16 +2187,28 @@ class LayerPanel(tk.Frame):
         elif entry[0] == "path":
             self._selection_kind = "path"
             self._selected_path = (entry[1], entry[2])
+            self._selected_gradient = None
             self._selected_text = None
             self._selected_filter = None
             self._selected_group = None
             self._selected_group_filter = None
             if self._on_path_select is not None:
                 self._on_path_select(entry[1], entry[2])
+        elif entry[0] == "gradient":
+            self._selection_kind = "gradient"
+            self._selected_gradient = (entry[1], entry[2])
+            self._selected_path = None
+            self._selected_text = None
+            self._selected_filter = None
+            self._selected_group = None
+            self._selected_group_filter = None
+            if self._on_gradient_select is not None:
+                self._on_gradient_select(entry[1], entry[2])
         else:
             self._selection_kind = "filter"
             self._selected_filter = (entry[1], entry[2])
             self._selected_text = None
+            self._selected_gradient = None
             self._selected_group = None
             self._selected_group_filter = None
             if self._on_filter_select is not None:
@@ -2190,6 +2242,9 @@ class LayerPanel(tk.Frame):
         elif entry[0] == "path":
             if self._on_path_edit is not None:
                 self._on_path_edit(entry[1], entry[2])
+        elif entry[0] == "gradient":
+            if self._on_gradient_edit is not None:
+                self._on_gradient_edit(entry[1], entry[2])
         elif entry[0] == "vector":
             if self._on_vector_edit is not None:
                 self._on_vector_edit(entry[1], entry[2])
@@ -2216,6 +2271,13 @@ class LayerPanel(tk.Frame):
         """True when a path row, not a layer row, is the current target."""
         return self._selection_kind == "path" and self._selected_path is not None
 
+    def _gradient_active(self):
+        """True when a gradient row, not a layer row, is the current target."""
+        return (
+            self._selection_kind == "gradient"
+            and self._selected_gradient is not None
+        )
+
     def _vector_active(self):
         """True when an editable vector row is the current target."""
         return (
@@ -2235,6 +2297,7 @@ class LayerPanel(tk.Frame):
                 self._selection_kind = "vector"
                 self._selected_vector = (layer_index, item_index)
                 self._selected_path = None
+                self._selected_gradient = None
                 self._selected_text = None
                 self._selected_filter = None
                 self._selected_group = None
@@ -2264,7 +2327,7 @@ class LayerPanel(tk.Frame):
         """
         if self._vector_active():
             return None
-        if self._text_active() or self._path_active():
+        if self._text_active() or self._path_active() or self._gradient_active():
             spec = self._selected_object_spec()
             if spec is None:
                 return None
@@ -2284,8 +2347,9 @@ class LayerPanel(tk.Frame):
         is_filter = self._filter_active()
         is_text = self._text_active()
         is_path = self._path_active()
+        is_gradient = self._gradient_active()
         is_vector = self._vector_active()
-        is_item = is_text or is_path or is_vector
+        is_item = is_text or is_path or is_gradient or is_vector
         is_group = self._selection_kind == "group" and self._selected_group is not None
         is_group_filter = self._group_filter_active()
         is_group_like = is_group or is_group_filter
@@ -2331,6 +2395,8 @@ class LayerPanel(tk.Frame):
                 target = "text"
             elif is_path:
                 target = "path"
+            elif is_gradient:
+                target = "gradient"
             elif is_vector:
                 target = "vector object"
             else:
@@ -2349,6 +2415,8 @@ class LayerPanel(tk.Frame):
             self.duplicate_tip.set_text("Duplicate text")
         elif is_path:
             self.duplicate_tip.set_text("Duplicate path")
+        elif is_gradient:
+            self.duplicate_tip.set_text("Duplicate gradient")
         elif is_vector:
             self.duplicate_tip.set_text("Duplicate vector object")
         else:
@@ -2373,6 +2441,11 @@ class LayerPanel(tk.Frame):
             self.up_tip.set_text("Move path up")
             self.down_tip.set_text("Move path down")
             self.more_tip.set_text("More path actions")
+        elif is_gradient:
+            self.delete_tip.set_text("Remove gradient")
+            self.up_tip.set_text("Move gradient up")
+            self.down_tip.set_text("Move gradient down")
+            self.more_tip.set_text("More gradient actions")
         elif is_vector:
             self.delete_tip.set_text("Remove vector object")
             self.up_tip.set_text("Move vector object up")
@@ -2406,6 +2479,8 @@ class LayerPanel(tk.Frame):
             self._on_text_edit(*self._selected_text)
         elif self._path_active() and self._on_path_edit is not None:
             self._on_path_edit(*self._selected_path)
+        elif self._gradient_active() and self._on_gradient_edit is not None:
+            self._on_gradient_edit(*self._selected_gradient)
         elif self._vector_active() and self._on_vector_edit is not None:
             self._on_vector_edit(*self._selected_vector)
         elif self._filter_active() and self._on_filter_edit is not None:
@@ -2430,6 +2505,8 @@ class LayerPanel(tk.Frame):
             self._on_text_remove()
         elif self._path_active() and self._on_path_remove is not None:
             self._on_path_remove()
+        elif self._gradient_active() and self._on_gradient_remove is not None:
+            self._on_gradient_remove()
         elif self._vector_active() and self._on_vector_remove is not None:
             self._on_vector_remove()
         elif self._filter_active() and self._on_filter_remove is not None:
@@ -2438,7 +2515,8 @@ class LayerPanel(tk.Frame):
             self._on_delete()
 
     def _handle_clear(self):
-        if self._text_active() or self._path_active() or self._vector_active():
+        if (self._text_active() or self._path_active()
+                or self._gradient_active() or self._vector_active()):
             return
         if self._group_filter_active() and self._on_group_filter_clear is not None:
             self._on_group_filter_clear()
@@ -2458,6 +2536,8 @@ class LayerPanel(tk.Frame):
             self._on_text_move(delta)
         elif self._path_active() and self._on_path_move is not None:
             self._on_path_move(delta)
+        elif self._gradient_active() and self._on_gradient_move is not None:
+            self._on_gradient_move(delta)
         elif self._vector_active() and self._on_vector_move is not None:
             self._on_vector_move(delta)
         elif self._filter_active() and self._on_filter_move is not None:
@@ -2482,6 +2562,9 @@ class LayerPanel(tk.Frame):
         elif self._path_active():
             if self._on_path_toggle is not None:
                 self._on_path_toggle()
+        elif self._gradient_active():
+            if self._on_gradient_toggle is not None:
+                self._on_gradient_toggle()
         elif self._vector_active():
             return
         elif self._filter_active() and self._on_filter_toggle is not None:
@@ -2497,6 +2580,9 @@ class LayerPanel(tk.Frame):
         elif self._path_active():
             layer_index, index = self._selected_path
             attr = "paths"
+        elif self._gradient_active():
+            layer_index, index = self._selected_gradient
+            attr = "gradients"
         elif self._vector_active():
             layer_index, index = self._selected_vector
             if not (0 <= layer_index < len(self._layers)):
@@ -2529,6 +2615,9 @@ class LayerPanel(tk.Frame):
         elif self._path_active():
             if self._on_path_duplicate is not None:
                 self._on_path_duplicate()
+        elif self._gradient_active():
+            if self._on_gradient_duplicate is not None:
+                self._on_gradient_duplicate()
         elif self._vector_active():
             if self._on_vector_duplicate is not None:
                 self._on_vector_duplicate()
@@ -2578,6 +2667,8 @@ class LayerPanel(tk.Frame):
             index = self._selected_text[0]
         elif self._path_active():
             index = self._selected_path[0]
+        elif self._gradient_active():
+            index = self._selected_gradient[0]
         else:
             indices = self.selected_indices(len(self._layers))
             index = indices[0] if indices else None
@@ -2588,7 +2679,8 @@ class LayerPanel(tk.Frame):
     def _context_layers(self):
         """Every layer the layer actions target: the whole layer selection,
         or just the owning layer for a filter, text or path row."""
-        if self._filter_active() or self._text_active() or self._path_active():
+        if (self._filter_active() or self._text_active()
+                or self._path_active() or self._gradient_active()):
             layer = self._context_layer()
             return [layer] if layer is not None else []
         return [
@@ -2623,6 +2715,13 @@ class LayerPanel(tk.Frame):
         """True when any target layer has path objects and can be modified."""
         return any(
             l.paths and not l.is_locked() for l in self._context_layers()
+        )
+
+    def _layer_has_gradients(self):
+        """True when any target layer has gradient objects and can be modified."""
+        return any(
+            (getattr(l, "gradients", None) or []) and not l.is_locked()
+            for l in self._context_layers()
         )
 
     def _clip_selected(self):
@@ -2705,6 +2804,24 @@ class LayerPanel(tk.Frame):
             menu.add_separator()
             menu.add_command("Remove Path", command=self.delete_current)
             return menu
+        if self._gradient_active():
+            menu.add_command("Edit Gradient", command=self._handle_rename)
+            menu.add_command("Duplicate Gradient",
+                             command=self._handle_duplicate)
+            menu.add_command("Show/Hide Gradient",
+                             command=self._handle_toggle)
+            menu.add_command(
+                "Rasterize Gradient", command=self._on_rasterize_gradient,
+                enabled=self._layer_has_gradients,
+            )
+            menu.add_separator()
+            menu.add_command("Move Gradient Up",
+                             command=lambda: self._handle_move(1))
+            menu.add_command("Move Gradient Down",
+                             command=lambda: self._handle_move(-1))
+            menu.add_separator()
+            menu.add_command("Remove Gradient", command=self.delete_current)
+            return menu
         if self._vector_active():
             menu.add_command("Edit Vector Object", command=self._handle_rename)
             menu.add_command("Duplicate Vector Object",
@@ -2785,6 +2902,10 @@ class LayerPanel(tk.Frame):
         menu.add_command(
             "Rasterize Paths", command=self._on_rasterize_paths,
             enabled=self._layer_has_paths,
+        )
+        menu.add_command(
+            "Rasterize Gradients", command=self._on_rasterize_gradients,
+            enabled=self._layer_has_gradients,
         )
         menu.add_separator()
         # Arrange actions
@@ -3343,6 +3464,7 @@ class LayerPanel(tk.Frame):
             filter_selection=self._selected_filter,
             text_selection=self._selected_text,
             path_selection=self._selected_path,
+            gradient_selection=self._selected_gradient,
             group_selection=(
                 self._selected_group if self._selection_kind == "group" else None
             ),

@@ -34,7 +34,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 from PIL import Image
 
-from paintapp import filters, path, poses, textrender, vector
+from paintapp import filters, gradient, path, poses, textrender, vector
 from paintapp.document import AssetLibrary, Canvas, Group, normalize_blend
 
 FORMAT = "pai"
@@ -335,6 +335,14 @@ def snapshot(app):
                         textrender.clone(spec) for spec in layer.texts
                     )
                     if clone is not None
+                ],
+                "gradients": [
+                    spec
+                    for spec in (
+                        gradient.to_json(entry_spec)
+                        for entry_spec in getattr(layer, "gradients", [])
+                    )
+                    if spec is not None
                 ],
                 "vector": bool(getattr(layer, "vector", False)),
                 "strokes": [
@@ -702,6 +710,14 @@ def _build_canvases(payload, cancel=None):
                 for spec in (
                     textrender.normalize(entry_spec)
                     for entry_spec in layer_entry.get("texts", [])
+                )
+                if spec is not None
+            ]
+            layer.gradients = [
+                spec
+                for spec in (
+                    gradient.from_json(entry_spec)
+                    for entry_spec in layer_entry.get("gradients", [])
                 )
                 if spec is not None
             ]

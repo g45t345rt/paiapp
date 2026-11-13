@@ -16,6 +16,8 @@ gradient can carry any number of colours and fade to transparency. The maths
 runs in numpy, which is already a hard dependency of the app's engine.
 """
 
+import base64
+import io
 import math
 
 import numpy as np
@@ -212,6 +214,174 @@ def strip_image(stops, width, height):
     out = Image.fromarray(rgb, "RGB").convert("RGBA")
     out.putalpha(Image.fromarray(alpha, "L"))
     return out
+
+
+def _point(value, default=(0.0, 0.0)):
+    """Coerce ``value`` to a finite ``(x, y)`` pair."""
+    try:
+        x, y = value[0], value[1]
+        return (float(x), float(y))
+    except (TypeError, IndexError, ValueError):
+        return (float(default[0]), float(default[1]))
+
+
+def _blend_key(value):
+    """Normalise a blend mode label/key to the key used by ``brush``."""
+    if not value:
+        return "normal"
+    key = str(value).strip().lower()
+    if key in brush.BLEND_MODES:
+        return key
+    for mode, label in brush.BLEND_MODES.items():
+        if label.lower() == key:
+            return mode
+    return "normal"
+
+
+def _decode_mask(data):
+    """Decode a stored base64 PNG mask into an ``L`` image (or ``None``)."""
+    if not isinstance(data, str) or not data:
+        return None
+    try:
+        raw = base64.b64decode(data.encode("ascii"))
+        image = Image.open(io.BytesIO(raw))
+        image.load()
+        return image.convert("L")
+    except Exception:
+        return None
+
+
+def _encode_mask(mask):
+    """Encode an ``L`` mask as base64 PNG for the project manifest."""
+    if not isinstance(mask, Image.Image):
+        return None
+    buf = io.BytesIO()
+    mask.convert("L").save(buf, format="PNG")
+    return base64.b64encode(buf.getvalue()).decode("ascii")
+
+
+def _mask_image(mask):
+    """Return a usable ``L`` mask from an image or a stored base64 string."""
+    if isinstance(mask, Image.Image):
+        return mask.convert("L")
+    return _decode_mask(mask)
+
+
+def normalize(spec):
+    """Return a valid gradient-object spec built from ``spec``.
+
+    A gradient object keeps its axis in document space and the full Gradient
+    tool settings (stops, type, spread, opacity and blend). Specs are kept on
+    the layer so the gradient stays editable instead of being baked into the
+    layer pixels. An optional selection mask is carried with it, so a live
+    gradient still respects the selection it was drawn through.
+    """
+    if not isinstance(spec, dict):
+        return None
+    stops = normalize_stops(spec.get("stops"))
+    if len(stops) < 2:
+        stops = [
+            [0.0, str(spec.get("from") or "#000000"), 255],
+            [1.0, str(spec.get("to") or "#ffffff"), 255],
+        ]
+    mode = str(spec.get("mode") or "linear").lower()
+    if mode not in dict(MODES):
+        mode = "linear"
+    spread = str(spec.get("spread") or "clamp").lower()
+    if spread not in dict(SPREADS):
+        spread = "clamp"
+    try:
+        opacity = max(1, min(100, int(spec.get("opacity", 100))))
+    except (TypeError, ValueError):
+        opacity = 100
+    mask = _mask_image(spec.get("mask"))
+    return {
+        "start": _point(spec.get("start")),
+        "end": _point(spec.get("end")),
+        "mode": mode,
+        "stops": stops,
+        "spread": spread,
+        "opacity": opacity,
+        "blend": _blend_key(spec.get("blend")),
+        "hidden": bool(spec.get("hidden", False)),
+        "mask": mask,
+    }
+
+
+def clone(spec):
+    """Return an independent copy of a gradient-object spec."""
+    normalized = normalize(spec)
+    if normalized is None:
+        return None
+    if normalized["mask"] is not None:
+        normalized["mask"] = normalized["mask"].copy()
+    return normalized
+
+
+def to_json(spec):
+    """A JSON-safe copy of ``spec`` (the mask is stored as base64 PNG)."""
+    normalized = normalize(spec)
+    if normalized is None:
+        return None
+    normalized["mask"] = _encode_mask(normalized["mask"])
+    return normalized
+
+
+def from_json(entry):
+    """Rebuild a spec from :func:`to_json` output."""
+    return normalize(entry)
+
+
+def describe(spec):
+    """A short human-readable label for the layer panel row."""
+    normalized = normalize(spec)
+    if normalized is None:
+        return "Gradient"
+    label = dict(MODES).get(normalized["mode"], "Linear")
+    return f"{label} gradient"
+
+
+def mask_for_size(spec, size):
+    """The spec's optional coverage mask, cropped/padded to ``size``."""
+    mask = _mask_image(spec.get("mask"))
+    if mask is None:
+        return None
+    width, height = max(1, int(size[0])), max(1, int(size[1]))
+    if mask.size == (width, height):
+        return mask
+    fitted = Image.new("L", (width, height), 0)
+    fitted.paste(mask, (0, 0))
+    return fitted
+
+
+def paste(image, spec, offset=(0, 0)):
+    """Draw one gradient object over ``image`` (RGBA) at ``offset``.
+
+    The gradient covers the full layer buffer, like the Gradient tool's fill,
+    and is composited through the spec's stops' alpha, opacity, blend and
+    optional selection mask.
+    """
+    if spec.get("hidden"):
+        return image
+    normalized = normalize(spec)
+    if normalized is None:
+        return image
+    width, height = image.size
+    ox, oy = int(offset[0]), int(offset[1])
+    start = (normalized["start"][0] - ox, normalized["start"][1] - oy)
+    end = (normalized["end"][0] - ox, normalized["end"][1] - oy)
+    rgb, alpha = gradient_layers(
+        (width, height), start, end, normalized["mode"],
+        stops=normalized["stops"], spread=normalized["spread"],
+    )
+    coverage = alpha
+    mask = mask_for_size(normalized, (width, height))
+    if mask is not None:
+        coverage = ImageChops.multiply(coverage, mask)
+    if normalized["opacity"] < 100:
+        factor = normalized["opacity"] / 100.0
+        coverage = coverage.point(lambda value: int(value * factor))
+    return brush.composite_image(image, rgb, coverage, normalized["blend"])
 
 
 def apply(layer, gradient, coverage, opacity=100, blend="normal", alpha=None):

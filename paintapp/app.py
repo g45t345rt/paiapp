@@ -18,6 +18,7 @@ from . import dialogs
 from . import colormanagement
 from . import combobox as _combobox
 from . import filters
+from . import gradient
 from . import fonts
 from . import modelsettings
 from . import path
@@ -528,6 +529,7 @@ class PaintApp:
         self._filter_sel = None
         self._text_sel = None
         self._path_sel = None
+        self._gradient_sel = None
         self._vector_sel = None
         self._group_sel = None
         self._group_filter_sel = None
@@ -944,6 +946,7 @@ class PaintApp:
             on_puppet_action=self.drawing.on_puppet_action,
             on_poses_action=self.drawing.on_poses_action,
             on_vector_action=self.drawing.on_vector_action,
+            on_gradient_change=self.drawing.on_gradient_settings_changed,
             on_transform_action=self.drawing.on_transform_action,
             on_vector_settings=self.drawing.refresh_vector,
             on_layout_change=self._on_layout_change,
@@ -1042,6 +1045,14 @@ class PaintApp:
             on_text_toggle=self.toggle_selected_text_visible,
             on_path_duplicate=self.duplicate_selected_path,
             on_path_toggle=self.toggle_selected_path_visible,
+            on_gradient_select=self._on_gradient_select,
+            on_gradient_edit=self._on_gradient_edit,
+            on_gradient_remove=self.remove_selected_gradient,
+            on_gradient_move=self.move_selected_gradient,
+            on_gradient_duplicate=self.duplicate_selected_gradient,
+            on_gradient_toggle=self.toggle_selected_gradient_visible,
+            on_rasterize_gradients=self.rasterize_selected_gradients,
+            on_rasterize_gradient=self.rasterize_selected_gradient,
         )
         self.layer_panel.pack(fill=tk.X)
 
@@ -2627,6 +2638,7 @@ class PaintApp:
         self._validate_filter_sel()
         self._validate_text_sel()
         self._validate_path_sel()
+        self._validate_gradient_sel()
         self._validate_vector_sel()
         self._validate_group_sel()
         self._validate_group_filter_sel()
@@ -2635,6 +2647,7 @@ class PaintApp:
             filter_selection=self._filter_sel,
             text_selection=self._text_sel,
             path_selection=self._path_sel,
+            gradient_selection=self._gradient_sel,
             vector_selection=self._vector_sel,
             group_selection=self._group_sel,
             groups=self.current.groups,
@@ -2997,6 +3010,19 @@ class PaintApp:
         if not (0 <= path_index < len(self.layers[layer_index].paths)):
             self._path_sel = None
 
+    def _validate_gradient_sel(self):
+        """Drop the gradient selection when it no longer points at a real object."""
+        sel = self._gradient_sel
+        if sel is None:
+            return
+        layer_index, gradient_index = sel
+        if not (0 <= layer_index < len(self.layers)):
+            self._gradient_sel = None
+            return
+        if not (0 <= gradient_index
+                < len(getattr(self.layers[layer_index], "gradients", None) or [])):
+            self._gradient_sel = None
+
     def _validate_vector_sel(self):
         """Drop the vector selection when it no longer points at a real object."""
         sel = self._vector_sel
@@ -3017,6 +3043,7 @@ class PaintApp:
         self._filter_sel = None
         self._text_sel = None
         self._path_sel = None
+        self._gradient_sel = None
         self._vector_sel = None
         self._group_sel = None
         self._group_filter_sel = None
@@ -3024,6 +3051,7 @@ class PaintApp:
         self.drawing.commit_text()
         self.drawing.finish_path()
         self.drawing.clear_vector_selection()
+        self.drawing.clear_gradient_target()
         self.layer_panel.set_opacity(self.active_layer().opacity)
         self.layer_panel.update_mask_state(self.active_layer())
         self._report_layer()
@@ -3420,6 +3448,8 @@ class PaintApp:
                 self._text_sel = None
             if self._path_sel and self._path_sel[0] in targets:
                 self._path_sel = None
+            if self._gradient_sel and self._gradient_sel[0] in targets:
+                self._gradient_sel = None
             if self._vector_sel and self._vector_sel[0] in targets:
                 self._vector_sel = None
         self._refresh_layer_list(indices)
@@ -4021,6 +4051,7 @@ class PaintApp:
         self._filter_sel = None
         self._text_sel = None
         self._path_sel = None
+        self._gradient_sel = None
 
     def canvas_move_choices(self):
         """Targets for the Layers panel's Move to Canvas command.
@@ -4358,7 +4389,9 @@ class PaintApp:
         self._filter_sel = None
         self._text_sel = None
         self._path_sel = None
+        self._gradient_sel = None
         self.area.set_outline_group(group)
+        self.drawing.clear_gradient_target()
         self._sync_prompt()
 
     def _selected_group(self):
@@ -4599,9 +4632,11 @@ class PaintApp:
         self._filter_sel = (layer_index, filter_index)
         self._text_sel = None
         self._path_sel = None
+        self._gradient_sel = None
         self._group_sel = None
         self._group_filter_sel = None
         layer = self.layers[layer_index]
+        self.drawing.clear_gradient_target()
         self.layer_panel.set_opacity(layer.opacity)
         self.layer_panel.update_mask_state(layer)
         self._report_layer()
@@ -4847,10 +4882,12 @@ class PaintApp:
         self._text_sel = (layer_index, text_index)
         self._vector_sel = None
         self._path_sel = None
+        self._gradient_sel = None
         self._filter_sel = None
         self._group_sel = None
         self._group_filter_sel = None
         layer = self.layers[layer_index]
+        self.drawing.clear_gradient_target()
         self.layer_panel.set_opacity(layer.opacity)
         self.layer_panel.update_mask_state(layer)
         self._report_layer()
@@ -4977,10 +5014,12 @@ class PaintApp:
         self._path_sel = (layer_index, path_index)
         self._vector_sel = None
         self._text_sel = None
+        self._gradient_sel = None
         self._filter_sel = None
         self._group_sel = None
         self._group_filter_sel = None
         layer = self.layers[layer_index]
+        self.drawing.clear_gradient_target()
         self.layer_panel.set_opacity(layer.opacity)
         self.layer_panel.update_mask_state(layer)
         self._report_layer()
@@ -5100,6 +5139,189 @@ class PaintApp:
         self._refresh_layer_list()
         self.render()
 
+    # ---------------------------------------------------------------- gradient
+    def _on_gradient_select(self, layer_index, gradient_index):
+        """Select a gradient row and open it for live editing."""
+        if not (0 <= layer_index < len(self.layers)):
+            return
+        layer = self.layers[layer_index]
+        if not (0 <= gradient_index < len(layer.gradients)):
+            return
+        self.active = layer_index
+        self._gradient_sel = (layer_index, gradient_index)
+        self._path_sel = None
+        self._text_sel = None
+        self._vector_sel = None
+        self._filter_sel = None
+        self._group_sel = None
+        self._group_filter_sel = None
+        self.area.set_outline_group(None)
+        self.drawing.commit_text()
+        self.drawing.finish_path()
+        self.drawing.clear_vector_selection()
+        if not self.tools.gradient_tool:
+            self.tools.select("gradient")
+        spec = layer.gradients[gradient_index]
+        self.tools.set_gradient_spec(spec)
+        self.drawing.edit_gradient_object(layer, gradient_index)
+        self.layer_panel.set_opacity(layer.opacity)
+        self.layer_panel.update_mask_state(layer)
+        self._report_layer()
+        self.render()
+        self.set_result("Editing live gradient; change its settings to update it.")
+
+    def _on_gradient_edit(self, layer_index, gradient_index):
+        self._on_gradient_select(layer_index, gradient_index)
+
+    def _gradient_target(self):
+        """The ``(layer, index)`` of the selected gradient object, or ``None``."""
+        sel = self._gradient_sel
+        if sel is None:
+            return None
+        layer_index, gradient_index = sel
+        if not (0 <= layer_index < len(self.layers)):
+            return None
+        layer = self.layers[layer_index]
+        gradients = getattr(layer, "gradients", None) or []
+        if not (0 <= gradient_index < len(gradients)):
+            return None
+        return layer, gradient_index
+
+    def remove_selected_gradient(self):
+        """Delete the selected gradient object from its layer."""
+        target = self._gradient_target()
+        if target is None:
+            self.set_result("Select a gradient object first.")
+            return
+        layer, index = target
+        if layer.is_locked():
+            self._active_layer_locked()
+            return
+        self._push_undo("Remove gradient")
+        layer.gradients.pop(index)
+        layer.invalidate_gradients()
+        self._gradient_sel = None
+        self.drawing.clear_gradient_target()
+        self._refresh_layer_list()
+        self.render()
+        self.set_result(f"Removed gradient from '{layer.name}'.")
+
+    def move_selected_gradient(self, delta):
+        """Move the selected gradient up (``1``) or down (``-1``)."""
+        target = self._gradient_target()
+        if target is None:
+            self.set_result("Select a gradient object first.")
+            return
+        layer, index = target
+        target_index = index + delta
+        if target_index < 0 or target_index >= len(layer.gradients):
+            return
+        if layer.is_locked():
+            self._active_layer_locked()
+            return
+        self._push_undo("Reorder gradient")
+        layer.gradients[index], layer.gradients[target_index] = (
+            layer.gradients[target_index], layer.gradients[index],
+        )
+        layer.invalidate_gradients()
+        self._gradient_sel = (self.layers.index(layer), target_index)
+        self.drawing.edit_gradient_object(layer, target_index)
+        self._refresh_layer_list()
+        self.render()
+
+    def duplicate_selected_gradient(self):
+        """Copy the selected gradient object, placing the copy just above it."""
+        target = self._gradient_target()
+        if target is None:
+            self.set_result("Select a gradient object first.")
+            return
+        layer, index = target
+        if layer.is_locked():
+            self._active_layer_locked()
+            return
+        copy = gradient.clone(layer.gradients[index])
+        if copy is None:
+            return
+        self._push_undo("Duplicate gradient")
+        layer.gradients.insert(index + 1, copy)
+        layer.invalidate_gradients()
+        self._gradient_sel = (self.layers.index(layer), index + 1)
+        self.drawing.edit_gradient_object(layer, index + 1)
+        self._refresh_layer_list()
+        self.render()
+        self.set_result(f"Duplicated gradient on '{layer.name}'.")
+
+    def toggle_selected_gradient_visible(self):
+        """Show or hide the selected gradient object without removing it."""
+        target = self._gradient_target()
+        if target is None:
+            self.set_result("Select a gradient object first.")
+            return
+        layer, index = target
+        self._push_undo("Toggle gradient visibility")
+        spec = layer.gradients[index]
+        if spec.get("hidden"):
+            spec.pop("hidden", None)
+        else:
+            spec["hidden"] = True
+        layer.invalidate_gradients()
+        self._gradient_sel = (self.layers.index(layer), index)
+        self._refresh_layer_list()
+        self.render()
+
+    def rasterize_selected_gradients(self):
+        """Fold the active layer's gradient objects into its pixels."""
+        multi = self._multi_layer_selection()
+        if multi is not None:
+            self.drawing.clear_gradient_target()
+            self._bake_layers(
+                multi, lambda l: bool(getattr(l, "gradients", None)),
+                lambda l: l.rasterize_gradients(),
+                "Rasterize gradients", "gradients", "_gradient_sel",
+            )
+            return
+        layer = self.active_layer()
+        if layer is None:
+            self.set_result("There is no layer with gradients.")
+            return
+        if self._active_layer_locked():
+            return
+        if not layer.gradients:
+            self.set_result("The active layer has no gradients.")
+            return
+        self._push_undo("Rasterize gradients")
+        layer.rasterize_gradients()
+        self._gradient_sel = None
+        self.drawing.clear_gradient_target()
+        self._refresh_layer_list()
+        self.render()
+        self.set_result(f"Rasterized gradients on '{layer.name}'.")
+
+    def rasterize_selected_gradient(self):
+        """Bake just the selected gradient object into the layer's pixels."""
+        target = self._gradient_target()
+        if target is None:
+            self.set_result("Select a gradient object first.")
+            return
+        layer, index = target
+        if layer.is_locked():
+            self._active_layer_locked()
+            return
+        if not (0 <= index < len(layer.gradients)):
+            return
+        spec = layer.gradients[index]
+        self._push_undo("Rasterize gradient")
+        layer.gradients.remove(spec)
+        image = layer.begin_write()
+        image = gradient.paste(image, spec, layer.offset)
+        layer.set_image(image)
+        layer.invalidate_gradients()
+        self._gradient_sel = None
+        self.drawing.clear_gradient_target()
+        self._refresh_layer_list()
+        self.render()
+        self.set_result(f"Rasterized gradient on '{layer.name}'.")
+
     def _vector_target(self):
         """The ``(layer, item_index)`` of the selected vector object, or ``None``."""
         sel = self._vector_sel
@@ -5123,11 +5345,13 @@ class PaintApp:
         self.active = layer_index
         self._vector_sel = (layer_index, item_index)
         self._path_sel = None
+        self._gradient_sel = None
         self._text_sel = None
         self._filter_sel = None
         self._group_sel = None
         self._group_filter_sel = None
         self.area.set_outline_group(None)
+        self.drawing.clear_gradient_target()
         self.drawing.commit_text()
         self.drawing.finish_path()
         self.drawing.select_vector_item(layer, item_index, edit=True)
@@ -5362,6 +5586,8 @@ class PaintApp:
         self._filter_sel = None
         self._text_sel = None
         self._path_sel = None
+        self._gradient_sel = None
+        self.drawing.clear_gradient_target()
         self._report_layer()
 
     def _on_group_filter_edit(self, group, filter_index):
@@ -5887,6 +6113,7 @@ class PaintApp:
             self._filter_sel = None
             self._text_sel = None
             self._path_sel = None
+            self._gradient_sel = None
             self._refresh_layer_list(multi)
             self.set_result("")
             self.render()
@@ -5908,6 +6135,7 @@ class PaintApp:
         self._filter_sel = None
         self._text_sel = None
         self._path_sel = None
+        self._gradient_sel = None
         self._refresh_layer_list()
         self.set_result("")
         self.render()
@@ -7040,7 +7268,8 @@ class PaintApp:
         elif tools.fill_tool:
             status = "fill: click to flood-fill the active layer"
         elif tools.gradient_tool:
-            status = "gradient: drag to set the axis, release to fill"
+            status = ("gradient: drag to add or edit a live gradient; panel "
+                      "changes update the selected one")
         elif tools.shape_tool:
             status = ("shape: drag to draw (Shift constrains); fill, stroke or "
                       "both with the tool's colors")
