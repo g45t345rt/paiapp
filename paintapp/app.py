@@ -2402,6 +2402,26 @@ class PaintApp:
         self.area.set_grid_size(self.grid_size)
         self.set_result(f"Grid size set to {self.grid_size} px.")
 
+    def ask_custom_grid_size(self):
+        """Prompt for a custom grid cell size and apply it."""
+        value = dialogs.ask_string(
+            self.root, "Grid Size", "Grid size (px):", str(self.grid_size),
+        )
+        if value is None:
+            return
+        try:
+            size = int(value.strip())
+        except (TypeError, ValueError):
+            self.set_result("Grid size must be a whole number.", kind="warn")
+            return
+        if not 1 <= size <= MAX_CANVAS_SIZE:
+            self.set_result(
+                f"Grid size must be between 1 and {MAX_CANVAS_SIZE} px.",
+                kind="warn",
+            )
+            return
+        self.set_grid_size(size)
+
     def clear_guides(self):
         """Delete every guide currently in effect.
 

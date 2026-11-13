@@ -1672,6 +1672,10 @@ def build_menus(app, parent):
             value=value,
             command=lambda v=value: app.set_grid_size(v),
         )
+    grid_size_menu.add_separator()
+    grid_size_menu.add_command(
+        label="Custom\u2026", command=app.ask_custom_grid_size,
+    )
     view_menu.add_cascade(label="Grid Size", menu=grid_size_menu)
     view_menu.add_separator()
     app.dark_var = tk.BooleanVar(value=theme.is_dark())
