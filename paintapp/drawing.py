@@ -280,6 +280,36 @@ class ToolsPanel(tk.Frame):
     TOOL_ICON = 18
     TOOL_PAD = 3
 
+    # Tool key -> shortcut registry id, used to append the current key
+    # combination to each tool button's tooltip.
+    TOOL_SHORTCUTS = {
+        "arrow": "tool_arrow",
+        "brush": "tool_brush",
+        "eraser": "tool_eraser",
+        "fill": "tool_fill",
+        "pick": "tool_pick",
+        "select": "tool_select",
+        "move": "tool_move",
+        "text": "tool_text",
+        "gradient": "tool_gradient",
+        "shape": "tool_shape",
+        "clone": "tool_clone",
+        "crop": "tool_crop",
+        "transform": "edit_free_transform",
+        "smudge": "tool_smudge",
+        "dodge": "tool_dodge",
+        "burn": "tool_burn",
+        "liquify": "tool_liquify",
+        "warp": "tool_warp",
+        "puppet": "tool_puppet",
+        "path": "tool_path",
+        "vector": "tool_vector",
+        "poses": "tool_poses",
+        "mask": "layer_mask_edit",
+        "paste": "tool_paste",
+        "drag": "tool_drag",
+    }
+
     # The Select tool's modes, chosen from its settings panel.
     SELECT_MODES = [
         ("rect", "Rectangle"),
@@ -300,7 +330,7 @@ class ToolsPanel(tk.Frame):
                  on_vector_settings=None, on_layout_change=None,
                  get_layout_family=None, on_layout_capture=None,
                  on_gradient_change=None,
-                 on_transform_action=None):
+                 on_transform_action=None, get_shortcut=None):
         super().__init__(parent)
         self._on_mode_change = on_mode_change
         self._on_brush_size = on_brush_size
@@ -324,6 +354,7 @@ class ToolsPanel(tk.Frame):
         self._get_layout_family = get_layout_family
         self._on_layout_capture = on_layout_capture
         self._on_transform_action = on_transform_action
+        self._get_shortcut = get_shortcut
         # The MOSS layout rows live here so they survive the Tool Settings panel
         # being rebuilt on every tool change.
         self.layout_model = LayoutModel()
@@ -640,7 +671,7 @@ class ToolsPanel(tk.Frame):
                 else (lambda k=key: self.select(k))
             )
             button = tk.Button(self._grid, command=command)
-            Tooltip(button, label)
+            Tooltip(button, lambda k=key: self._tool_tooltip(k))
             self._tool_buttons[key] = button
             self._tool_labels[key] = label
 
@@ -697,6 +728,15 @@ class ToolsPanel(tk.Frame):
         self._relayout_tools()
 
     # ------------------------------------------------------------------ tools
+    def _tool_tooltip(self, key):
+        """The tool button tooltip: its label plus the current shortcut."""
+        label = self._tool_labels.get(key, key)
+        shortcut_id = self.TOOL_SHORTCUTS.get(key)
+        if shortcut_id is None or self._get_shortcut is None:
+            return label
+        accelerator = self._get_shortcut(shortcut_id)
+        return f"{label} ({accelerator})" if accelerator else label
+
     def _active_tool(self):
         for key, flag in self.TOOL_FLAGS.items():
             if getattr(self, flag):

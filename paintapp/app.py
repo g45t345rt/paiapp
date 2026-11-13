@@ -976,6 +976,7 @@ class PaintApp:
             get_layout_family=lambda: self.gen.model_family()
             if hasattr(self, "gen") else None,
             on_layout_capture=self._layout_selection_box,
+            get_shortcut=lambda shortcut_id: self.shortcuts.accelerator(shortcut_id),
         )
         self.tools.pack(fill=tk.X)
         self.tools_rail.on_resize = self.tools.set_width

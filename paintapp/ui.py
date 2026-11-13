@@ -936,7 +936,8 @@ class Tooltip:
     Icon-only buttons carry their meaning in the tooltip, so this stays
     dependency-free and theme-aware: the popup is a bare ``Toplevel`` filled
     with the panel colors, like :class:`PopupMenu`. Call :meth:`set_text` to
-    retarget a button whose meaning depends on the current selection.
+    retarget a button whose meaning depends on the current selection, or pass a
+    callable for ``text`` to recompute the label each time it is shown.
     """
 
     DELAY = 500
@@ -960,10 +961,20 @@ class Tooltip:
         if self._window is not None:
             self._hide()
 
+    def _text_value(self):
+        """The tooltip text, resolving a callable each time it is shown."""
+        text = self.text
+        if callable(text):
+            try:
+                text = text()
+            except Exception:
+                return ""
+        return text or ""
+
     # ------------------------------------------------------------- internals
     def _schedule(self, _event=None):
         self._cancel()
-        if not self.text:
+        if not self._text_value():
             return
         try:
             self._job = self.widget.after(self.DELAY, self._show)
@@ -980,7 +991,8 @@ class Tooltip:
 
     def _show(self):
         self._job = None
-        if self._window is not None or not self.text:
+        text = self._text_value()
+        if self._window is not None or not text:
             return
         try:
             if str(self.widget.cget("state")) == "disabled":
@@ -996,7 +1008,7 @@ class Tooltip:
             pass
         win.configure(bg=theme.color("border"))
         tk.Label(
-            win, text=self.text, bg=theme.color("panel_bg"),
+            win, text=text, bg=theme.color("panel_bg"),
             fg=theme.color("text"), padx=6, pady=2, justify="left",
             wraplength=self.MAX_WIDTH,
         ).pack(padx=1, pady=1)
