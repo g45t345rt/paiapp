@@ -423,6 +423,7 @@ class LayerPanel(tk.Frame):
         self._rows = []
         self._row_widgets = []
         self._row_index = {}
+        self._reuse_rows = None
         self._preview_cache = {}
         self._mask_preview_cache = {}
         self._preview_job = None
@@ -614,19 +615,26 @@ class LayerPanel(tk.Frame):
         ``vector_selection`` is an optional ``(layer_index, item_index)`` for
         one of a vector layer's editable strokes/fills.
         """
+        # Keep the existing rows alive so unchanged entries can be reused in
+        # place. Collapsing, deleting or toggling one row then only touches the
+        # rows whose content really changed, instead of tearing down and
+        # recreating every widget in the list.
+        old_widgets = self._row_widgets
+        self._reuse_rows = {}
+        for widgets in old_widgets:
+            key = widgets.get("key")
+            if key is not None:
+                self._reuse_rows[key] = widgets
         self._rows = []
         self._row_widgets = []
         self._row_index = {}
         self._drop_layer = None
-        # The rebuild tears the rows down, so any in-flight reorder drag loses
-        # its origin row; drop the press/ghost/marker state rather than leave it
-        # dangling.
+        # A rebuild can drop an in-flight reorder drag's origin row, so drop the
+        # press/ghost/marker state rather than leave it dangling.
         self._press = None
         self._drag_row = None
         self._end_ghost()
         self._drop_line = None
-        for child in self.inner.winfo_children():
-            child.destroy()
         self._layers = layers
         self._groups = list(groups) if groups else []
         # Preview photos outlive a rebuild (that is what makes re-listing cheap,
@@ -652,6 +660,7 @@ class LayerPanel(tk.Frame):
                         GROUP_COLLAPSED if group.collapsed else GROUP_EXPANDED,
                         GROUP_ICON,
                     ],
+                    key=("group", _uid(group)),
                 )
                 group_row[id(group)] = len(self._rows) - 1
                 self._insert_group_filter_rows(group)
@@ -676,6 +685,7 @@ class LayerPanel(tk.Frame):
                     GROUP_COLLAPSED if group.collapsed else GROUP_EXPANDED,
                     GROUP_ICON,
                 ],
+                key=("group", _uid(group)),
             )
             group_row[id(group)] = len(self._rows) - 1
             self._insert_group_filter_rows(group)
@@ -683,6 +693,30 @@ class LayerPanel(tk.Frame):
                 for member in range(index, start - 1, -1):
                     self._insert_layer_row(layers, member, layer_row, 1)
             index = start - 1
+
+        # Drop the widgets whose rows are gone (a collapsed child, a deleted
+        # layer) and re-pack the survivors in the new order. Re-pack is cheap and
+        # keeps reused rows in the right place without recreating them; when the
+        # order is unchanged the rows are left untouched entirely.
+        used = {id(widgets["row"]) for widgets in self._row_widgets}
+        for widgets in old_widgets:
+            if id(widgets["row"]) not in used:
+                try:
+                    widgets["row"].destroy()
+                except tk.TclError:
+                    pass
+        previous = [widgets["row"] for widgets in old_widgets]
+        current = [widgets["row"] for widgets in self._row_widgets]
+        if current != previous:
+            # Re-packing an already packed widget only reconfigures it and
+            # leaves it where it was, so a re-inserted row (an expanded layer's
+            # object rows) would stay at the bottom. Unpack the survivors first,
+            # then pack them in the new order; Tk redraws once afterwards.
+            for widgets in self._row_widgets:
+                widgets["row"].pack_forget()
+            for widgets in self._row_widgets:
+                widgets["row"].pack(fill=tk.X)
+        self._reuse_rows = None
 
         self._layout_dividers()
         self._selection_kind = "layer"
@@ -785,7 +819,8 @@ class LayerPanel(tk.Frame):
         self._sync_button_state()
 
     def _add_row(self, text, entry, indent=0, layer=None, hidden=False,
-                 badges=None, group=None, leading=None, name_icons=None):
+                 badges=None, group=None, leading=None, name_icons=None,
+                 key=None):
         """Append one row widget and record it against its ``entry``.
 
         Every row is a fixed height (thumbnail plus padding) and reserves the
@@ -806,9 +841,47 @@ class LayerPanel(tk.Frame):
         the right edge of the row, replacing the parenthesised marks that used
         to trail the name. ``icon`` names a vendored Tabler SVG (``None`` for a
         text-only badge) and ``glyph`` is the fallback when the icon rasteriser
-        is missing. Returns the row index.
+        is missing. ``key`` is a stable identity used to reuse the row's widgets
+        across refreshes; rows with the same key and structure are updated in
+        place instead of being rebuilt. Returns the row index.
         """
         bg = theme.color("listbox_bg")
+        token, photos = None, None
+        mask_token, mask_photos = None, None
+        if layer is not None:
+            token, photos = self._cached_preview(layer)
+            if layer.mask is not None:
+                mask_token, mask_photos = self._cached_mask_preview(layer)
+        elif group is not None:
+            token, photos = self._cached_group_preview(group)
+        photo = photos[0] if photos else None
+        if leading is not None and photo is not None:
+            leading = None
+        has_mask = mask_photos is not None
+        badges = list(badges or ())
+        name_icons = list(name_icons or ())
+        # Everything that changes the widget tree rather than just its colors,
+        # text or images. A matching signature means the old row can be updated
+        # in place; a mismatch means it must be rebuilt.
+        signature = (
+            indent, layer is not None, group is not None, has_mask,
+            leading, len(name_icons),
+        )
+        old = None
+        if key is not None and self._reuse_rows:
+            old = self._reuse_rows.pop(key, None)
+            if old is not None:
+                try:
+                    if not old["row"].winfo_exists():
+                        old = None
+                except tk.TclError:
+                    old = None
+        if old is not None and old.get("signature") == signature:
+            self._reuse_row(
+                old, entry, text, hidden, badges, name_icons,
+                token, photos, mask_token, mask_photos,
+            )
+            return len(self._rows) - 1
         # The row is its content height plus a pad above and below, so the
         # content sits inset and the rule below it lands squarely in the gap to
         # the next row rather than hugging the thumbnail.
@@ -824,18 +897,9 @@ class LayerPanel(tk.Frame):
         cell.pack(side=tk.LEFT, fill=tk.Y)
         cell.pack_propagate(False)
         widgets.append(cell)
-        token, photos = None, None
-        mask_token, mask_photos = None, None
-        if layer is not None:
-            token, photos = self._cached_preview(layer)
-            if layer.mask is not None:
-                mask_token, mask_photos = self._cached_mask_preview(layer)
-        elif group is not None:
-            token, photos = self._cached_group_preview(group)
         # The label is made either way, so a preview that could not be built has
         # somewhere to appear once it can.
         thumb = tk.Label(cell, bg=bg, bd=0)
-        photo = photos[0] if photos else None
         if photo is not None:
             thumb.config(image=photo)
         thumb.place(relx=0.5, rely=0.5, anchor="center")
@@ -884,20 +948,22 @@ class LayerPanel(tk.Frame):
                     icon, icon_name, glyph, bg, theme.color(token_name)
                 )
                 icon.pack(side=tk.LEFT, padx=(0, BADGE_GAP))
-                Tooltip(icon, tooltip)
+                icon_tip = Tooltip(icon, tooltip)
                 widgets.append(icon)
-                badge_widgets.append((icon, icon_name, glyph, token_name))
+                badge_widgets.append(
+                    (icon, icon_name, glyph, token_name, icon_tip)
+                )
         # Name icons sit between the preview cell and the name, packed before
         # the label so they take their width from the left like the cells do.
         name_icon_widgets = []
-        for position, name_icon in enumerate(name_icons or ()):
+        for position, name_icon in enumerate(name_icons):
             icon_label = tk.Label(row, bg=bg, bd=0)
             self._paint_leading(icon_label, name_icon, bg,
                                 theme.color(name_icon[2]))
             icon_label.pack(side=tk.LEFT, padx=((4 if position == 0 else 1), 0))
-            Tooltip(icon_label, name_icon[3])
+            icon_tip = Tooltip(icon_label, name_icon[3])
             widgets.append(icon_label)
-            name_icon_widgets.append((icon_label, name_icon))
+            name_icon_widgets.append((icon_label, icon_tip, name_icon))
         label = tk.Label(row, text=text, anchor="w", bg=bg, fg=theme.color("text"))
         label.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(4, 2))
         widgets.append(label)
@@ -913,21 +979,17 @@ class LayerPanel(tk.Frame):
         widgets.append(divider)
         self._rows.append(entry)
         index = len(self._rows) - 1
-        label.bind("<Configure>", lambda e, i=index: self._fit_row_label(e, i))
+        label.bind("<Configure>", self._on_row_configure)
         # The name's tooltip stays empty until the label actually has to trim
         # the name, so hovering only explains a name the row cannot show whole.
         name_tip = Tooltip(label, "")
         for widget in widgets:
             self._row_index[widget] = index
-            widget.bind("<Button-1>", lambda e, i=index: self._on_press(e, i))
+            widget.bind("<Button-1>", self._on_row_press)
             widget.bind("<B1-Motion>", self._on_motion)
             widget.bind("<ButtonRelease-1>", self._on_release)
-            widget.bind(
-                "<Double-Button-1>", lambda e, i=index: self._on_double(e, i)
-            )
-            widget.bind(
-                "<Button-3>", lambda e, i=index: self._on_context(e, i)
-            )
+            widget.bind("<Double-Button-1>", self._on_row_double)
+            widget.bind("<Button-3>", self._on_row_context)
         self._row_widgets.append({
             "row": row, "cell": cell, "label": label,
             "thumb": thumb, "photos": photos, "photo": photo, "token": token,
@@ -943,8 +1005,111 @@ class LayerPanel(tk.Frame):
             "indent": indent,
             "full_text": text, "font": None,
             "tooltip": name_tip, "truncated": None,
+            "key": key, "signature": signature, "_widgets": widgets,
         })
         return index
+
+    def _reuse_row(self, widgets, entry, text, hidden, badges, name_icons,
+                   token, photos, mask_token, mask_photos):
+        """Update a row's mutable parts in place and record it for this build.
+
+        Keeps the frame, thumbnail cells and layout, so dropping an object or
+        collapsing a group does not flash the whole list. Only the status badges
+        are added, removed or retargeted in place; indent, masks and name-icon
+        count changes never reach here, they get a new row in :meth:`_add_row`.
+        """
+        index = len(self._rows)
+        self._rows.append(entry)
+        widgets["hidden"] = bool(hidden)
+        widgets["full_text"] = text
+        widgets["truncated"] = None
+        label = widgets["label"]
+        if label.cget("text") != text:
+            label.config(text=text)
+        widgets["tooltip"].set_text("")
+        try:
+            width = label.winfo_width()
+        except tk.TclError:
+            width = 0
+        if width > 1:
+            self._fit_label(widgets, width)
+        widgets["photos"] = photos
+        widgets["photo"] = None
+        widgets["token"] = token
+        widgets["thumb"].config(image="")
+        if widgets.get("mask_thumb") is not None:
+            widgets["mask_photos"] = mask_photos
+            widgets["mask_photo"] = None
+            widgets["mask_token"] = mask_token
+            widgets["mask_thumb"].config(image="")
+        for slot, name_icon in enumerate(name_icons):
+            icon_tip = widgets["name_icons"][slot][1]
+            icon_tip.set_text(name_icon[3])
+        widgets["name_icons"] = [
+            (icon_label, icon_tip, name_icon)
+            for (icon_label, icon_tip, _old), name_icon
+            in zip(widgets["name_icons"], name_icons)
+        ]
+        self._sync_badges(widgets, badges)
+        self._row_widgets.append(widgets)
+        for widget in widgets["_widgets"]:
+            self._row_index[widget] = index
+
+    def _sync_badges(self, widgets, badges):
+        """Match a reused row's status badges to ``badges``.
+
+        A row can gain or lose badges without changing its widget structure (a
+        collapsed group shows its member count, a layer shows or hides its
+        state icons), so the strip and its labels are reconciled in place rather
+        than forcing the whole row to be rebuilt.
+        """
+        bg = theme.color("listbox_bg")
+        row = widgets["row"]
+        label = widgets["label"]
+        strip = widgets.get("badge_strip")
+        if badges and strip is None:
+            strip = tk.Frame(row, bg=bg)
+            # Pin the strip to the right edge; it must precede the expanding
+            # label in pack order, so insert it before rather than appending.
+            strip.pack(side=tk.RIGHT, fill=tk.Y, before=label)
+            widgets["badge_strip"] = strip
+            widgets["_widgets"].append(strip)
+        elif not badges and strip is not None:
+            for icon, _name, _glyph, _token, _tip in widgets["badges"]:
+                try:
+                    widgets["_widgets"].remove(icon)
+                except ValueError:
+                    pass
+            try:
+                strip.destroy()
+            except tk.TclError:
+                pass
+            widgets["badge_strip"] = None
+            widgets["badges"] = []
+            widgets["_widgets"].remove(strip)
+            return
+        current = widgets["badges"]
+        for slot, badge in enumerate(badges):
+            icon_name, glyph, token_name, tooltip = badge
+            if slot < len(current):
+                icon, _old_name, _old_glyph, _old_token, icon_tip = current[slot]
+                icon_tip.set_text(tooltip)
+                current[slot] = (icon, icon_name, glyph, token_name, icon_tip)
+            else:
+                icon = tk.Label(strip, bg=bg, bd=0)
+                self._paint_badge(icon, icon_name, glyph, bg,
+                                  theme.color(token_name))
+                icon.pack(side=tk.LEFT, padx=(0, BADGE_GAP))
+                icon_tip = Tooltip(icon, tooltip)
+                widgets["_widgets"].append(icon)
+                current.append((icon, icon_name, glyph, token_name, icon_tip))
+        for icon, _name, _glyph, _token, _tip in current[len(badges):]:
+            try:
+                icon.destroy()
+            except tk.TclError:
+                pass
+            widgets["_widgets"].remove(icon)
+        del current[len(badges):]
 
     def _layout_dividers(self):
         """Place each row's bottom rule, trimmed to its indent, past the last row.
@@ -985,7 +1150,15 @@ class LayerPanel(tk.Frame):
         """
         if index >= len(self._row_widgets):
             return
-        widgets = self._row_widgets[index]
+        self._fit_label(self._row_widgets[index], event.width)
+
+    def _fit_label(self, widgets, width):
+        """Trim ``widgets``' name to ``width`` pixels with an ellipsis.
+
+        Used both by the label's ``<Configure>`` handler and when a reused row's
+        name changes, since the label width does not change in that case and no
+        ``<Configure>`` event fires.
+        """
         full_text = widgets.get("full_text")
         if not full_text:
             return
@@ -997,7 +1170,7 @@ class LayerPanel(tk.Frame):
             except tk.TclError:
                 font = tkfont.nametofont("TkDefaultFont")
             widgets["font"] = font
-        text = _fit_text(font, full_text, event.width - LABEL_CHROME)
+        text = _fit_text(font, full_text, width - LABEL_CHROME)
         if label.cget("text") != text:
             label.config(text=text)
         # Only a trimmed name needs the tooltip, and it is retargeted only when
@@ -1457,12 +1630,19 @@ class LayerPanel(tk.Frame):
         """
         layer = layers[index]
         collapsed = bool(getattr(layer, "collapsed", False))
+        # Only a layer with object rows can be expanded, so a plain raster
+        # layer gets no disclosure chevron to suggest hidden children.
+        has_objects = self._layer_object_count(layer) > 0
+        name_icons = []
+        if has_objects:
+            name_icons.append(
+                LAYER_COLLAPSED if collapsed else LAYER_EXPANDED
+            )
         layer_row[index] = self._add_row(
             layer.name, ("layer", index), indent, layer,
             hidden=not layer.visible, badges=self._layer_badges(layer),
-            name_icons=[
-                LAYER_COLLAPSED if collapsed else LAYER_EXPANDED,
-            ],
+            name_icons=name_icons,
+            key=("layer", _uid(layer)),
         )
         if collapsed:
             return
@@ -1471,24 +1651,29 @@ class LayerPanel(tk.Frame):
             if not spec.get("enabled", True):
                 text += "  (off)"
             self._add_row(text, ("filter", index, filter_index), indent + 1,
-                          leading=FILTER_LEAD)
+                          leading=FILTER_LEAD,
+                          key=("filter", _uid(layer), filter_index))
         for text_index, spec in enumerate(layer.texts):
             self._add_row(textrender.describe(spec), ("text", index, text_index),
                           indent + 1, leading=TEXT_LEAD,
-                          hidden=bool(spec.get("hidden")))
+                          hidden=bool(spec.get("hidden")),
+                          key=("text", _uid(layer), text_index))
         for path_index, spec in enumerate(layer.paths):
             self._add_row(path.describe(spec), ("path", index, path_index),
                           indent + 1, leading=PATH_LEAD,
-                          hidden=bool(spec.get("hidden")))
+                          hidden=bool(spec.get("hidden")),
+                          key=("path", _uid(layer), path_index))
         item_index = 0
         for spec in getattr(layer, "strokes", None) or []:
             self._add_row(vector.describe(spec), ("vector", index, item_index),
-                          indent + 1, leading=VECTOR_LINE_LEAD)
+                          indent + 1, leading=VECTOR_LINE_LEAD,
+                          key=("vector", _uid(layer), item_index))
             item_index += 1
         for spec in getattr(layer, "fills", None) or []:
             self._add_row(vector.describe_fill(spec),
                           ("vector", index, item_index), indent + 1,
-                          leading=VECTOR_FILL_LEAD)
+                          leading=VECTOR_FILL_LEAD,
+                          key=("vector", _uid(layer), item_index))
             item_index += 1
 
     def _insert_group_filter_rows(self, group):
@@ -1503,7 +1688,8 @@ class LayerPanel(tk.Frame):
             if not spec.get("enabled", True):
                 text += "  (off)"
             self._add_row(text, ("group_filter", group, filter_index), 1,
-                          leading=FILTER_LEAD)
+                          leading=FILTER_LEAD,
+                          key=("group_filter", _uid(group), filter_index))
 
     def selected_group(self):
         """The group behind the selected row, or ``None``.
@@ -1742,7 +1928,7 @@ class LayerPanel(tk.Frame):
                 # The name icons (a group's chevron and folder) follow the same
                 # rule as the type icon: their own muted token on a plain row,
                 # the row foreground when the row is selected or grayscale.
-                for icon_label, name_icon in widgets["name_icons"]:
+                for icon_label, _tip, name_icon in widgets["name_icons"]:
                     self._paint_leading(
                         icon_label, name_icon, row_bg,
                         row_fg if (selected or widgets["hidden"])
@@ -1767,7 +1953,7 @@ class LayerPanel(tk.Frame):
                 tinted = selected or widgets["hidden"] or (
                     self._drop_layer is not None and entry[0] == "layer"
                     and entry[1] == self._drop_layer)
-                for icon, icon_name, glyph, token_name in widgets["badges"]:
+                for icon, icon_name, glyph, token_name, _tip in widgets["badges"]:
                     self._paint_badge(
                         icon, icon_name, glyph, row_bg,
                         row_fg if tinted else theme.color(token_name),
@@ -1843,6 +2029,35 @@ class LayerPanel(tk.Frame):
         return "break"
 
     # ------------------------------------------------------------------ events
+    def _row_for(self, event):
+        """The current row index of the widget that raised ``event``.
+
+        Bindings look the row up at event time rather than capturing an index at
+        creation, so a row that survives a refresh can move to a new position
+        without rebinding every widget.
+        """
+        return self._row_index.get(event.widget)
+
+    def _on_row_press(self, event):
+        row = self._row_for(event)
+        if row is not None:
+            self._on_press(event, row)
+
+    def _on_row_double(self, event):
+        row = self._row_for(event)
+        if row is not None:
+            self._on_double(event, row)
+
+    def _on_row_context(self, event):
+        row = self._row_for(event)
+        if row is not None:
+            self._on_context(event, row)
+
+    def _on_row_configure(self, event):
+        row = self._row_for(event)
+        if row is not None:
+            self._fit_row_label(event, row)
+
     def _on_press(self, event, row):
         """A click on a row: plain selects it, Ctrl toggles, Shift extends."""
         if not (0 <= row < len(self._rows)):
