@@ -1,4 +1,4 @@
-"""Unit tests for the manga tone filters (run: .venv\\Scripts\\python.exe tests\\test_manga_filters.py)."""
+"""Unit tests for the manga filters (run: .venv\\Scripts\\python.exe tests\\test_manga_filters.py)."""
 
 import os
 import sys
@@ -27,8 +27,12 @@ def solid(gray):
 def test_registered():
     check("halftone present", "halftone" in filters.FILTERS, True)
     check("screentone present", "screentone" in filters.FILTERS, True)
+    check("focus lines present", "focus_lines" in filters.FILTERS, True)
+    check("speed lines present", "speed_lines" in filters.FILTERS, True)
     check("halftone category", filters.FILTERS["halftone"]["category"], "manga")
     check("screentone category", filters.FILTERS["screentone"]["category"], "manga")
+    check("focus lines category", filters.FILTERS["focus_lines"]["category"], "manga")
+    check("speed lines category", filters.FILTERS["speed_lines"]["category"], "manga")
     check(
         "manga in categories",
         ("manga", "Manga") in filters.CATEGORIES,
@@ -37,7 +41,7 @@ def test_registered():
     check(
         "manga menu order",
         filters.filters_in_category("manga"),
-        ["halftone", "screentone"],
+        ["halftone", "screentone", "focus_lines", "speed_lines"],
     )
 
 
@@ -47,6 +51,12 @@ def test_choice_defaults():
     spec = filters.new_spec("screentone")
     check("screentone pattern default", spec["params"]["pattern"], "dot")
     check("screentone color default", spec["params"]["color"], "#000000")
+    spec = filters.new_spec("focus_lines")
+    check("focus lines centre default", spec["params"]["center_x"], 50)
+    check("focus lines ray default", spec["params"]["rays"], 48)
+    spec = filters.new_spec("speed_lines")
+    check("speed lines angle default", spec["params"]["angle"], 0)
+    check("speed lines colour default", spec["params"]["color"], "#000000")
 
 
 def test_normalize_round_trip():
@@ -111,11 +121,65 @@ def test_screentone_patterns():
         check(f"screentone pattern {pattern} runs", out.size, (32, 32))
 
 
+def test_focus_lines():
+    import numpy as np
+
+    spec = filters.new_spec("focus_lines")
+    out = filters.apply_chain(solid(200), [spec])
+    arr = np.asarray(out)
+    check("focus lines keep the clear centre",
+          tuple(arr[16, 16]), (200, 200, 200, 255))
+    check("focus lines paint some ink", bool((arr[..., 0] < 200).any()), True)
+    check("focus lines keep alpha", set(arr[..., 3].ravel().tolist()), {255})
+
+    spec["params"].update({"rays": 12, "width": 3, "inner": 0, "jitter": 0,
+                           "color": "#ff0000"})
+    arr = np.asarray(filters.apply_chain(solid(200), [spec]))
+    check("focus lines honour ink colour", bool((arr[..., 0] == 255).any()), True)
+
+
+def test_speed_lines():
+    import numpy as np
+
+    spec = filters.new_spec("speed_lines")
+    spec["params"].update({"angle": 0, "spacing": 8, "thickness": 3,
+                           "length": 100, "jitter": 0, "color": "#000000"})
+    arr = np.asarray(filters.apply_chain(solid(200), [spec]))
+    row_means = arr[..., 0].mean(axis=1)
+    check("speed lines ink some rows", float(row_means.min()) < 50.0, True)
+    check("speed lines leave gaps", float(row_means.max()) > 150.0, True)
+    check("speed lines keep alpha", set(arr[..., 3].ravel().tolist()), {255})
+
+    spec["params"]["opacity"] = 0
+    unchanged = filters.apply_chain(solid(200), [spec])
+    check("zero opacity is a no-op", unchanged.getpixel((0, 0)),
+          (200, 200, 200, 255))
+
+
+def test_line_filter_round_trip():
+    spec = filters.new_spec("focus_lines")
+    spec["params"].update({"center_x": 25, "rays": 12, "color": "#123456"})
+    loaded = filters.normalize_spec(spec)
+    check("focus centre kept", loaded["params"]["center_x"], 25)
+    check("focus rays kept", loaded["params"]["rays"], 12)
+    check("focus colour kept", loaded["params"]["color"], "#123456")
+
+    spec = filters.new_spec("speed_lines")
+    spec["params"].update({"angle": 90, "thickness": 4})
+    loaded = filters.normalize_spec(spec)
+    check("speed angle kept", loaded["params"]["angle"], 90)
+    check("speed thickness kept", loaded["params"]["thickness"], 4)
+
+
 def test_describe():
     spec = filters.new_spec("halftone")
     check("halftone describes", filters.describe(spec).startswith("Halftone"), True)
     spec = filters.new_spec("screentone")
     check("screentone describes", filters.describe(spec).startswith("Screentone"), True)
+    spec = filters.new_spec("focus_lines")
+    check("focus lines describe", filters.describe(spec).startswith("Focus Lines"), True)
+    spec = filters.new_spec("speed_lines")
+    check("speed lines describe", filters.describe(spec).startswith("Speed Lines"), True)
 
 
 def test_gpu_screens_match_cpu():

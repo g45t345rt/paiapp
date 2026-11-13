@@ -764,6 +764,113 @@ def _halftone(image, params):
 _SCREENTONE_PATTERNS = ("dot", "line", "cross", "grid")
 
 
+def _line_noise(index):
+    """Deterministic 0..1 noise for each ray or line, as a float32 array.
+
+    The effects need per-line irregularity but must stay pure functions of the
+    spec, so the variation comes from a cheap integer hash of the line index
+    rather than a random module. The same index always yields the same offset.
+    """
+    value = np.asarray(index, dtype=np.int64)
+    value = (value * 1103515245 + 12345) & 0x7FFFFFFF
+    return ((value >> 8) % 65536).astype(np.float32) / 65535.0
+
+
+def _focus_lines(image, params):
+    """Radial concentration lines converging on a focal point.
+
+    The lines are painted over the existing pixels and grow wider toward the
+    image edge, leaving a clear disc around the focus so the subject stays
+    readable. ``jitter`` varies each ray's angle and width; the alpha channel is
+    untouched, so the filter inks only the areas the layer already shows.
+    """
+    rgb, alpha = _rgb_parts(image)
+    base = np.asarray(rgb).astype(np.float32)
+    height, width = base.shape[:2]
+    opacity = _clamp01(float(params["opacity"]) / 100.0)
+    if opacity <= 0.0:
+        return image
+
+    cx = float(params["center_x"]) / 100.0 * width
+    cy = float(params["center_y"]) / 100.0 * height
+    rays = max(2, int(round(float(params["rays"]))))
+    line_width = max(1.0, float(params["width"]))
+    jitter = _clamp01(float(params["jitter"]) / 100.0)
+    max_distance = max(1.0, math.hypot(width * 0.5, height * 0.5))
+    clear = _clamp01(float(params["inner"]) / 100.0) * max_distance
+
+    yy, xx = np.mgrid[0:height, 0:width].astype(np.float32)
+    dx = xx + 0.5 - cx
+    dy = yy + 0.5 - cy
+    distance = np.hypot(dx, dy)
+    angle = np.arctan2(dy, dx) - math.radians(float(params["angle"]))
+    step = 2.0 * math.pi / rays
+    slot = angle / step
+    noise = _line_noise(np.floor(slot))
+    phase = np.mod(slot + (noise - 0.5) * jitter * 0.5, 1.0)
+    # Perpendicular distance in pixels to the nearest ray centre.
+    offset = np.abs(phase - 0.5) * step * np.maximum(distance, 1.0)
+
+    edge = np.clip(
+        (distance - clear) / max(1.0, max_distance - clear), 0.0, 1.0
+    )
+    taper = 0.35 + 0.65 * edge
+    width_px = line_width * taper * (1.0 + (noise - 0.5) * jitter)
+    fade = np.clip(
+        (distance - clear) / max(1.0, line_width * 2.0), 0.0, 1.0
+    )
+    mask = (offset < np.maximum(0.5, width_px * 0.5)) * fade * opacity
+
+    color = np.array(rgba(params["color"])[:3], dtype=np.float32)
+    out = base * (1.0 - mask[..., None]) + color * mask[..., None]
+    return _rejoin(
+        Image.fromarray(np.clip(out, 0, 255).astype(np.uint8), "RGB"), alpha
+    )
+
+
+def _speed_lines(image, params):
+    """Parallel action lines with irregular spacing and dash lengths.
+
+    Lines run along ``angle``; ``spacing`` and ``thickness`` control the grid,
+    ``length`` the ink-to-gap ratio along each line, and ``jitter`` the
+    per-line offset and width. The alpha channel is left untouched.
+    """
+    rgb, alpha = _rgb_parts(image)
+    base = np.asarray(rgb).astype(np.float32)
+    height, width = base.shape[:2]
+    opacity = _clamp01(float(params["opacity"]) / 100.0)
+    if opacity <= 0.0:
+        return image
+
+    theta = math.radians(float(params["angle"]))
+    cos, sin = math.cos(theta), math.sin(theta)
+    spacing = max(2.0, float(params["spacing"]))
+    thickness = max(1.0, float(params["thickness"]))
+    length = _clamp01(float(params["length"]) / 100.0)
+    jitter = _clamp01(float(params["jitter"]) / 100.0)
+
+    yy, xx = np.mgrid[0:height, 0:width].astype(np.float32)
+    along = (xx + 0.5) * cos + (yy + 0.5) * sin
+    across = -(xx + 0.5) * sin + (yy + 0.5) * cos
+    index = np.floor(across / spacing)
+    noise = _line_noise(index)
+    shifted = np.mod(across + (noise - 0.5) * spacing * jitter, spacing)
+    width_px = thickness * (1.0 + (noise - 0.5) * 0.8 * jitter)
+    line = shifted < np.maximum(0.5, width_px)
+
+    # A dash period tied to the image size keeps the streaks readable at any
+    # resolution; the per-line offset stops the gaps from lining up.
+    period = max(spacing * 2.0, (width + height) * 0.18)
+    dash = np.mod(along + noise * period, period) < period * length
+    mask = (line & dash) * opacity
+
+    color = np.array(rgba(params["color"])[:3], dtype=np.float32)
+    out = base * (1.0 - mask[..., None]) + color * mask[..., None]
+    return _rejoin(
+        Image.fromarray(np.clip(out, 0, 255).astype(np.uint8), "RGB"), alpha
+    )
+
+
 def _screentone(image, params):
     """Overlay a repeating tone pattern, gated by the image's darkness.
 
@@ -1064,6 +1171,36 @@ _register(
     ],
     _screentone,
     lambda p: f"Screentone {int(p['size'])}px @ {int(p['angle'])}\u00b0",
+)
+_register(
+    "focus_lines", "manga", "Focus Lines",
+    [
+        _p("center_x", "Center X %", 0, 100, 50, 1, "int"),
+        _p("center_y", "Center Y %", 0, 100, 50, 1, "int"),
+        _p("rays", "Lines", 4, 240, 48, 1, "int"),
+        _p("width", "Line width", 1, 16, 2, 1, "int"),
+        _p("inner", "Clear centre", 0, 100, 18, 1, "int"),
+        _p("angle", "Angle", 0, 180, 0, 1, "int"),
+        _p("jitter", "Roughness", 0, 100, 25, 1, "int"),
+        _p("opacity", "Opacity", 0, 100, 100, 1, "int"),
+        _c("color", "Ink color", "#000000"),
+    ],
+    _focus_lines,
+    lambda p: f"Focus Lines {int(p['rays'])} @ {int(p['angle'])}\u00b0",
+)
+_register(
+    "speed_lines", "manga", "Speed Lines",
+    [
+        _p("angle", "Angle", 0, 180, 0, 1, "int"),
+        _p("spacing", "Spacing", 2, 80, 14, 1, "int"),
+        _p("thickness", "Line width", 1, 16, 2, 1, "int"),
+        _p("length", "Dash length", 5, 100, 70, 1, "int"),
+        _p("jitter", "Roughness", 0, 100, 30, 1, "int"),
+        _p("opacity", "Opacity", 0, 100, 100, 1, "int"),
+        _c("color", "Ink color", "#000000"),
+    ],
+    _speed_lines,
+    lambda p: f"Speed Lines {int(p['spacing'])}px @ {int(p['angle'])}\u00b0",
 )
 
 # Category key -> display label, in menu order.
