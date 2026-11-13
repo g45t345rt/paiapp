@@ -966,8 +966,10 @@ class PaintApp:
         self.layer_panel = LayerPanel(
             content,
             on_add=self.add_layer, on_delete=self.delete_layer,
+            on_add_vector=self.add_vector_layer,
             on_duplicate=self.duplicate_layer,
             on_clear=self.clear,
+            on_layer_collapse=self.toggle_layer_collapse,
             on_move=self.move_layer, on_toggle=self.toggle_visible,
             on_lock=self.toggle_lock,
             on_isolate=self.isolate_layer, on_show_all=self.show_all_layers,
@@ -3390,6 +3392,37 @@ class PaintApp:
         self._refresh_layer_list()
         self.render()
         self.set_result(f"Duplicated layer '{source.name}'.")
+
+    def toggle_layer_collapse(self):
+        """Fold the selected layers' object rows, or unfold them again.
+
+        Like a collapsed group, this only affects the layer list; the layers
+        still composite normally. A mixed selection collapses as a unit (unless
+        every target is already collapsed), and any object-row selection on a
+        folded layer is dropped since its row is no longer shown.
+        """
+        if self.current is None:
+            return
+        indices = self.layer_panel.selected_indices(len(self.layers))
+        if not indices:
+            if not (0 <= self.active < len(self.layers)):
+                return
+            indices = [self.active]
+        layers = [self.layers[i] for i in indices]
+        collapsed = not all(layer.collapsed for layer in layers)
+        for layer in layers:
+            layer.collapsed = collapsed
+        if collapsed:
+            targets = set(indices)
+            if self._filter_sel and self._filter_sel[0] in targets:
+                self._filter_sel = None
+            if self._text_sel and self._text_sel[0] in targets:
+                self._text_sel = None
+            if self._path_sel and self._path_sel[0] in targets:
+                self._path_sel = None
+            if self._vector_sel and self._vector_sel[0] in targets:
+                self._vector_sel = None
+        self._refresh_layer_list(indices)
 
     # ------------------------------------------------------------- link layers
     def _master_layers(self):

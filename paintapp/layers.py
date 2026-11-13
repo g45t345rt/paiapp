@@ -118,6 +118,11 @@ VECTOR_FILL_LEAD = ("vector-polygon", "F", "muted", "Vector fill")
 GROUP_EXPANDED = ("chevron-down", "\u25be", "muted", "Collapse group")
 GROUP_COLLAPSED = ("chevron-right", "\u25b8", "muted", "Expand group")
 
+# A layer header's disclosure chevron; like a group it sits before the name and
+# collapses the layer's indented object rows without affecting its pixels.
+LAYER_EXPANDED = ("chevron-down", "\u25be", "muted", "Collapse layer")
+LAYER_COLLAPSED = ("chevron-right", "\u25b8", "muted", "Expand layer")
+
 # A group header's type icon, a folder, drawn beside the chevron so a group reads
 # as a container the way the object rows read as a filter, text or path.
 GROUP_ICON = ("folder", "\u229e", "muted", "Group")
@@ -147,6 +152,9 @@ ICON_MORE = "\u22ef"
 # icon rasteriser is unavailable. The blend mode keeps its name (there is no
 # single icon for the full mode list) and rides the same strip as a text badge.
 ICON_SIZE = 15
+# Space between a row's status badges, in pixels, so adjacent state icons read
+# as separate marks rather than one crowded cluster.
+BADGE_GAP = 5
 # The action-strip buttons draw one Tabler icon each, a little larger than the
 # row badges so they stay tappable, with a couple of transparent pixels of
 # padding baked into the icon (Tk ignores a button's own padx/pady for images).
@@ -248,8 +256,10 @@ class LayerPanel(tk.Frame):
     scrolling column of row widgets rather than a listbox: each layer row leads
     with a tiny preview of that layer's image over a checkerboard, so a layer is
     recognizable at a glance without selecting it. Each layer's non-destructive
-    filters and its editable text and path objects are listed on indented rows
-    directly below it. Rows are tracked in :attr:`_rows` so a selected row maps
+    filters and its editable text, path and vector objects are listed on
+    indented rows directly below it, and a layer header can be collapsed just
+    like a group header to hide those rows. Rows are tracked in
+    :attr:`_rows` so a selected row maps
     back to its layer (``("layer", index)``), filter
     (``("filter", layer, index)``), text (``("text", layer, index)``) or path
     (``("path", layer, index)``). A layer row or a group header can also be
@@ -266,8 +276,9 @@ class LayerPanel(tk.Frame):
     version and only rebuilt after :meth:`sync_previews` sees an edit and the
     pixels have been still for a moment; see :data:`PREVIEW_DELAY`.
 
-    The primary actions are compact icon buttons (Show/Hide/Add/Group/Duplicate/
-    Delete/Move up/Move down) that act on whichever row is selected - the active
+    The primary actions are compact icon buttons (Show/Hide/Add/Add Vector/
+    Group/Duplicate/Delete/Move up/Move down) that act on whichever row is
+    selected - the active
     layer for a layer row, the selected filter or text object for one of their
     rows. The Show/Hide button is a one-click shortcut for the layer or group
     visibility toggle, its dot reflecting the current state, so it never needs
@@ -323,7 +334,8 @@ class LayerPanel(tk.Frame):
                  on_path_duplicate=None, on_path_toggle=None,
                  on_vector_select=None, on_vector_edit=None,
                  on_vector_remove=None, on_vector_duplicate=None,
-                 on_vector_move=None):
+                 on_vector_move=None, on_layer_collapse=None,
+                 on_add_vector=None):
         super().__init__(parent)
         self._on_group_duplicate = on_group_duplicate
         self._on_text_duplicate = on_text_duplicate
@@ -335,6 +347,8 @@ class LayerPanel(tk.Frame):
         self._on_vector_remove = on_vector_remove
         self._on_vector_duplicate = on_vector_duplicate
         self._on_vector_move = on_vector_move
+        self._on_layer_collapse = on_layer_collapse
+        self._on_add_vector = on_add_vector
         self._on_add = on_add
         self._on_delete = on_delete
         self._on_duplicate = on_duplicate
@@ -491,6 +505,9 @@ class LayerPanel(tk.Frame):
         )
         self.add_btn, self.add_tip = icon_button(
             "plus", ICON_ADD, self._on_add, "Add layer"
+        )
+        self.add_vector_btn, self.add_vector_tip = icon_button(
+            "vector", ICON_VECTOR, self._on_add_vector, "Add vector layer"
         )
         self.group_btn, self.group_tip = icon_button(
             "folder-plus", ICON_GROUP, self._on_group_add, "Add group"
@@ -716,11 +733,24 @@ class LayerPanel(tk.Frame):
             layer_index, item_index = vector_selection
             for row, entry in enumerate(self._rows):
                 if entry == ("vector", layer_index, item_index):
-                    self._selected = [row]
+                    owner = layer_row.get(layer_index)
+                    # Keep the owning layer highlighted alongside its object,
+                    # so adding a vector stroke does not make the layer row look
+                    # deselected.
+                    self._selected = sorted(
+                        {row, owner} - {None}
+                    )
                     self._anchor = row
                     self._selection_kind = "vector"
                     self._selected_vector = (layer_index, item_index)
                     break
+            else:
+                # A collapsed layer hides the object row; keep its header
+                # selected rather than leaving the list with no selection.
+                owner = layer_row.get(layer_index)
+                if owner is not None:
+                    self._selected = [owner]
+                    self._anchor = owner
         elif path_selection is not None:
             layer_index, path_index = path_selection
             for row, entry in enumerate(self._rows):
@@ -849,11 +879,11 @@ class LayerPanel(tk.Frame):
             widgets.append(strip)
             badge_strip = strip
             for icon_name, glyph, token_name, tooltip in badges:
-                icon = tk.Label(strip, bg=bg, bd=0, padx=1)
+                icon = tk.Label(strip, bg=bg, bd=0)
                 self._paint_badge(
                     icon, icon_name, glyph, bg, theme.color(token_name)
                 )
-                icon.pack(side=tk.LEFT)
+                icon.pack(side=tk.LEFT, padx=(0, BADGE_GAP))
                 Tooltip(icon, tooltip)
                 widgets.append(icon)
                 badge_widgets.append((icon, icon_name, glyph, token_name))
@@ -1374,7 +1404,9 @@ class LayerPanel(tk.Frame):
         mode (kept as a short text badge, since the full mode list has no single
         icon). A hidden layer leads with the crossed eye even though its row is
         also drawn in grayscale, so the state reads without relying on the
-        dimming alone.
+        dimming alone. A trailing text badge counts the layer's object rows
+        (filters, texts, paths, vector strokes and fills), so a filter, a text
+        or a vector stroke can be read at a glance.
         """
         badges = []
         if not layer.visible:
@@ -1400,15 +1432,40 @@ class LayerPanel(tk.Frame):
         if getattr(layer, "blend", "normal") != "normal":
             label = document.BLEND_LABELS.get(layer.blend, layer.blend)
             badges.append((None, label, "muted", f"Blend mode: {label}"))
+        count = self._layer_object_count(layer)
+        noun = "object" if count == 1 else "objects"
+        badges.append((None, str(count), "muted", f"{count} {noun}"))
         return badges
 
+    def _layer_object_count(self, layer):
+        """How many object rows ``layer`` lists beneath it.
+
+        Filters, texts, paths, vector strokes and vector fills are all kept as
+        editable specs and each gets an indented row, so the badge counts every
+        one of them. The same total applies to vector and ordinary raster
+        layers, which both may carry any of these kinds.
+        """
+        return sum(len(getattr(layer, attr, None) or ())
+                   for attr in ("filters", "texts", "paths", "strokes",
+                                "fills"))
+
     def _insert_layer_row(self, layers, index, layer_row, indent):
-        """Insert one layer row (and its indented filter rows) into the list."""
+        """Insert one layer row (and its indented object rows) into the list.
+
+        A collapsed layer keeps its header but omits every object row beneath
+        it, mirroring how a collapsed group hides its members.
+        """
         layer = layers[index]
+        collapsed = bool(getattr(layer, "collapsed", False))
         layer_row[index] = self._add_row(
             layer.name, ("layer", index), indent, layer,
             hidden=not layer.visible, badges=self._layer_badges(layer),
+            name_icons=[
+                LAYER_COLLAPSED if collapsed else LAYER_EXPANDED,
+            ],
         )
+        if collapsed:
+            return
         for filter_index, spec in enumerate(layer.filters):
             text = filters.describe(spec)
             if not spec.get("enabled", True):
@@ -1892,7 +1949,7 @@ class LayerPanel(tk.Frame):
         self._sync_button_state()
 
     def _on_double(self, _event, row):
-        """A double click edits the row's target (or collapses a group)."""
+        """A double click edits an object row (or collapses a layer/group)."""
         if not (0 <= row < len(self._rows)):
             return
         # A double click is not a drag; forget the press that started it.
@@ -1902,7 +1959,10 @@ class LayerPanel(tk.Frame):
         self._select_rows([row], row)
         entry = self._rows[row]
         if entry[0] == "layer":
-            self._on_rename()
+            if self._on_layer_collapse is not None:
+                self._on_layer_collapse()
+            else:
+                self._on_rename()
         elif entry[0] == "group":
             if self._on_group_collapse is not None:
                 self._on_group_collapse()
@@ -1964,7 +2024,12 @@ class LayerPanel(tk.Frame):
                 self._selected_filter = None
                 self._selected_group = None
                 self._selected_group_filter = None
-                self._selected = [row]
+                owner = next(
+                    (i for i, candidate in enumerate(self._rows)
+                     if candidate == ("layer", layer_index)),
+                    None,
+                )
+                self._selected = sorted({row, owner} - {None})
                 self._anchor = row
                 # Repaint only: routing the row again would call back into the
                 # app, which would re-enter this method through a canvas sync.
@@ -2459,6 +2524,7 @@ class LayerPanel(tk.Frame):
         )
         if include_primary:
             menu.add_command("Add Layer", command=self._on_add)
+            menu.add_command("Add Vector Layer", command=self._on_add_vector)
             menu.add_command("Duplicate Layer", command=self._on_duplicate)
             menu.add_command(
                 "Merge Layers", command=self._handle_merge, enabled=not single
@@ -2467,6 +2533,13 @@ class LayerPanel(tk.Frame):
         menu.add_separator()
         # Visibility / state actions
         menu.add_command("Show/Hide Layer", command=self._handle_toggle)
+        collapsed = all(
+            getattr(layer, "collapsed", False) for layer in self._context_layers()
+        )
+        menu.add_command(
+            "Expand Layer" if collapsed else "Collapse Layer",
+            command=self._toggle_layer_collapse,
+        )
         menu.add_command("Lock/Unlock Layer", command=self._handle_lock)
         menu.add_command(
             "Isolate/Unisolate Layer", command=self._handle_toggle_isolate,
@@ -2908,6 +2981,10 @@ class LayerPanel(tk.Frame):
     def _toggle_collapse(self):
         if self._on_group_collapse is not None:
             self._on_group_collapse()
+
+    def _toggle_layer_collapse(self):
+        if self._on_layer_collapse is not None:
+            self._on_layer_collapse()
 
     def _handle_opacity(self, _value=None):
         self._on_opacity(self.opacity_var.get())

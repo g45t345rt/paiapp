@@ -655,6 +655,10 @@ class Layer:
         self.draw = ImageDraw.Draw(self.image)
         self.visible = True
         self.locked = False
+        # True when the layer panel hides this layer's object rows (filters,
+        # texts, paths and vector strokes/fills), matching a collapsed group.
+        # It only affects the list; the layer still composites normally.
+        self.collapsed = False
         self.opacity = 1.0
         # Optional 8-bit mask, aligned to ``image`` in the layer's own pixel
         # space, whose value scales the layer's alpha at composite time (255 =
@@ -834,6 +838,7 @@ class Layer:
         if self.mask is not None:
             duplicate.mask = self.mask.copy()
         duplicate.visible = self.visible
+        duplicate.collapsed = self.collapsed
         duplicate.locked = self.locked
         duplicate.opacity = self.opacity
         duplicate.offset = tuple(self.offset)
@@ -1942,6 +1947,7 @@ class Canvas:
                 "image": layer.image,
                 "mask": layer.mask,
                 "visible": layer.visible,
+                "collapsed": bool(getattr(layer, "collapsed", False)),
                 "locked": layer.locked,
                 "opacity": layer.opacity,
                 "offset": tuple(layer.offset),
@@ -2061,6 +2067,7 @@ class Canvas:
                 layer.mask = mask
                 layer._mask_shared = True
             layer.visible = layer_entry["visible"]
+            layer.collapsed = bool(layer_entry.get("collapsed", False))
             layer.locked = layer_entry.get("locked", False)
             layer.opacity = layer_entry["opacity"]
             layer.offset = tuple(layer_entry.get("offset", (0, 0)))

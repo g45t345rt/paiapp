@@ -625,6 +625,9 @@ class ToolsPanel(tk.Frame):
         # The tool whose settings are currently built, so a mode switch can
         # update rows in place instead of rebuilding the panel.
         self._rendered_tool = None
+        # Tooltips owned by the current settings panel; keeping the objects
+        # alive preserves their widget bindings across garbage collection.
+        self._action_tips = []
         self._tool_buttons = {}
         self._tool_labels = {}
         for key, label in self.TOOL_BUTTONS:
@@ -862,10 +865,15 @@ class ToolsPanel(tk.Frame):
             self._render_settings(active)
 
     def _on_theme(self):
-        """Re-render the tool-button icons with the new theme's colors."""
+        """Re-render icon-bearing chrome with the new theme's colors."""
         active = self._active_tool()
         for key, button in self._tool_buttons.items():
             self._set_tool_icon(button, key, key == active)
+        # Settings icons are rasterised in the theme's text color, so they must
+        # be drawn again when it changes. Rebuilding the panel is safe here:
+        # theme switches are rare and the builder restores every control value.
+        if self._rendered_tool is not None:
+            self._render_settings(self._rendered_tool)
 
     def _set_tool_icon(self, button, key, active):
         """Draw a tool button's icon beside its label (accent when active).
@@ -906,6 +914,7 @@ class ToolsPanel(tk.Frame):
         self._rendered_tool = active
         for child in self.settings.winfo_children():
             child.destroy()
+        self._action_tips = []
         self._brush_preview = None
         # The advanced block's toggle button, if the tool has one; the symmetry
         # block packs before it so its guide controls stay above "Advanced".
@@ -1213,6 +1222,62 @@ class ToolsPanel(tk.Frame):
         row = tk.Frame(parent)
         row.pack(fill=tk.X, pady=(3, 0))
         return row
+
+    def _section_header(self, parent, text):
+        """A small uppercase section title with a hairline rule beside it.
+
+        Vector editing has enough unrelated controls (anchors, booleans,
+        arrange, align, appearance) that running them together as rows of
+        buttons is hard to scan. A quiet header gives each group a name without
+        the visual weight of a ``LabelFrame`` border.
+        """
+        header = tk.Frame(parent)
+        header.pack(fill=tk.X, pady=(8, 2))
+        label = tk.Label(header, text=text.upper(), anchor="w")
+        theme.register(label, fg="muted")
+        label.pack(side=tk.LEFT)
+        rule = tk.Frame(header, height=1, bd=0, highlightthickness=0)
+        theme.register(rule, bg="border")
+        rule.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(6, 0))
+        return header
+
+    def _button_grid(self, parent, columns):
+        """A packed frame whose ``columns`` columns share equal widths."""
+        grid = tk.Frame(parent)
+        grid.pack(fill=tk.X)
+        for column in range(columns):
+            grid.columnconfigure(column, weight=1, uniform="action-btn")
+        return grid
+
+    def _action_button(self, parent, text, command, icon=None, tooltip=None,
+                       glyph=None):
+        """A compact button carrying a Tabler icon beside its label.
+
+        When the icon cannot be rendered the button falls back to ``glyph`` (or
+        the label), so an icon-only control such as the align buttons is never
+        blank. Image buttons ignore ``padx``/``pady`` in Tk, so the icon is
+        rendered with a little transparent padding instead.
+        """
+        button = tk.Button(
+            parent, text=text, command=command, anchor="w",
+            padx=4, pady=2, borderwidth=1, highlightthickness=0,
+        )
+        image = None
+        if icon:
+            image = icons.photo(icon, 16, theme.color("text"), padding=2)
+        if image is not None:
+            centered = not text
+            button.config(
+                image=image, text=(f" {text}" if text else ""),
+                compound="center" if centered else "left",
+                anchor="center" if centered else "w",
+                width=0, height=0, padx=0, pady=0,
+            )
+        elif glyph:
+            button.config(text=glyph, anchor="center")
+        if tooltip:
+            self._action_tips.append(Tooltip(button, tooltip))
+        return button
 
     def _settings_for_brush(self):
         self._brush_stamping_controls()
@@ -2726,71 +2791,97 @@ class ToolsPanel(tk.Frame):
         self._vector_color_note.pack(fill=tk.X, pady=(4, 0))
 
         self._vector_edit = tk.Frame(self.settings)
-        self._check_row(self._vector_edit, "Show anchors",
-                        self._vector_anchors_var, self._on_vector_anchors)
-        self._check_row(self._vector_edit, "Snap anchors",
-                        self._vector_snap_var, self._on_vector_edit)
-        self._check_row(self._vector_edit, "Scale width",
-                        self._vector_scale_width_var, self._on_vector_correct)
+
+        # Visibility and interaction toggles first; the groups below only hold
+        # commands that act on the selected geometry.
+        options = tk.Frame(self._vector_edit)
+        options.pack(fill=tk.X)
+        options.columnconfigure(0, weight=1, uniform="vector-toggle")
+        options.columnconfigure(1, weight=1, uniform="vector-toggle")
+        for index, (label, var, command) in enumerate((
+                ("Show anchors", self._vector_anchors_var,
+                 self._on_vector_anchors),
+                ("Snap anchors", self._vector_snap_var, self._on_vector_edit),
+                ("Scale width", self._vector_scale_width_var,
+                 self._on_vector_correct))):
+            tk.Checkbutton(
+                options, text=label, variable=var, command=command,
+                anchor="w",
+            ).grid(row=index // 2, column=index % 2, sticky="ew")
         self._slider_row(self._vector_edit, "Handle",
                          self._vector_anchor_size_var, 2, 12,
                          self._on_vector_edit)
-        actions = tk.Frame(self._vector_edit)
-        actions.pack(fill=tk.X, pady=(4, 0))
-        for label, action in (("All", "select_all"), ("None", "clear"),
-                              ("Delete", "delete")):
-            tk.Button(
-                actions, text=label,
-                command=lambda a=action: self._vector_action(a),
-            ).pack(side=tk.LEFT, padx=(0, 3))
-        shape_actions = tk.Frame(self._vector_edit)
-        shape_actions.pack(fill=tk.X, pady=(3, 0))
-        for label, action in (("Corner", "corner"), ("Smooth", "smooth"),
-                              ("Split", "split"), ("Close", "toggle_closed")):
-            tk.Button(
-                shape_actions, text=label,
-                command=lambda a=action: self._vector_action(a),
-            ).pack(side=tk.LEFT, padx=(0, 3))
-        shape_actions2 = tk.Frame(self._vector_edit)
-        shape_actions2.pack(fill=tk.X, pady=(3, 0))
-        for label, action in (("Simplify", "simplify"), ("Connect", "connect")):
-            tk.Button(
-                shape_actions2, text=label,
-                command=lambda a=action: self._vector_action(a),
-            ).pack(side=tk.LEFT, padx=(0, 3))
-        bool_actions = tk.Frame(self._vector_edit)
-        bool_actions.pack(fill=tk.X, pady=(3, 0))
-        for label, operation in (("Union", "union"), ("Subtract", "subtract"),
-                                 ("Intersect", "intersect"),
-                                 ("Exclude", "exclude")):
-            tk.Button(
-                bool_actions, text=label,
-                command=lambda op=operation: self._vector_action(
+
+        self._section_header(self._vector_edit, "Anchor")
+        anchor_actions = self._button_grid(self._vector_edit, 3)
+        for index, (label, action) in enumerate((
+                ("Corner", "corner"), ("Smooth", "smooth"), ("Split", "split"),
+                ("Simplify", "simplify"), ("Connect", "connect"),
+                ("Close", "toggle_closed"))):
+            self._action_button(
+                anchor_actions, label,
+                lambda a=action: self._vector_action(a),
+            ).grid(row=index // 3, column=index % 3, sticky="ew",
+                   padx=(0, 2), pady=(2, 0))
+
+        self._section_header(self._vector_edit, "Pathfinder")
+        pathfinder = self._button_grid(self._vector_edit, 2)
+        for index, (label, operation, icon) in enumerate((
+                ("Union", "union", "pathfinder-union"),
+                ("Subtract", "subtract", "pathfinder-subtract"),
+                ("Intersect", "intersect", "pathfinder-intersect"),
+                ("Exclude", "exclude", "pathfinder-exclude"))):
+            self._action_button(
+                pathfinder, label,
+                lambda op=operation: self._vector_action(
                     "boolean", {"op": op}),
-            ).pack(side=tk.LEFT, padx=(0, 3))
-        object_actions = tk.Frame(self._vector_edit)
-        object_actions.pack(fill=tk.X, pady=(3, 0))
-        for label, action in (("Copy", "duplicate"), ("Front", "front"),
-                              ("Back", "back")):
-            tk.Button(
-                object_actions, text=label,
-                command=lambda a=action: self._vector_action(a),
-            ).pack(side=tk.LEFT, padx=(0, 3))
-        align_actions = tk.Frame(self._vector_edit)
-        align_actions.pack(fill=tk.X, pady=(3, 0))
-        for label, action, edge in (
-                ("L", "align", "left"), ("C", "align", "hcenter"),
-                ("R", "align", "right"), ("T", "align", "top"),
-                ("M", "align", "vcenter"), ("B", "align", "bottom"),
-                ("Dist H", "distribute", "h"),
-                ("Dist V", "distribute", "v")):
-            tk.Button(
-                align_actions, text=label,
-                command=lambda a=action, e=edge: self._vector_action(
-                    a, {"edge": e}),
-            ).pack(side=tk.LEFT, padx=(0, 2))
-        tk.Label(self._vector_edit, text="Lines", anchor="w").pack(
-            fill=tk.X, pady=(6, 0))
+                icon=icon,
+            ).grid(row=index // 2, column=index % 2, sticky="ew",
+                   padx=(0, 2), pady=(2, 0))
+
+        self._section_header(self._vector_edit, "Arrange")
+        arrange = self._button_grid(self._vector_edit, 3)
+        for index, (label, action, icon) in enumerate((
+                ("Copy", "duplicate", "copy"),
+                ("Front", "front", "arrow-up"),
+                ("Back", "back", "arrow-down"))):
+            self._action_button(
+                arrange, label,
+                lambda a=action: self._vector_action(a),
+                icon=icon,
+            ).grid(row=0, column=index, sticky="ew",
+                   padx=(0, 2 if index < 2 else 0), pady=(2, 0))
+
+        self._section_header(self._vector_edit, "Align")
+        align = self._button_grid(self._vector_edit, 3)
+        for index, (glyph, edge, icon, tip) in enumerate((
+                ("L", "left", "align-left", "Align left edges"),
+                ("C", "hcenter", "align-center-h",
+                 "Align horizontal centers"),
+                ("R", "right", "align-right", "Align right edges"),
+                ("T", "top", "align-top", "Align top edges"),
+                ("M", "vcenter", "align-middle-v",
+                 "Align vertical centers"),
+                ("B", "bottom", "align-bottom", "Align bottom edges"))):
+            self._action_button(
+                align, "",
+                lambda e=edge: self._vector_action("align", {"edge": e}),
+                icon=icon, tooltip=tip, glyph=glyph,
+            ).grid(row=index // 3, column=index % 3, sticky="ew",
+                   padx=(0, 2), pady=(2, 0))
+        distribute = self._button_grid(self._vector_edit, 2)
+        for index, (label, edge, icon) in enumerate((
+                ("Distribute H", "h", "distribute-h"),
+                ("Distribute V", "v", "distribute-v"))):
+            self._action_button(
+                distribute, label,
+                lambda e=edge: self._vector_action(
+                    "distribute", {"edge": e}),
+                icon=icon,
+            ).grid(row=0, column=index, sticky="ew",
+                   padx=(0, 2 if index == 0 else 0), pady=(2, 0))
+
+        self._section_header(self._vector_edit, "Lines")
         list_row = tk.Frame(self._vector_edit)
         list_row.pack(fill=tk.X)
         self._vector_list = tk.Listbox(
@@ -2801,8 +2892,19 @@ class ToolsPanel(tk.Frame):
         scroll.set_command(self._vector_list.yview)
         self._vector_list.config(yscrollcommand=scroll.set)
         scroll.pack(side=tk.RIGHT, fill=tk.Y)
-        tk.Label(self._vector_edit, text="Selected line", anchor="w").pack(
-            fill=tk.X, pady=(6, 0))
+        select_actions = self._button_grid(self._vector_edit, 3)
+        for index, (label, action, tip) in enumerate((
+                ("All", "select_all", "Select every line"),
+                ("None", "clear", "Clear the selection"),
+                ("Delete", "delete", "Delete the selected lines"))):
+            self._action_button(
+                select_actions, label,
+                lambda a=action: self._vector_action(a),
+                tooltip=tip,
+            ).grid(row=0, column=index, sticky="ew",
+                   padx=(0, 2 if index < 2 else 0), pady=(2, 0))
+
+        self._section_header(self._vector_edit, "Appearance")
         self._slider_row(self._vector_edit, "Width",
                          self._vector_prop_width_var, vector.MIN_WIDTH,
                          min(vector.MAX_WIDTH, BRUSH_SLIDER_MAX),
@@ -2811,31 +2913,26 @@ class ToolsPanel(tk.Frame):
                          self._vector_prop_opacity_var, 1, 100,
                          self._on_vector_prop)
         prop_row = self._swatch_row(self._vector_edit)
-        tk.Label(prop_row, text="Color", width=9, anchor="w").pack(side=tk.LEFT)
+        tk.Label(prop_row, text="Stroke", width=6, anchor="w").pack(side=tk.LEFT)
         self._vector_prop_btn = tk.Button(
             prop_row, width=3, command=self._choose_vector_prop_color)
         theme.skip(self._vector_prop_btn)
         self._vector_prop_btn.pack(side=tk.LEFT)
+        tk.Label(prop_row, text="Fill", width=4, anchor="w").pack(
+            side=tk.LEFT, padx=(8, 0))
         self._vector_prop_fill_btn = tk.Button(
             prop_row, width=3, command=self._choose_vector_fill_color)
         theme.skip(self._vector_prop_fill_btn)
-        self._vector_prop_fill_btn.pack(side=tk.LEFT, padx=(4, 0))
-        tk.Button(
-            prop_row, text="Apply",
-            command=lambda: self._vector_action("apply"),
-        ).pack(side=tk.LEFT, padx=(4, 0))
-        tk.Button(
-            prop_row, text="No fill",
-            command=lambda: self._vector_action("clear_fill"),
-        ).pack(side=tk.LEFT, padx=(4, 0))
-        tk.Button(
-            prop_row, text="Gradient",
-            command=lambda: self._vector_action("gradient"),
-        ).pack(side=tk.LEFT, padx=(4, 0))
-        tk.Button(
-            prop_row, text="No grad",
-            command=lambda: self._vector_action("clear_gradient"),
-        ).pack(side=tk.LEFT, padx=(4, 0))
+        self._vector_prop_fill_btn.pack(side=tk.LEFT)
+        prop_actions = self._button_grid(self._vector_edit, 2)
+        for index, (label, action) in enumerate((
+                ("Apply", "apply"), ("No fill", "clear_fill"),
+                ("Gradient", "gradient"), ("No grad", "clear_gradient"))):
+            self._action_button(
+                prop_actions, label,
+                lambda a=action: self._vector_action(a),
+            ).grid(row=index // 2, column=index % 2, sticky="ew",
+                   padx=(0, 2), pady=(2, 0))
 
         # A zero-height marker the conditional rows are packed in front of, so
         # re-showing them keeps them above any controls packed after this.
@@ -2943,9 +3040,8 @@ class ToolsPanel(tk.Frame):
             prop_btn.config(bg=prop, activebackground=prop)
         fill_btn = getattr(self, "_vector_prop_fill_btn", None)
         if alive(fill_btn):
-            fill = self._vector_prop_fill
-            fill_btn.config(
-                bg=fill or "#f0f0f0", activebackground=fill or "#f0f0f0")
+            fill = self._vector_prop_fill or theme.color("panel_bg")
+            fill_btn.config(bg=fill, activebackground=fill)
 
     def _choose_vector_color(self):
         def preview(color):

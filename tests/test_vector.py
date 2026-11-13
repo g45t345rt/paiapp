@@ -710,6 +710,30 @@ def test_shape_geometry_is_editable():
     check("shift constrains the line to an axis", line["points"][1][1], 0.0)
 
 
+def test_ellipse_shape_closes_smoothly():
+    ellipse = shape.vector_geometry("ellipse", (10, 10, 90, 50))
+    check("ellipse closing anchor keeps its incoming handle",
+          ellipse["handles_in"][0] != ellipse["points"][0], True)
+    rounded = shape.vector_geometry("rectangle", (0, 0, 40, 40), radius=8)
+    check("rounded rectangle closing anchor keeps its incoming handle",
+          rounded["handles_in"][0] != rounded["points"][0], True)
+
+
+def test_closed_stroke_fill_uses_its_geometry():
+    geometry = shape.vector_geometry("ellipse", (10, 10, 90, 50))
+    spec = vector.new_stroke(
+        geometry["points"], 2, "#000000", closed=True,
+        handles_in=geometry["handles_in"],
+        handles_out=geometry["handles_out"], fill="#000000",
+    )
+    layer = Layer("v", (100, 60), (0, 0, 0, 0))
+    vector.paste(layer.image, spec, (0, 0))
+    check("closed stroke fill paints the far edge",
+          layer.image.getpixel((14, 30))[3], 255)
+    check("closed stroke fill paints the interior",
+          layer.image.getpixel((50, 30))[3], 255)
+
+
 def test_vector_item_selection_switches_tools_mode():
     from types import SimpleNamespace
     from paintapp.drawing import DrawingController

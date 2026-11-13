@@ -194,9 +194,13 @@ def vector_geometry(kind, box, shift=False, radius=0):
     points = geometry["points"]
     # A closed path ends on a duplicate of its first anchor; drop it so the
     # shape has one editable node per corner (the closing segment supplies it).
+    # The duplicate carries the curve control the closing segment arrives with,
+    # so fold it into the first anchor instead of losing it - otherwise a true
+    # curve (an ellipse, a rounded corner) closes with a sharp cusp.
     if (geometry["closed"] and len(points) >= 3
             and math.hypot(points[-1][0] - points[0][0],
                            points[-1][1] - points[0][1]) < 1e-6):
+        geometry["handles_in"][0] = geometry["handles_in"][-1]
         geometry["points"] = points[:-1]
         geometry["handles_in"] = geometry["handles_in"][:-1]
         geometry["handles_out"] = geometry["handles_out"][:-1]

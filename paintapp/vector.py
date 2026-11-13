@@ -2403,10 +2403,13 @@ def _render_sprite(spec):
     fill = spec.get("fill")
     gradient = spec.get("fill_gradient")
     closed = bool(spec.get("closed", False))
-    fill_points = [
-        ((x - left) * scale, (y - top) * scale)
-        for x, y in (points if closed else flatten(spec, closed=True))
-    ]
+    # ``points`` is already in sprite space; only an open spec (whose fill
+    # polygon has to be closed for painting) still needs the transform.
+    fill_points = (
+        points if closed
+        else [((x - left) * scale, (y - top) * scale)
+              for x, y in flatten(spec, closed=True)]
+    )
     if (fill or gradient) and len(fill_points) >= 3:
         if gradient:
             mask = Image.new("L", sprite.size, 0)

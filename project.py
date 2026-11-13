@@ -304,6 +304,7 @@ def snapshot(app):
             entry["layers"].append({
                 "name": layer.name,
                 "visible": bool(layer.visible),
+                "collapsed": bool(getattr(layer, "collapsed", False)),
                 "locked": bool(layer.locked),
                 "opacity": float(layer.opacity),
                 "offset": [int(layer.offset[0]), int(layer.offset[1])],
@@ -672,6 +673,7 @@ def _build_canvases(payload, cancel=None):
                 else:
                     layer.mask = _place_layer_mask(mask, layer.image.size, offset)
             layer.visible = bool(layer_entry.get("visible", True))
+            layer.collapsed = bool(layer_entry.get("collapsed", False))
             layer.locked = bool(layer_entry.get("locked", False))
             layer.opacity = float(layer_entry.get("opacity", 1.0))
             layer.positive_prompt = str(layer_entry.get("prompt", "") or "")
