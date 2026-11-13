@@ -2591,7 +2591,7 @@ class CanvasView(tk.Canvas):
         )
 
     # ------------------------------------------------------------------ preview
-    def set_generation_preview(self, image, origin=(0, 0), fit=True):
+    def set_generation_preview(self, image, origin=(0, 0), fit=True, scale=1.0):
         """Show a finished generation in the viewport before it is applied.
 
         ``image`` is drawn at document ``origin`` over the dimmed document, so
@@ -2600,11 +2600,19 @@ class CanvasView(tk.Canvas):
         rectangle. Passing ``None`` clears the preview. The same call renders the
         live denoising frames, so what forms on screen is what the result will
         look like.
+
+        ``scale`` is ``image``'s pixels per document pixel. It is ``1.0`` for a
+        document-sized result, and greater than one for an upscaled inpaint crop
+        (see ``_plan_inpaint_crop``), so the crop is placed back at the document
+        region it stands in for instead of at its raw pixel size.
         """
         if image is None:
             self.clear_generation_preview()
             return
-        self._gen_preview = (image, (int(origin[0]), int(origin[1])))
+        scale = float(scale) if scale and scale > 0 else 1.0
+        self._gen_preview = (
+            image, (int(origin[0]), int(origin[1])), scale,
+        )
         if fit:
             # Zoom and scroll so the whole canvas-and-preview rectangle is on
             # screen straight away; the view's zoom controls inspect it after.
@@ -2639,11 +2647,13 @@ class CanvasView(tk.Canvas):
         """Document rectangle of the canvas unioned with the preview."""
         if self._gen_preview is None:
             return None
-        image, (ox, oy) = self._gen_preview
+        image, (ox, oy), scale = self._gen_preview
+        width = image.width / scale
+        height = image.height / scale
         return (
             min(0, ox), min(0, oy),
-            max(self.doc.width, ox + image.width),
-            max(self.doc.height, oy + image.height),
+            max(self.doc.width, ox + width),
+            max(self.doc.height, oy + height),
         )
 
     def _preview_layout_bounds(self):
@@ -2656,15 +2666,17 @@ class CanvasView(tk.Canvas):
         origin = self._preview_layout_origin()
         if origin is None:
             return None
-        image, _doc_origin = self._gen_preview
+        image, _doc_origin, scale = self._gen_preview
+        width = image.width / scale
+        height = image.height / scale
         index = getattr(self.doc, "active", 0)
         if not (0 <= index < len(self._layout.cells)):
             return None
         left, top, right, bottom = self._layout.cells[index]
         return (
             min(left, origin[0]), min(top, origin[1]),
-            max(right, origin[0] + image.width),
-            max(bottom, origin[1] + image.height),
+            max(right, origin[0] + width),
+            max(bottom, origin[1] + height),
         )
 
     def _preview_layout_origin(self):
@@ -2678,14 +2690,16 @@ class CanvasView(tk.Canvas):
         """
         if self._layout is None or self._gen_preview is None:
             return None
-        image, _doc_origin = self._gen_preview
+        image, _doc_origin, scale = self._gen_preview
+        width = image.width / scale
+        height = image.height / scale
         index = getattr(self.doc, "active", 0)
         if not (0 <= index < len(self._layout.cells)):
             return None
         left, top, right, bottom = self._layout.cells[index]
         return (
-            int(left + (right - left - image.width) // 2),
-            int(top + (bottom - top - image.height) // 2),
+            int(left + (right - left - width) // 2),
+            int(top + (bottom - top - height) // 2),
         )
 
     def _preview_fit_zoom(self, rect, pad=24):
@@ -2735,10 +2749,12 @@ class CanvasView(tk.Canvas):
         if self._gen_preview is None:
             return board
         board = Image.blend(board, Image.new("RGB", board.size, (0, 0, 0)), 0.5)
-        image, doc_origin = self._gen_preview
+        image, doc_origin, scale = self._gen_preview
         if origin is None:
             origin = doc_origin
-        crop, item = visible_crop(image, origin, self.zoom, window, render_size)
+        crop, item = visible_crop(
+            image, origin, self.zoom, window, render_size, source_scale=scale,
+        )
         if crop is None:
             return board
         position = (

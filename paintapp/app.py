@@ -8898,8 +8898,9 @@ class PaintApp:
                     sub = message[4] if len(message) > 4 else None
                     self._on_job_progress(source, job_id, frac, label, sub)
                 elif tag == "genpreview":
-                    _tag, doc, image = message
-                    self._on_gen_preview(doc, image)
+                    _tag, doc, image = message[:3]
+                    crop_box = message[3] if len(message) > 3 else None
+                    self._on_gen_preview(doc, image, crop_box)
                 elif tag == "jobdone":
                     _tag, job_id, result, error, cancelled = message
                     self._on_job_done(source, job_id, result, error, cancelled)
@@ -9709,7 +9710,12 @@ class PaintApp:
             )
 
         def preview_frame(image):
-            self.queue.put(("genpreview", doc, image))
+            # With Crop and stitch the run frame is the upscaled crop, not the
+            # document, so carry the crop box along: the preview places the
+            # frame back over the region it stands in for instead of centring it.
+            self.queue.put((
+                "genpreview", doc, image, stitch["box"] if stitch else None,
+            ))
 
         def finisher(result, error, cancelled):
             self._clear_live_preview()
@@ -9954,7 +9960,7 @@ class PaintApp:
                 return index
         return None
 
-    def _on_gen_preview(self, doc, image):
+    def _on_gen_preview(self, doc, image, crop_box=None):
         """Paint one live denoising-step frame onto its canvas.
 
         Frames use the same surface as the finished result: the target canvas is
@@ -9963,6 +9969,12 @@ class PaintApp:
         the floating action bar is shown with the run's own actions. A preview
         still awaiting accept/reject on this same canvas is closed so this run
         can take over; a preview on another canvas is left alone.
+
+        ``crop_box`` is the document ``(left, top, right, bottom)`` an upscaled
+        Crop-and-stitch frame stands in for. The frame is placed over that box
+        and scaled back to its document size so the forming image lands where
+        the finished result will; without it the frame is document-sized and is
+        centred as usual.
         """
         pending = self._preview
         if pending is not None:
@@ -9981,11 +9993,21 @@ class PaintApp:
         index = self._canvas_index(doc)
         if first and index is not None and index != self.active_canvas:
             self._activate_canvas(index)
-        origin = ((doc.width - image.width) // 2, (doc.height - image.height) // 2)
+        if crop_box is not None:
+            left, top, right, bottom = crop_box
+            box_w = max(1, right - left)
+            origin = (int(left), int(top))
+            scale = image.width / box_w
+        else:
+            origin = (
+                (doc.width - image.width) // 2,
+                (doc.height - image.height) // 2,
+            )
+            scale = 1.0
         try:
             # Never re-frame: the frame repaints in place so the zoom and pan the
             # user set are kept while the image forms.
-            view.set_generation_preview(image, origin, fit=False)
+            view.set_generation_preview(image, origin, fit=False, scale=scale)
         except tk.TclError:
             return
         if first:
