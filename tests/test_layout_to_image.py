@@ -327,6 +327,37 @@ def test_layout_overlapping_cycle():
           ctrl._layout_cycle_row(150, 150, top, "move", 1.0), top)
 
 
+def test_layout_ctrl_drag_starts_nested_box():
+    from types import SimpleNamespace
+
+    from paintapp.drawing import DrawingController
+
+    model = layout.LayoutModel()
+    model.enabled = True
+    model.add_box((100, 100, 300, 300))
+    tools = SimpleNamespace(layout_supported=lambda: True, layout_model=model,
+                            layout_tool=True)
+    view = SimpleNamespace(
+        zoom=1.0,
+        set_selection=lambda _selection: None,
+        set_selection_label=lambda _box: None,
+    )
+    app = SimpleNamespace(
+        tools=tools,
+        current=SimpleNamespace(size=(800, 640)),
+        area=SimpleNamespace(current_view=lambda: view),
+    )
+    ctrl = DrawingController(app)
+
+    check("layout is not a colour-sampling tool", ctrl._pick_tool(), False)
+    ctrl._layout_press(150, 150, ctrl=True)
+    check("ctrl grabs the box underneath", ctrl._layout_edit is not None, True)
+
+    ctrl._layout_press(150, 150)
+    check("plain press starts a new box", ctrl._layout_origin, (150, 150))
+    check("plain press does not grab the box", ctrl._layout_edit, None)
+
+
 def main():
     for name, fn in sorted(globals().items()):
         if name.startswith("test_") and callable(fn):

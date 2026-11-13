@@ -660,8 +660,9 @@ class LayoutEditor(tk.Frame):
             text = "Drag a box on the canvas to add an item."
         else:
             text = ("Each box places one item; the Positive prompt is the scene "
-                    "caption. Click overlapping boxes again to reach one "
-                    "underneath.")
+                    "caption. Drag inside a box to draw another; Ctrl-drag to "
+                    "move or resize one, clicking overlapping boxes again to "
+                    "reach the one underneath.")
         self.hint_label.config(text=text)
 
     def _notify(self):

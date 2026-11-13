@@ -7202,9 +7202,10 @@ class PaintApp:
                           "AI segmentation")
             elif getattr(tools, "select_mode", "rect") == "lasso":
                 status = ("select (lasso): drag a freeform outline; "
-                          "drag inside it to move")
+                          "Ctrl-drag inside it to move")
             else:
-                status = "select: drag a rectangle; drag inside it to move"
+                status = ("select: drag a rectangle; Ctrl-drag inside it to "
+                          "move")
         elif tools.path_tool:
             what = ("stroke a line (brush size)" if tools.path_mode == "stroke"
                     else "fill and stroke the shape"
@@ -7250,9 +7251,9 @@ class PaintApp:
                       "ring to rotate, Shift/Ctrl-click to multi-select, "
                       "right-click to delete; Apply keeps it, Cancel restores")
         elif tools.layout_tool:
-            status = ("layout control: drag empty canvas to add a box, drag a box "
-                      "to move it, or its handles to resize; name and label items "
-                      "in Tool Settings")
+            status = ("layout control: drag to add a box, even inside another "
+                      "one; Ctrl-drag a box to move it, or its handles to "
+                      "resize; name and label items in Tool Settings")
         elif tools.inpaint_mask_edit:
             status = ("inpaint mask: paint where generation may change pixels; "
                       "Generate with Region set to 'Painted mask' to use it")

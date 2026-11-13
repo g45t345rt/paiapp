@@ -4568,6 +4568,35 @@ class DrawingController:
     def _on_ctrl_release(self, event):
         self._refresh_pick_cursor(False)
 
+    def _select_move_hover(self, ctrl):
+        """Whether a Control chord over the marquee should show the move cursor.
+
+        The Select tool only repositions the selection when Control is held and
+        the press lands inside the marquee; anywhere else the press starts a new
+        selection. Mirror that in the pointer so the move arrow appears exactly
+        where the drag would move the selection.
+        """
+        if self._sel_mode == "move":
+            return True
+        tools = self.app.tools
+        if not tools.select_tool or getattr(tools, "select_transform", False):
+            return False
+        if getattr(tools, "select_mode", "rect") not in ("rect", "lasso"):
+            return False
+        if not ctrl or self.cursor_x is None or self.cursor_y is None:
+            return False
+        selection = self._selection()
+        return bool(selection is not None and not selection.is_empty()
+                    and selection.contains(self.cursor_x, self.cursor_y))
+
+    def _apply_select_cursor(self, view, ctrl):
+        """Show the move arrow over a Control-draggable selection, else crosshair."""
+        cursor = "fleur" if self._select_move_hover(ctrl) else "crosshair"
+        try:
+            view.config(cursor=cursor)
+        except tk.TclError:
+            pass
+
     def _pointer_over(self, view):
         """Whether the mouse pointer currently sits inside ``view``."""
         try:
@@ -4579,6 +4608,14 @@ class DrawingController:
         """Show or drop the pick cursor for the current Control state."""
         view = self.app.area.current_view()
         if view is None or not self._pointer_over(view):
+            return
+        if self.app.tools.layout_tool:
+            self._apply_layout_cursor(
+                view, self.cursor_x, self.cursor_y, ctrl)
+            return
+        if self.app.tools.select_tool \
+                and not getattr(self.app.tools, "select_transform", False):
+            self._apply_select_cursor(view, ctrl)
             return
         sample = ctrl and self._pick_tool()
         self._apply_cursor(view, sample=sample)
@@ -4648,7 +4685,7 @@ class DrawingController:
         "move_tool", "drag_tool", "transform_tool", "select_tool", "text_tool",
         "path_tool", "vector_tool", "fill_tool", "gradient_tool", "shape_tool",
         "crop_tool", "paste_tool", "arrow_tool", "eyedropper", "liquify_tool",
-        "warp_tool", "puppet_tool", "poses_tool",
+        "warp_tool", "puppet_tool", "poses_tool", "layout_tool",
     )
 
     def _paint_tool(self):
@@ -4759,6 +4796,11 @@ class DrawingController:
         if self.app.tools.text_tool:
             self._apply_cursor(event.widget)
             self._hover_text(event)
+            return
+        if self.app.tools.select_tool and not getattr(
+                self.app.tools, "select_transform", False):
+            self._apply_cursor(event.widget)
+            self._apply_select_cursor(event.widget, bool(event.state & 0x4))
             return
         self._apply_cursor(event.widget)
 
@@ -4977,7 +5019,7 @@ class DrawingController:
             self._arrow_press(x, y, cycle=bool(event.state & ALT_STATE_MASK))
             return
         if tools.layout_tool:
-            self._layout_press(x, y)
+            self._layout_press(x, y, ctrl=bool(event.state & 0x4))
             return
         if tools.path_tool:
             self._path_press(event, x, y)
@@ -5028,7 +5070,7 @@ class DrawingController:
             if getattr(tools, "select_transform", False):
                 self._selection_transform_press(event)
             else:
-                self._begin_select(x, y)
+                self._begin_select(x, y, ctrl=bool(event.state & 0x4))
             return
         if tools.drag_tool:
             self._begin_pan(event)
@@ -6115,6 +6157,8 @@ class DrawingController:
         if tools.layout_tool:
             self.cursor_x, self.cursor_y = x1, y1
             self._layout_drag(x1, y1)
+            self._apply_layout_cursor(
+                view, x1, y1, bool(event.state & 0x4))
             return
         if tools.path_tool:
             self._path_drag(x1, y1)
@@ -6145,6 +6189,7 @@ class DrawingController:
                 self._selection_transform_drag(event, x1, y1)
             else:
                 self._drag_select(x1, y1)
+                self._apply_select_cursor(event.widget, bool(event.state & 0x4))
             return
         if tools.drag_tool:
             self._pan_to(event)
@@ -6192,6 +6237,9 @@ class DrawingController:
             return
         if self.app.tools.layout_tool:
             self._layout_release()
+            x, y = self._doc_coords(event)
+            self._apply_layout_cursor(
+                event.widget, x, y, bool(event.state & 0x4))
             return
         if self.app.tools.text_tool:
             if self._text_drag is not None:
@@ -6236,6 +6284,7 @@ class DrawingController:
             return
         if self.app.tools.select_tool:
             self._release_select()
+            self._apply_select_cursor(event.widget, bool(event.state & 0x4))
             return
         if self._pan_view is not None:
             self._end_pan()
@@ -6292,10 +6341,10 @@ class DrawingController:
         bottom = min(height, max(a[1], b[1]))
         return (left, top, right, bottom)
 
-    def _begin_select(self, x, y):
+    def _begin_select(self, x, y, ctrl=False):
         self._set_selection_label(None)
         selection = self._selection()
-        if selection is not None and not selection.is_empty() \
+        if ctrl and selection is not None and not selection.is_empty() \
                 and selection.contains(x, y):
             self._begin_float(x, y, selection)
             return
@@ -6427,13 +6476,18 @@ class DrawingController:
             bottom = min(float(height), max(end_xy[1], top + 1.0))
         return (left, top, right, bottom)
 
-    def _layout_press(self, x, y):
-        """Grab an existing box (move/resize) or begin drawing a new one."""
+    def _layout_press(self, x, y, ctrl=False):
+        """Begin drawing a new box, or move/resize an existing one.
+
+        A plain press always starts a new box, so one can be drawn inside an
+        existing one. Control grabs the box (or its handle) under the pointer
+        to move or resize it.
+        """
         view = self.app.area.current_view()
         if view is None or self.app.current is None:
             return
         tolerance = self.LAYOUT_HANDLE_HIT / max(view.zoom, 1e-6)
-        row, handle = self._layout_hit(x, y, tolerance)
+        row, handle = self._layout_hit(x, y, tolerance) if ctrl else (None, None)
         if row is not None:
             row = self._layout_cycle_row(x, y, row, handle, tolerance)
             self._layout_edit = (row, handle, tuple(row["bbox"]), (x, y))
@@ -6441,6 +6495,7 @@ class DrawingController:
             self._set_selection_label(tuple(row["bbox"]))
             return
         self._layout_last_pick = None
+        self._layout_edit = None
         self._layout_origin = (x, y)
         size = self.app.current.size
         box = self._rect_from((x, y), (x, y))
@@ -6486,25 +6541,40 @@ class DrawingController:
             return
         self.app.add_layout_box(box)
 
-    def _hover_layout(self, event):
-        """Show the move/resize cursor over an existing box's handles."""
-        view = event.widget
+    def _apply_layout_cursor(self, view, x, y, ctrl):
+        """Show a move/resize cursor only where Control would grab a box.
+
+        A plain Layout Control press starts a new box even over an existing one,
+        so the crosshair is the honest pointer there. Control grabs the box or
+        handle under the pointer, and a drag in progress keeps its cursor even
+        once the pointer leaves the box.
+        """
         cursor = "crosshair"
-        x, y = self._doc_coords(event)
-        tolerance = self.LAYOUT_HANDLE_HIT / max(view.zoom, 1e-6)
-        row, handle = self._layout_hit(x, y, tolerance)
-        if handle is not None:
-            cursor = self.CROP_CURSORS.get(handle, "crosshair")
+        if self._layout_edit is not None:
+            cursor = self.CROP_CURSORS.get(self._layout_edit[1], "crosshair")
+        elif ctrl and x is not None and y is not None:
+            tolerance = self.LAYOUT_HANDLE_HIT / max(view.zoom, 1e-6)
+            row, handle = self._layout_hit(x, y, tolerance)
+            if row is not None:
+                cursor = self.CROP_CURSORS.get(handle, "crosshair")
         try:
             view.config(cursor=cursor)
         except tk.TclError:
             view.config(cursor="crosshair")
 
-    def _begin_float(self, x, y, selection):
-        """Begin dragging an active selection.
+    def _hover_layout(self, event):
+        """Show the move/resize cursor over a box only while Control is held."""
+        x, y = self._doc_coords(event)
+        self._apply_layout_cursor(
+            event.widget, x, y, bool(event.state & 0x4))
 
-        Dragging inside the marquee repositions the selection itself; the layer
-        pixels are left untouched (use cut/paste to move pixels).
+    def _begin_float(self, x, y, selection):
+        """Begin dragging an active selection while Control is held.
+
+        Ctrl-dragging inside the marquee repositions the selection itself; the
+        layer pixels are left untouched (use cut/paste to move pixels). A plain
+        drag inside the marquee starts a new selection instead, so pixels inside
+        an existing selection can be selected again.
         """
         self._sel_mode = "move"
         self._float_selection = selection
