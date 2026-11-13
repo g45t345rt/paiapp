@@ -480,9 +480,9 @@ class ToolsPanel(tk.Frame):
         # pin rotations auto-correct. Pins live in the live session.
         self.puppet_influence = 200
         self.puppet_expansion = 20
-        # The full triangulation is noisy over a detailed drawing; show only the
-        # pins unless the user opts into the mesh from the tool settings.
-        self.puppet_show_mesh = False
+        # The full triangulation is noisy over a detailed drawing; show the mesh
+        # by default, and the user can turn it off from the tool settings.
+        self.puppet_show_mesh = True
         self.puppet_correct_rotation = True
         # Select tool mode: "rect" (marquee), "lasso", "wand", or "segment".
         self.select_mode = "rect"
