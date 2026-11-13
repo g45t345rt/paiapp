@@ -376,6 +376,18 @@ def test_backend_falls_back_to_cpu_for_unsupported_amd():
             os.environ.pop("PAI_ROCM_GFX", None)
 
 
+def test_parse():
+    flags = setup_env._parse(
+        ["--core-only", "--reinstall", "--setup-only", "--rocm", "--", "--foo", "x"])
+    check("flags recognised", flags[:4], (True, True, True, True))
+    check("args after -- pass through", flags[4], ["--foo", "x"])
+    none = setup_env._parse(["some.arg"])
+    check("no flags", none[:4], (False, False, False, False))
+    check("plain args pass through", none[4], ["some.arg"])
+    check("separates launcher and app args",
+          setup_env._parse(["--core-only", "--", "a"])[4], ["a"])
+
+
 def main():
     for name, fn in sorted(globals().items()):
         if name.startswith("test_") and callable(fn):
