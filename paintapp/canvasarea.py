@@ -1713,6 +1713,21 @@ class CanvasView(tk.Canvas):
         self._rendering = False
         self._pending_anchor = None
         self._rendered_view_size = (self.winfo_width(), self.winfo_height())
+        self._remember_view()
+
+    def _remember_view(self):
+        """Keep the document's camera in sync with this view for project saves.
+
+        The stacked camera and the exploded-grid camera cannot be mixed, so
+        each render stores its own: a normal view updates ``view_state`` and a
+        grid view updates ``exploded_view_state``. Saving and reopening then
+        restores the exact zoom, pan and rotation per canvas.
+        """
+        state = self.view_state()
+        if self._layout is not None:
+            self.doc.exploded_view_state = state
+        else:
+            self.doc.view_state = state
 
     def _live_composite(self, region, scale, dirty, render_size):
         """The composite for a live stroke, patched over its dirty rectangle.
@@ -4605,6 +4620,31 @@ class CanvasArea(tk.Frame):
         if self._on_gallery_close is not None:
             self._on_gallery_close()
 
+    def _restore_doc_view(self, view):
+        """Apply the camera a loaded document remembered in the project file.
+
+        A canvas that was saved in exploded mode restores the grid camera and
+        is marked as already framed, so activating it does not fit the whole
+        board over the saved view.
+        """
+        doc = view.doc
+        exploded = bool(getattr(doc, "show_exploded", False))
+        state = (
+            getattr(doc, "exploded_view_state", None) if exploded
+            else getattr(doc, "view_state", None)
+        )
+        if not state:
+            return
+        view.set_view_state(state)
+        if exploded:
+            # Keep the stacked camera too, so turning the grid off after a
+            # reload returns to the saved stacked viewport instead of leaving
+            # the camera in grid coordinates.
+            stacked = getattr(doc, "view_state", None)
+            if stacked:
+                view._stacked_view_state = dict(stacked)
+            view._exploded_camera_framed = True
+
     def _add(self, doc):
         page = tk.Frame(self.stack, bg=rgb_to_hex(self.bg_color))
         # The page backdrop is document-view chrome, not app chrome: keep the
@@ -4619,6 +4659,7 @@ class CanvasArea(tk.Frame):
         page.columnconfigure(0, weight=1)
 
         view = CanvasView(inner, doc, bg=self.bg_color)
+        self._restore_doc_view(view)
         corner = tk.Frame(inner, bg=rgb_to_hex(self.bg_color))
         theme.register(corner, bg="ruler_bg")
         top_ruler = RulerCanvas(inner, view, orient=tk.HORIZONTAL)

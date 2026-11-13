@@ -1978,6 +1978,11 @@ class Canvas:
         # painting. It is a per-canvas view preference, persisted in the .pai
         # project (the cached layout is not).
         self.show_exploded = False
+        # Camera persisted with the project (see ``CanvasView._remember_view``):
+        # the stacked view's zoom/pan/rotation, plus the grid camera while the
+        # exploded view is shown. ``None`` means "use the view's own default".
+        self.view_state = None
+        self.exploded_view_state = None
         self._exploded_layout = None
         self._exploded_key = None
         # Cache for :meth:`composite_region` and :meth:`composite_overview`: the
@@ -2445,6 +2450,17 @@ class Canvas:
         duplicate.layer_counter = self.layer_counter
         duplicate.group_counter = self.group_counter
         duplicate.guides = [tuple(guide) for guide in self.guides]
+        # Carry the camera over so the copy opens on the same viewport. The
+        # nested points are copied so later renders on either document cannot
+        # mutate the other's state.
+        for attr in ("view_state", "exploded_view_state"):
+            state = getattr(self, attr, None)
+            if state is not None:
+                state = dict(state)
+                for key in ("anchor", "pivot"):
+                    if isinstance(state.get(key), (list, tuple)):
+                        state[key] = list(state[key])
+            setattr(duplicate, attr, state)
         duplicate.gen_settings = dict(self.gen_settings)
         # The copy belongs to the same project, so it shares the asset library.
         duplicate.library = self.library

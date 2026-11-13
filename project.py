@@ -30,6 +30,7 @@ tkinter variables) and :func:`write` encodes it off-thread. :func:`load` and
 
 import io
 import json
+import math
 import os
 import zipfile
 from concurrent.futures import ThreadPoolExecutor
@@ -130,6 +131,88 @@ def _load_guides(entries):
         if orient in ("h", "v"):
             guides.append((orient, int(round(float(pos)))))
     return guides
+
+
+def _copy_view_state(state):
+    """Detach a view/camera state before it leaves the Tk thread.
+
+    :func:`write` runs off-thread, so the manifest must not share the mutable
+    point lists a live view may still replace while a save is encoding.
+    """
+    if not isinstance(state, dict):
+        return None
+    detached = dict(state)
+    for key in ("anchor", "pivot"):
+        point = detached.get(key)
+        if isinstance(point, (list, tuple)):
+            detached[key] = list(point)
+    return detached
+
+
+def _load_point(value):
+    """Return a finite ``[x, y]`` from saved data, or ``None``."""
+    if not isinstance(value, (list, tuple)) or len(value) < 2:
+        return None
+    try:
+        x, y = float(value[0]), float(value[1])
+    except (TypeError, ValueError):
+        return None
+    if not (math.isfinite(x) and math.isfinite(y)):
+        return None
+    return [x, y]
+
+
+def _load_view_state(value):
+    """Coerce a saved canvas camera to the shape ``CanvasView`` expects.
+
+    Returns ``None`` for a missing or malformed entry, so a damaged manifest
+    falls back to the default view instead of failing the whole load.
+    """
+    if not isinstance(value, dict):
+        return None
+    anchor = _load_point(value.get("anchor"))
+    if anchor is None:
+        return None
+    try:
+        zoom = float(value.get("zoom", 1.0))
+        angle = float(value.get("angle", 0.0))
+    except (TypeError, ValueError):
+        return None
+    if not (math.isfinite(zoom) and math.isfinite(angle)):
+        return None
+    return {
+        "zoom": zoom,
+        "anchor": anchor,
+        "angle": angle,
+        "flip": bool(value.get("flip", False)),
+        "flip_v": bool(value.get("flip_v", False)),
+        "pivot": _load_point(value.get("pivot")),
+    }
+
+
+def _canvas_view_states(canvas):
+    """The stacked and exploded cameras for ``canvas``.
+
+    The live view is preferred over the document's last-rendered cache: a pan
+    small enough to stay inside the pre-rendered margin does not repaint, so
+    the cache can lag behind the viewport the user is actually looking at when
+    the save starts.
+    """
+    stacked = getattr(canvas, "view_state", None)
+    exploded = getattr(canvas, "exploded_view_state", None)
+    view = getattr(canvas, "widget", None)
+    if view is not None:
+        try:
+            if view.exploded:
+                stacked = view._stacked_view_state or stacked
+                exploded = view.view_state()
+            else:
+                stacked = view.view_state()
+        except Exception:
+            # A widget being torn down must not fail the save; the cached
+            # camera below is still usable.
+            pass
+    return _copy_view_state(stacked), _copy_view_state(exploded)
 
 
 def _place_layer(image, size, offset):
@@ -264,6 +347,7 @@ def snapshot(app):
             "file": filename,
         })
     for canvas_index, canvas in enumerate(app.canvases):
+        view_state, exploded_view_state = _canvas_view_states(canvas)
         entry = {
             "name": canvas.name,
             "width": canvas.width,
@@ -277,6 +361,8 @@ def snapshot(app):
             "proof_intent": getattr(canvas, "proof_intent", "relative"),
             "guides": [[orient, int(pos)] for orient, pos in canvas.guides],
             "show_exploded": bool(getattr(canvas, "show_exploded", False)),
+            "view": view_state,
+            "exploded_view": exploded_view_state,
             "groups": [
                 {
                     "id": group.id,
@@ -657,6 +743,8 @@ def _build_canvases(payload, cancel=None):
         doc.proof_intent = str(entry.get("proof_intent") or "relative")
         doc.guides = _load_guides(entry.get("guides"))
         doc.show_exploded = bool(entry.get("show_exploded", False))
+        doc.view_state = _load_view_state(entry.get("view"))
+        doc.exploded_view_state = _load_view_state(entry.get("exploded_view"))
         groups = {}
         for group_entry in entry.get("groups", []) or []:
             group = Group(

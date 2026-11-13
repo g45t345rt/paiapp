@@ -320,6 +320,52 @@ def test_legacy_assets_default_to_ungrouped():
     check("legacy asset keeps id", asset.id, 1)
 
 
+def test_canvas_view_round_trips():
+    """A canvas camera is saved and restored so reopening keeps the viewport."""
+    app = fake_app([fake_layer("A", (1, 2, 3, 255))])
+    app.canvases[0].view_state = {
+        "zoom": 2.5,
+        "anchor": [30.0, 40.0],
+        "angle": 0.5,
+        "flip": True,
+        "flip_v": False,
+        "pivot": [100.0, 120.0],
+    }
+    app.canvases[0].exploded_view_state = {
+        "zoom": 0.5,
+        "anchor": [5.0, 6.0],
+        "angle": 0.0,
+        "flip": False,
+        "flip_v": False,
+        "pivot": None,
+    }
+    with tempfile.TemporaryDirectory() as tmp:
+        path = os.path.join(tmp, "sample.pai")
+        manifest = project.save(app, path)
+        payload = project.read(SimpleNamespace(canvases=[]), path)
+    loaded = payload["canvases"][0]
+    check("stacked zoom saved", manifest["canvases"][0]["view"]["zoom"], 2.5)
+    check("stacked zoom restored", loaded.view_state["zoom"], 2.5)
+    check("stacked anchor restored", loaded.view_state["anchor"], [30.0, 40.0])
+    check("stacked rotation restored", loaded.view_state["angle"], 0.5)
+    check("stacked flip restored", loaded.view_state["flip"], True)
+    check("stacked pivot restored", loaded.view_state["pivot"], [100.0, 120.0])
+    check("grid zoom restored", loaded.exploded_view_state["zoom"], 0.5)
+    check("grid anchor restored", loaded.exploded_view_state["anchor"], [5.0, 6.0])
+
+
+def test_malformed_view_state_is_ignored():
+    """A damaged camera entry falls back to the default view, not a failed load."""
+    check("missing view", project._load_view_state(None), None)
+    check("non-numeric zoom", project._load_view_state(
+        {"zoom": "wide", "anchor": [0, 0]}
+    ), None)
+    check("missing anchor", project._load_view_state({"zoom": 2.0}), None)
+    check("nan anchor", project._load_view_state(
+        {"zoom": 2.0, "anchor": [float("nan"), 0]}
+    ), None)
+
+
 def main():
     for name, fn in sorted(globals().items()):
         if name.startswith("test_") and callable(fn):
