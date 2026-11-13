@@ -1695,6 +1695,37 @@ class Layer:
         )
 
 
+def normalize_tags(tags):
+    """Trim, drop blanks and case-insensitive duplicates, then sort labels."""
+    seen = set()
+    result = []
+    for tag in tags or []:
+        label = str(tag).strip()
+        if not label:
+            continue
+        key = label.casefold()
+        if key in seen:
+            continue
+        seen.add(key)
+        result.append(label)
+    result.sort(key=str.casefold)
+    return result
+
+
+class AssetGroup:
+    """A named collection in the project's asset library.
+
+    Membership is stored on each :class:`Asset` (``asset.group`` is this group's
+    ``id``, or ``None`` for ungrouped assets), mirroring how layer groups work.
+    A group is only a label and a collapse flag; it owns no pixels.
+    """
+
+    def __init__(self, name, group_id):
+        self.name = name
+        self.id = group_id
+        self.collapsed = False
+
+
 class Asset:
     """A reference image kept with the project, outside any layer stack.
 
@@ -1707,15 +1738,23 @@ class Asset:
     panel's fields (and both prompts) from the run that produced the image, so
     selecting a generated asset can restore them; it is empty for an imported
     asset.
+
+    Organization lives here too: ``group`` is the owning :class:`AssetGroup` id
+    (or ``None``), ``tags`` are free-form labels, and ``favorite`` pins the asset
+    to the top of filtered lists.
     """
 
-    def __init__(self, name, image, asset_id, source="", prompt="", settings=None):
+    def __init__(self, name, image, asset_id, source="", prompt="", settings=None,
+                 group=None, tags=None, favorite=False):
         self.name = name
         self.image = image
         self.id = asset_id
         self.source = source
         self.prompt = prompt
         self.settings = dict(settings) if settings else {}
+        self.group = group
+        self.tags = normalize_tags(tags)
+        self.favorite = bool(favorite)
 
     def copy(self, name=None):
         """Return an independent duplicate sharing no pixels with this asset."""
@@ -1726,6 +1765,9 @@ class Asset:
             self.source,
             self.prompt,
             dict(self.settings),
+            self.group,
+            list(self.tags),
+            self.favorite,
         )
 
 
@@ -1744,14 +1786,17 @@ class AssetLibrary:
     def __init__(self):
         self.assets = []
         self.asset_counter = 0
+        self.groups = []
+        self.group_counter = 0
 
     def add_asset(self, name=None, image=None, source="", prompt="", settings=None,
-                  index=None, size=(1, 1)):
+                  index=None, size=(1, 1), group=None, tags=None, favorite=False):
         """Add a reference image and return it (newest first unless ``index``).
 
         The image is stored as-is (copied into RGBA) at its own dimensions. A
         ``None`` image yields a transparent ``size`` slot. ``settings`` records
-        the Generate panel fields that produced a generated image.
+        the Generate panel fields that produced a generated image. ``group`` is
+        an :class:`AssetGroup` id (unknown ids are treated as ungrouped).
         """
         self.asset_counter += 1
         if name is None:
@@ -1760,7 +1805,12 @@ class AssetLibrary:
             image = Image.new("RGBA", tuple(size), (0, 0, 0, 0))
         elif image.mode != "RGBA":
             image = image.convert("RGBA")
-        asset = Asset(name, image, self.asset_counter, source, prompt, settings)
+        if group is not None and self.find_group(group) is None:
+            group = None
+        asset = Asset(
+            name, image, self.asset_counter, source, prompt, settings,
+            group, tags, favorite,
+        )
         if index is None:
             self.assets.insert(0, asset)
         else:
@@ -1772,9 +1822,104 @@ class AssetLibrary:
         if asset in self.assets:
             self.assets.remove(asset)
 
+    def new_group(self, name=None):
+        """Create and return a new empty asset group."""
+        self.group_counter += 1
+        if name is None:
+            name = f"Group {self.group_counter}"
+        group = AssetGroup(name, self.group_counter)
+        self.groups.append(group)
+        return group
+
+    def add_group(self, name, group_id, collapsed=False):
+        """Restore a saved group, keeping its id and collapse state."""
+        group_id = int(group_id)
+        existing = self.find_group(group_id)
+        if existing is not None:
+            return existing
+        group = AssetGroup(name, group_id)
+        group.collapsed = bool(collapsed)
+        self.groups.append(group)
+        self.group_counter = max(self.group_counter, group.id)
+        return group
+
+    def find_group(self, group_id):
+        """The group with ``group_id``, or ``None``."""
+        for group in self.groups:
+            if group.id == group_id:
+                return group
+        return None
+
+    def find_by_id(self, asset_id):
+        """The asset with ``asset_id``, or ``None``."""
+        for asset in self.assets:
+            if asset.id == asset_id:
+                return asset
+        return None
+
+    def assets_in_group(self, group):
+        """The assets whose ``group`` is ``group`` (an id or a group object)."""
+        group_id = getattr(group, "id", group)
+        return [asset for asset in self.assets if asset.group == group_id]
+
+    def ungrouped_assets(self):
+        """The assets that belong to no group."""
+        return [asset for asset in self.assets if asset.group is None]
+
+    def remove_group(self, group):
+        """Delete ``group`` and return its assets to the ungrouped set.
+
+        Returns the number of assets that were reassigned.
+        """
+        if group not in self.groups:
+            return 0
+        moved = 0
+        for asset in self.assets:
+            if asset.group == group.id:
+                asset.group = None
+                moved += 1
+        self.groups.remove(group)
+        return moved
+
+    def move_asset(self, asset, group_id, before=None):
+        """Move ``asset`` into ``group_id`` and place it before ``before``.
+
+        ``before`` is an asset that should follow the moved asset (``None``
+        appends after the group's last asset). The library list is the manual
+        order, so this is the one operation behind both "move to group" and
+        drag-reorder. Unknown group ids mean ungrouped.
+        """
+        if asset not in self.assets:
+            return
+        if group_id is not None and self.find_group(group_id) is None:
+            group_id = None
+        self.assets.remove(asset)
+        asset.group = group_id
+        if before is not None and before in self.assets:
+            self.assets.insert(self.assets.index(before), asset)
+            return
+        index = len(self.assets)
+        for position in range(len(self.assets) - 1, -1, -1):
+            if self.assets[position].group == group_id:
+                index = position + 1
+                break
+        self.assets.insert(index, asset)
+
+    def move_group(self, group, before=None):
+        """Reorder ``group`` in the group list, before ``before`` or at the end."""
+        if group not in self.groups:
+            return
+        self.groups.remove(group)
+        if before is not None and before in self.groups:
+            self.groups.insert(self.groups.index(before), group)
+        else:
+            self.groups.append(group)
+
     def clear(self):
         self.assets = []
         self.asset_counter = 0
+        self.groups = []
+        self.group_counter = 0
 
 
 class MaskSurface:
@@ -1990,14 +2135,15 @@ class Canvas:
         self.library.asset_counter = int(value)
 
     def add_asset(self, name=None, image=None, source="", prompt="", settings=None,
-                  index=None):
+                  index=None, group=None, tags=None, favorite=False):
         """Add a reference image to the project's assets and return it.
 
         A ``None`` image yields a transparent canvas-sized slot. See
         :meth:`AssetLibrary.add_asset`.
         """
         return self.library.add_asset(
-            name, image, source, prompt, settings, index, size=self.size
+            name, image, source, prompt, settings, index, size=self.size,
+            group=group, tags=tags, favorite=favorite,
         )
 
     def remove_asset(self, asset):

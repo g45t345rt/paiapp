@@ -13,7 +13,9 @@ Each canvas may also carry layer groups, referenced from its layers by id.
 Version 1 files (a single implicit canvas at ``layers/``) still load; files
 written before groups existed simply have no ``groups`` entry. Files written
 before version 19 kept assets per canvas (``canvases/NNNN/assets/``); those
-load into the one project-wide asset list.
+load into the one project-wide asset list. Version 20 adds asset groups, tags,
+favorites and a project-wide asset group counter; older files load with every
+asset ungrouped and untagged.
 
 The functions take the running :class:`paint.PaintApp` so the caller can keep
 all of its state (canvases, palette, generation panel) in one place.
@@ -38,7 +40,7 @@ from paintapp import filters, gradient, path, poses, textrender, vector
 from paintapp.document import AssetLibrary, Canvas, Group, normalize_blend
 
 FORMAT = "pai"
-VERSION = 19
+VERSION = 20
 MANIFEST = "project.json"
 
 # Maps manifest keys to the tkinter variables that hold the generate panel.
@@ -228,12 +230,21 @@ def snapshot(app):
         ],
         "canvases": [],
         "asset_counter": 0,
+        "asset_group_counter": 0,
+        "asset_groups": [],
         "assets": [],
     }
 
     images = {}
     library = _app_library(app)
     manifest["asset_counter"] = int(library.asset_counter)
+    manifest["asset_group_counter"] = int(getattr(library, "group_counter", 0))
+    for group in getattr(library, "groups", []) or []:
+        manifest["asset_groups"].append({
+            "id": int(group.id),
+            "name": group.name,
+            "collapsed": bool(getattr(group, "collapsed", False)),
+        })
     for asset_index, asset in enumerate(library.assets):
         # Assets are project-wide reference images; they keep their own
         # dimensions, so no offset is stored.
@@ -247,6 +258,9 @@ def snapshot(app):
             # The Generate panel fields that produced a generated image, so
             # selecting the asset can restore them after a reload.
             "settings": dict(getattr(asset, "settings", {}) or {}),
+            "group": getattr(asset, "group", None),
+            "tags": list(getattr(asset, "tags", []) or []),
+            "favorite": bool(getattr(asset, "favorite", False)),
             "file": filename,
         })
     for canvas_index, canvas in enumerate(app.canvases):
@@ -772,6 +786,27 @@ def _build_library(payload):
     assets = payload.get("assets", {})
     entries = payload.get("asset_entries") or []
     library = AssetLibrary()
+    for group_entry in manifest.get("asset_groups", []) or []:
+        try:
+            group_id = int(group_entry.get("id", 0) or 0)
+        except (TypeError, ValueError):
+            continue
+        if group_id <= 0:
+            continue
+        if library.find_group(group_id) is not None:
+            continue
+        library.add_group(
+            group_entry.get("name", "Group"),
+            group_id,
+            collapsed=group_entry.get("collapsed", False),
+        )
+    try:
+        counter = int(manifest.get("asset_group_counter", 0) or 0)
+    except (TypeError, ValueError):
+        counter = 0
+    library.group_counter = max(
+        [counter] + [group.id for group in library.groups]
+    )
     kept = []
     for asset_index, (legacy, asset_entry) in enumerate(entries):
         image = assets.get(asset_index)
@@ -782,6 +817,14 @@ def _build_library(payload):
         + [int(entry.get("id", 0) or 0) for legacy, entry, _ in kept if not legacy]
     )
     for legacy, asset_entry, image in kept:
+        group_id = asset_entry.get("group")
+        if group_id is not None:
+            try:
+                group_id = int(group_id)
+            except (TypeError, ValueError):
+                group_id = None
+            if library.find_group(group_id) is None:
+                group_id = None
         asset = library.add_asset(
             name=asset_entry.get("name", "Asset"),
             image=image,
@@ -791,6 +834,9 @@ def _build_library(payload):
             # Rebuild the saved order (newest first) rather than
             # front-inserting each restore, which would reverse it.
             index=len(library.assets),
+            group=group_id,
+            tags=asset_entry.get("tags", []),
+            favorite=asset_entry.get("favorite", False),
         )
         if legacy:
             next_id += 1

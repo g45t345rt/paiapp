@@ -256,6 +256,70 @@ def test_save_empty_project_still_reports_done():
     check("empty project reports done", seen, [0.0])
 
 
+def test_save_persists_asset_organization():
+    from paintapp.document import AssetLibrary
+
+    app = fake_app([fake_layer("A", (1, 2, 3, 255))])
+    library = AssetLibrary()
+    refs = library.new_group("Refs")
+    library.add_asset(
+        name="grouped", image=Image.new("RGBA", (3, 3)), source="generated",
+        group=refs.id, tags=["portrait", "red"], favorite=True,
+    )
+    library.add_asset(name="loose", image=Image.new("RGBA", (3, 3)))
+    library.move_group(refs)
+    app.asset_library = library
+    with tempfile.TemporaryDirectory() as tmp:
+        path = os.path.join(tmp, "sample.pai")
+        manifest = project.save(app, path)
+        payload = project.read(SimpleNamespace(canvases=[]), path)
+    restored = payload["library"]
+    check("group counter saved", manifest["asset_group_counter"], 1)
+    check("group saved", [
+        (entry["id"], entry["name"]) for entry in manifest["asset_groups"]
+    ], [(1, "Refs")])
+    check("group restored", [
+        (group.id, group.name) for group in restored.groups
+    ], [(1, "Refs")])
+    grouped = restored.find_by_id(1)
+    loose = restored.find_by_id(2)
+    check("group membership restored", grouped.group, 1)
+    check("tags restored", grouped.tags, ["portrait", "red"])
+    check("favorite restored", grouped.favorite, True)
+    check("ungrouped asset stays ungrouped", loose.group, None)
+    check("ungrouped has no tags", loose.tags, [])
+
+
+def test_legacy_assets_default_to_ungrouped():
+    """Assets saved before organization existed load ungrouped and untagged."""
+    import json
+    import zipfile
+    import io
+
+    def png(color):
+        buf = io.BytesIO()
+        Image.new("RGBA", (2, 2), color).save(buf, "PNG")
+        return buf.getvalue()
+
+    manifest = {
+        "format": project.FORMAT, "version": 19,
+        "asset_counter": 1,
+        "assets": [{"id": 1, "name": "old", "file": "assets/0000_old.png"}],
+        "canvases": [],
+    }
+    with tempfile.TemporaryDirectory() as tmp:
+        path = os.path.join(tmp, "old.pai")
+        with zipfile.ZipFile(path, "w") as zf:
+            zf.writestr(project.MANIFEST, json.dumps(manifest))
+            zf.writestr("assets/0000_old.png", png((1, 2, 3, 255)))
+        payload = project.read(SimpleNamespace(canvases=[]), path)
+    asset = payload["library"].assets[0]
+    check("legacy asset ungrouped", asset.group, None)
+    check("legacy asset untagged", asset.tags, [])
+    check("legacy asset not favorite", asset.favorite, False)
+    check("legacy asset keeps id", asset.id, 1)
+
+
 def main():
     for name, fn in sorted(globals().items()):
         if name.startswith("test_") and callable(fn):

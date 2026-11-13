@@ -39,7 +39,7 @@ from .constants import (    APP_NAME, APP_VERSION, DONATE_URL, CONTRIBUTE_URL, D
     DEFAULT_PANEL_SIDES, DEFAULT_COLLAPSED_PANELS, DEFAULT_PANEL_GROUPS, rgba,
     TOOL_RAIL_W, TOOL_RAIL_MIN_W, TOOL_RAIL_MAX_W,
 )
-from .document import AssetLibrary, Canvas
+from .document import AssetLibrary, Canvas, normalize_tags
 from .drawing import DrawingController, ToolsPanel
 from .generation import (
     GenerationPanel,
@@ -1065,10 +1065,19 @@ class PaintApp:
             on_preview=self.preview_asset,
             on_save=self.save_asset,
             on_rename=self.rename_asset,
-            on_delete=self.delete_asset,
+            on_delete=self.delete_assets,
             on_drag=self._drag_asset_over_layer,
             on_drop=self._drop_asset_on_layer,
             on_select=self._on_asset_select,
+            on_assign_group=self.move_assets_to_group,
+            on_reorder=self.reorder_assets,
+            on_move_group=self.move_asset_group,
+            on_new_group=self.create_asset_group,
+            on_rename_group=self.rename_asset_group,
+            on_delete_group=self.delete_asset_group,
+            on_favorite=self.toggle_asset_favorite,
+            on_tags=self.edit_asset_tags,
+            on_collapse_group=self.set_asset_group_collapsed,
         )
         self.assets_panel.pack(fill=tk.X)
 
@@ -2683,7 +2692,9 @@ class PaintApp:
         """Show the project's assets in the Assets panel."""
         if not hasattr(self, "assets_panel"):
             return
-        self.assets_panel.refresh(self.asset_library.assets)
+        self.assets_panel.refresh(
+            self.asset_library.assets, self.asset_library.groups,
+        )
 
     def add_asset_from_file(self):
         """Add an image file to the project's assets."""
@@ -2710,21 +2721,24 @@ class PaintApp:
             return
         self._set_modified(True)
         asset = self.current.add_asset(
-            name=os.path.basename(path), image=image, source="imported"
+            name=os.path.basename(path), image=image, source="imported",
+            group=self._target_asset_group(),
         )
         self._refresh_asset_list()
-        self._select_asset(asset)
+        self._select_asset(asset, reveal=True)
         self.set_result(f"Added '{asset.name}' to the project assets.")
 
-    def _select_asset(self, asset):
+    def _select_asset(self, asset, reveal=False):
         """Highlight ``asset`` in the Assets panel (best effort)."""
+        if not hasattr(self, "assets_panel") or asset is None:
+            return
+        self.assets_panel.select_asset(asset.id, reveal=reveal)
+
+    def _target_asset_group(self):
+        """The group a newly added asset should join, if one is filter-selected."""
         if not hasattr(self, "assets_panel"):
-            return
-        try:
-            index = self.asset_library.assets.index(asset)
-        except ValueError:
-            return
-        self.assets_panel.refresh(self.asset_library.assets, selected=index)
+            return None
+        return self.assets_panel.default_group_id()
 
     def add_layer_to_assets(self, index=None):
         """Store a layer's composited pixels in the project's assets.
@@ -2751,9 +2765,10 @@ class PaintApp:
                     )
                     asset = self.current.add_asset(
                         name=layer.name, image=image, source="layer",
+                        group=self._target_asset_group(),
                     )
                 self._refresh_asset_list()
-                self._select_asset(asset)
+                self._select_asset(asset, reveal=True)
                 self.set_result(f"Added {len(multi)} layers to the assets.")
                 return
             indices = (
@@ -2770,12 +2785,13 @@ class PaintApp:
         self._set_modified(True)
         asset = self.current.add_asset(
             name=layer.name, image=image, source="layer",
+            group=self._target_asset_group(),
         )
         self._refresh_asset_list()
-        self._select_asset(asset)
+        self._select_asset(asset, reveal=True)
         self.set_result(f"Added layer '{layer.name}' to the assets.")
 
-    def _on_asset_select(self, index):
+    def _on_asset_select(self, asset_id):
         """Restore a generated asset's settings into the Generate panel.
 
         Only generated assets carry the fields their run used; an imported asset
@@ -2785,7 +2801,7 @@ class PaintApp:
         """
         if self.current is None or not hasattr(self, "gen"):
             return
-        asset = self._asset_at(index)
+        asset = self._asset_by_id(asset_id)
         if asset is None or asset.source != "generated":
             return
         settings = getattr(asset, "settings", None)
@@ -2806,11 +2822,11 @@ class PaintApp:
             self.tools.refresh_layout_settings()
             self._sync_layout_overlay()
 
-    def insert_asset(self, index):
+    def insert_asset(self, asset_id):
         """Insert an asset onto a new layer above the active one."""
-        self._insert_asset_above(index, self.active + 1)
+        self._insert_asset_above(asset_id, self.active + 1)
 
-    def insert_asset_at_layer(self, index, layer_index):
+    def insert_asset_at_layer(self, asset_id, layer_index):
         """Insert an asset onto a new layer above the layer at ``layer_index``.
 
         Used when an asset is dragged out of the Assets panel and dropped on a
@@ -2820,15 +2836,15 @@ class PaintApp:
         if not (0 <= layer_index < len(self.layers)):
             return
         self._insert_asset_above(
-            index, layer_index + 1, above=self.layers[layer_index].name
+            asset_id, layer_index + 1, above=self.layers[layer_index].name
         )
 
-    def _insert_asset_above(self, index, position, above=None):
-        """Add a layer at ``position`` holding the asset at ``index``."""
+    def _insert_asset_above(self, asset_id, position, above=None):
+        """Add a layer at ``position`` holding the asset with ``asset_id``."""
         if self.current is None:
             self.set_result("There is no canvas to insert into.")
             return
-        asset = self._asset_at(index)
+        asset = self._asset_by_id(asset_id)
         if asset is None:
             return
         self._push_undo("Insert asset")
@@ -2858,14 +2874,14 @@ class PaintApp:
         buffer.paste(image, (x, y), image)
         return buffer
 
-    def _drag_asset_over_layer(self, index, x_root, y_root):
+    def _drag_asset_over_layer(self, asset_id, x_root, y_root):
         """While an asset is dragged, tint the layer row under the pointer."""
         if not hasattr(self, "layer_panel") or self.current is None:
             return
         target = self.layer_panel.layer_row_at(x_root, y_root)
         self.layer_panel.set_drop_target(target)
 
-    def _drop_asset_on_layer(self, index, x_root, y_root):
+    def _drop_asset_on_layer(self, asset_id, x_root, y_root):
         """Drop an asset dragged from the Assets panel onto a layer or canvas.
 
         A release on a layer row (or one of its filter/text rows) inserts the
@@ -2879,9 +2895,9 @@ class PaintApp:
             target = self.layer_panel.layer_row_at(x_root, y_root)
             self.layer_panel.set_drop_target(None)
         if target is not None:
-            self.insert_asset_at_layer(index, target)
+            self.insert_asset_at_layer(asset_id, target)
         elif self._drop_over_canvas(x_root, y_root):
-            self.insert_asset(index)
+            self.insert_asset(asset_id)
 
     def _drop_over_canvas(self, x_root, y_root):
         """True when ``(x_root, y_root)`` is inside the active canvas view."""
@@ -2897,9 +2913,9 @@ class PaintApp:
             return False
         return left <= x_root <= right and top <= y_root <= bottom
 
-    def save_asset(self, index):
+    def save_asset(self, asset_id):
         """Save an asset's pixels to an image file."""
-        asset = self._asset_at(index)
+        asset = self._asset_by_id(asset_id)
         if asset is None:
             return
         path = filedialog.asksaveasfilename(
@@ -2931,9 +2947,9 @@ class PaintApp:
         self.submit_project_job("export", f"Save {name}", runner, finisher)
         self.set_result(f"Saving {name}\u2026")
 
-    def rename_asset(self, index):
+    def rename_asset(self, asset_id):
         """Rename an asset (its label only; pixels are untouched)."""
-        asset = self._asset_at(index)
+        asset = self._asset_by_id(asset_id)
         if asset is None:
             return
         name = dialogs.ask_string(
@@ -2947,35 +2963,200 @@ class PaintApp:
         self._set_modified(True)
         asset.name = name
         self._refresh_asset_list()
-        self._select_asset(asset)
+        self._select_asset(asset, reveal=False)
 
-    def delete_asset(self, index):
-        """Remove an asset from the project."""
-        asset = self._asset_at(index)
-        if asset is None:
+    def delete_assets(self, asset_ids):
+        """Remove one or more assets from the project after one confirmation."""
+        assets = self._assets_by_ids(asset_ids)
+        if not assets:
             return
-        if not dialogs.ask_yes_no(
-            self.root, "Delete Asset", f"Delete the asset '{asset.name}'?",
-        ):
+        if len(assets) == 1:
+            message = f"Delete the asset '{assets[0].name}'?"
+        else:
+            message = f"Delete {len(assets)} assets?"
+        if not dialogs.ask_yes_no(self.root, "Delete Assets", message):
             return
         self._set_modified(True)
-        self.current.remove_asset(asset)
+        for asset in assets:
+            self.asset_library.remove_asset(asset)
+        self._refresh_asset_list()
+        self.set_result(
+            f"Deleted 1 asset." if len(assets) == 1
+            else f"Deleted {len(assets)} assets."
+        )
+
+    def create_asset_group(self, name=None):
+        """Create an asset group, asking for a name when none is supplied."""
+        if name is None:
+            default = f"Group {self.asset_library.group_counter + 1}"
+            name = dialogs.ask_string(
+                self.root, "New Asset Group", "Group name:", initialvalue=default,
+            )
+            if name is None:
+                return None
+        name = name.strip()
+        if not name:
+            return None
+        group = self.asset_library.new_group(name)
+        self._set_modified(True)
+        self._refresh_asset_list()
+        self.set_result(f"Created asset group '{group.name}'.")
+        return group
+
+    def rename_asset_group(self, group_id):
+        """Give an asset group a new label."""
+        group = self.asset_library.find_group(group_id)
+        if group is None:
+            return
+        name = dialogs.ask_string(
+            self.root, "Rename Asset Group", "Group name:",
+            initialvalue=group.name,
+        )
+        if name is None:
+            return
+        name = name.strip()
+        if not name or name == group.name:
+            return
+        self._set_modified(True)
+        group.name = name
+        self._refresh_asset_list()
+        self.set_result(f"Renamed group to '{name}'.")
+
+    def delete_asset_group(self, group_id):
+        """Delete a group; its assets return to the ungrouped set."""
+        group = self.asset_library.find_group(group_id)
+        if group is None:
+            return
+        if not dialogs.ask_yes_no(
+            self.root, "Delete Asset Group",
+            f"Delete the group '{group.name}'?\n\n"
+            "Its assets will move to Ungrouped.",
+        ):
+            return
+        moved = self.asset_library.remove_group(group)
+        self._set_modified(True)
+        self._refresh_asset_list()
+        suffix = f" {moved} asset{'s' if moved != 1 else ''} moved to Ungrouped."
+        self.set_result(f"Deleted group '{group.name}'.{suffix}")
+
+    def move_assets_to_group(self, asset_ids, group_id):
+        """Move assets into a group (``None`` means ungrouped)."""
+        assets = self._assets_by_ids(asset_ids)
+        if not assets:
+            return
+        group = self.asset_library.find_group(group_id)
+        if group_id is not None and group is None:
+            group_id = None
+        for asset in assets:
+            self.asset_library.move_asset(asset, group_id)
+        self._set_modified(True)
+        self._refresh_asset_list()
+        label = group.name if group is not None else "Ungrouped"
+        self.set_result(
+            f"Moved 1 asset to {label}." if len(assets) == 1
+            else f"Moved {len(assets)} assets to {label}."
+        )
+
+    def reorder_assets(self, asset_ids, group_id, before_asset_id=None):
+        """Reorder assets inside ``group_id``, before ``before_asset_id``."""
+        assets = self._assets_by_ids(asset_ids)
+        if not assets:
+            return
+        before = self._asset_by_id(before_asset_id)
+        if before in assets:
+            before = None
+        group = self.asset_library.find_group(group_id)
+        if group_id is not None and group is None:
+            group_id = None
+        for asset in assets:
+            self.asset_library.move_asset(asset, group_id, before=before)
+        self._set_modified(True)
         self._refresh_asset_list()
 
-    def _asset_at(self, index):
-        """The asset at ``index`` on the active canvas, or ``None``."""
-        if index is None:
+    def move_asset_group(self, group_id, before_group_id=None):
+        """Reorder a group in the Assets panel."""
+        group = self.asset_library.find_group(group_id)
+        if group is None:
+            return
+        before = self.asset_library.find_group(before_group_id)
+        if before is group:
+            before = None
+        self.asset_library.move_group(group, before=before)
+        self._set_modified(True)
+        self._refresh_asset_list()
+
+    def set_asset_group_collapsed(self, group_id, collapsed):
+        """Remember a group's collapsed state in the project (no refresh)."""
+        group = self.asset_library.find_group(group_id)
+        if group is None or group.collapsed == bool(collapsed):
+            return
+        group.collapsed = bool(collapsed)
+        self._set_modified(True)
+
+    def toggle_asset_favorite(self, asset_ids):
+        """Flip the favorite flag on every selected asset."""
+        assets = self._assets_by_ids(asset_ids)
+        if not assets:
+            return
+        favorite = not all(asset.favorite for asset in assets)
+        for asset in assets:
+            asset.favorite = favorite
+        self._set_modified(True)
+        self._refresh_asset_list()
+        word = "Added" if favorite else "Removed"
+        self.set_result(f"{word} favorite on {len(assets)} asset"
+                        f"{'s' if len(assets) != 1 else ''}.")
+
+    def edit_asset_tags(self, asset_ids):
+        """Edit the comma-separated tag list of one or more assets."""
+        assets = self._assets_by_ids(asset_ids)
+        if not assets:
+            return
+        if len(assets) == 1:
+            initial = ", ".join(assets[0].tags)
+        else:
+            # Offer the tags every selected asset already shares, so accepting
+            # the dialog does not silently add tags to just some of them.
+            first = assets[0].tags
+            lower = [{tag.casefold() for tag in asset.tags} for asset in assets[1:]]
+            initial = ", ".join(
+                tag for tag in first
+                if all(tag.casefold() in other for other in lower)
+            )
+        text = dialogs.ask_string(
+            self.root, "Edit Asset Tags", "Tags (comma separated):",
+            initialvalue=initial,
+        )
+        if text is None:
+            return
+        tags = normalize_tags(text.split(","))
+        for asset in assets:
+            asset.tags = tags
+        self._set_modified(True)
+        self._refresh_asset_list()
+        self.set_result(
+            f"Updated tags on 1 asset." if len(assets) == 1
+            else f"Updated tags on {len(assets)} assets."
+        )
+
+    def _asset_by_id(self, asset_id):
+        """The asset with ``asset_id``, or ``None``."""
+        if asset_id is None:
             return None
-        assets = self.asset_library.assets
-        if 0 <= index < len(assets):
-            return assets[index]
-        return None
+        return self.asset_library.find_by_id(asset_id)
+
+    def _assets_by_ids(self, asset_ids):
+        """Resolve ids to assets, in library (manual) order, without duplicates."""
+        wanted = set(asset_ids or [])
+        if not wanted:
+            return []
+        return [asset for asset in self.asset_library.assets if asset.id in wanted]
 
     def selected_asset(self):
         """The asset highlighted in the Assets panel, or ``None``."""
         if not hasattr(self, "assets_panel"):
             return None
-        return self._asset_at(self.assets_panel.selected_index())
+        return self._asset_by_id(self.assets_panel.selected_asset_id())
 
     def _validate_group_sel(self):
         """Drop the group selection when it no longer belongs to the canvas."""
@@ -6489,9 +6670,12 @@ class PaintApp:
             self.set_result("Clipboard is empty.")
             return
         self._set_modified(True)
-        asset = self.current.add_asset(name=name, image=image, source="imported")
+        asset = self.current.add_asset(
+            name=name, image=image, source="imported",
+            group=self._target_asset_group(),
+        )
         self._refresh_asset_list()
-        self._select_asset(asset)
+        self._select_asset(asset, reveal=True)
         self.set_result(f"Pasted '{asset.name}' into assets.")
 
     def _paste_external_image(self, data=None, dest=None, fit=None):
@@ -9566,10 +9750,10 @@ class PaintApp:
         if output == OUTPUT_ASSETS:
             asset = doc.add_asset(
                 name=name, image=image, source="generated", prompt=prompt,
-                settings=settings,
+                settings=settings, group=self._target_asset_group(),
             )
             self._show_doc(doc)
-            self._select_asset(asset)
+            self._select_asset(asset, reveal=True)
             self.statusbar.set_status("generated")
             self.set_result(
                 f"Generated {result.width} x {result.height} image into assets."
@@ -9826,7 +10010,7 @@ class PaintApp:
         )
 
     # --------------------------------------------------------- asset preview
-    def preview_asset(self, index):
+    def preview_asset(self, asset_id):
         """Show an asset in the canvas viewport for review before inserting it.
 
         Nothing is written to the document until the user accepts the preview:
@@ -9838,7 +10022,7 @@ class PaintApp:
         if self.current is None:
             self.set_result("There is no canvas to preview an asset on.")
             return
-        asset = self._asset_at(index)
+        asset = self._asset_by_id(asset_id)
         if asset is None:
             return
         doc = self.current
@@ -9903,7 +10087,7 @@ class PaintApp:
         self._clear_generation_preview()
         if asset not in doc.assets:
             return
-        self.insert_asset(doc.assets.index(asset))
+        self.insert_asset(asset.id)
 
     # ------------------------------------------------------------ segment (AI)
     def start_segment(self, x, y):
