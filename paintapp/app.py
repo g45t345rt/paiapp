@@ -6961,7 +6961,8 @@ class PaintApp:
         elif tools.paste_tool:
             status = "paste: paste the clipboard, or set the paste options"
         elif tools.arrow_tool:
-            status = "no tool: pick a tool from the toolbar"
+            status = ("no tool: click a layer on the canvas to select it; "
+                      "Alt-click cycles through overlapping layers")
         elif tools.select_tool:
             if getattr(tools, "select_transform", False):
                 status = ("select (transform): drag the handles to scale, "

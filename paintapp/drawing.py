@@ -2209,7 +2209,9 @@ class ToolsPanel(tk.Frame):
     # ------------------------------------------------------------- arrow tool
     def _settings_for_arrow(self):
         tk.Label(self.settings,
-                 text="No tool selected. Pick a tool to start drawing.",
+                 text="No tool selected. Click a layer on the canvas to select "
+                      "it; Alt-click cycles through overlapping layers, or "
+                      "pick a tool to start drawing.",
                  anchor="w", fg="#888888", wraplength=210,
                  justify="left").pack(fill=tk.X)
 
@@ -4800,6 +4802,67 @@ class DrawingController:
             return True
         return False
 
+    def _layers_at(self, x, y):
+        """Indices of visible layers with a pixel under ``(x, y)``, top first.
+
+        Layers are searched front to back, so the first index is the layer drawn
+        on top. Hidden layers, members of a hidden (or fully transparent) group,
+        and layers that are transparent at the point are skipped, so clicking
+        empty space never selects a layer the user cannot see.
+        """
+        doc = self.app.current
+        if doc is None:
+            return []
+        hits = []
+        for index in range(len(doc.layers) - 1, -1, -1):
+            layer = doc.layers[index]
+            if not self._layer_visible(layer) or layer.opacity <= 0.0:
+                continue
+            group = getattr(layer, "group", None)
+            if group is not None and getattr(group, "opacity", 1.0) <= 0.0:
+                continue
+            image = layer.composited_image()
+            ox, oy = layer.offset
+            px = int(x) - ox
+            py = int(y) - oy
+            if not (0 <= px < image.width and 0 <= py < image.height):
+                continue
+            if image.getpixel((px, py))[3]:
+                hits.append(index)
+        return hits
+
+    def _layer_at(self, x, y):
+        """Index of the topmost visible layer with a pixel under ``(x, y)``."""
+        hits = self._layers_at(x, y)
+        return hits[0] if hits else None
+
+    def _arrow_press(self, x, y, cycle=False):
+        """Select the layer under an Arrow-tool click, mirroring the list.
+
+        A plain click picks the topmost layer under the pointer, like the Move
+        tools in Photoshop and other paint apps. ``cycle`` (Alt+click) walks to
+        the next layer below the active one at that spot and wraps around after
+        the bottom, so stacked layers can be reached without the Layers panel.
+        """
+        hits = self._layers_at(x, y)
+        if not hits:
+            return
+        if cycle and self.app.active in hits:
+            index = hits[(hits.index(self.app.active) + 1) % len(hits)]
+        else:
+            index = hits[0]
+        if index == self.app.active:
+            return
+        doc = self.app.current
+        layer = doc.layers[index] if doc is not None else None
+        self.app._on_layer_select(index)
+        panel = getattr(self.app, "layer_panel", None)
+        if panel is not None:
+            panel.select_layer(index)
+        self.app.render()
+        if layer is not None:
+            self.app.set_result(f"Selected layer '{layer.name}'.")
+
     def on_press(self, event):
         if self._preview_showing(event):
             return
@@ -4840,6 +4903,7 @@ class DrawingController:
         if tools.paste_tool:
             return
         if tools.arrow_tool:
+            self._arrow_press(x, y, cycle=bool(event.state & ALT_STATE_MASK))
             return
         if tools.layout_tool:
             self._layout_press(x, y)
