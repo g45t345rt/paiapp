@@ -10,11 +10,17 @@ plus a clockwise ``rotation`` in degrees::
 
     {"text", "family", "size", "bold", "italic", "color", "align",
      "rotation", "line_spacing", "letter_spacing", "stroke", "shadow",
-     "width", "wrap", "x", "y"}
+     "width", "wrap", "x", "y", "case", "underline", "strikethrough",
+     "paragraph_spacing", "opacity"}
 
 ``line_spacing`` is extra leading as a fraction of the size, ``letter_spacing``
-is extra pixels between glyphs, ``stroke`` is ``{"color", "width"}`` or ``None``
-and ``shadow`` is ``{"color", "dx", "dy", "blur"}`` or ``None``.
+is extra pixels between glyphs, ``paragraph_spacing`` is extra pixels between
+paragraphs, ``stroke`` is ``{"color", "width"}`` or ``None`` and ``shadow`` is
+``{"color", "dx", "dy", "blur"}`` or ``None``. ``case`` is one of
+:data:`CASE_MODES` and changes how glyphs are drawn without altering the stored
+text (caret offsets stay valid). ``align`` also accepts ``"justify"``, which
+stretches every row but the last of a paragraph across the layout box.
+``opacity`` is a percentage applied to the fill, outline and shadow.
 
 ``width`` is the fixed layout box in document pixels (``0`` hugs the longest
 line). When a box is set, ``align`` centres or right-aligns within it, and with
@@ -38,7 +44,8 @@ from .constants import rgba
 MIN_SIZE = 4
 MAX_SIZE = 1000
 DEFAULT_SIZE = 48
-ALIGNMENTS = ("left", "center", "right")
+ALIGNMENTS = ("left", "center", "right", "justify")
+CASE_MODES = ("normal", "upper", "lower", "title")
 
 # Extra pixels between lines, as a fraction of the font size, when a spec does
 # not ask for its own leading.
@@ -46,6 +53,8 @@ DEFAULT_LINE_SPACING = 0.15
 MAX_STROKE = 100
 MAX_BLUR = 100
 MAX_OFFSET = 2000
+MAX_PARAGRAPH_SPACING = 1000
+MAX_OPACITY = 100
 
 # Fixed layout box limits. ``width`` of 0 means the box hugs the longest line.
 MAX_WIDTH = 20000.0
@@ -119,6 +128,19 @@ def normalize(spec):
     except (TypeError, ValueError):
         track = 0.0
     track = max(-0.5 * size, min(2.0 * size, track))
+    case = str(spec.get("case") or "normal").lower()
+    if case not in CASE_MODES:
+        case = "normal"
+    try:
+        paragraph = int(round(float(spec.get("paragraph_spacing", 0) or 0)))
+    except (TypeError, ValueError):
+        paragraph = 0
+    paragraph = max(0, min(MAX_PARAGRAPH_SPACING, paragraph))
+    try:
+        opacity = int(round(float(spec.get("opacity", MAX_OPACITY))))
+    except (TypeError, ValueError):
+        opacity = MAX_OPACITY
+    opacity = max(0, min(MAX_OPACITY, opacity))
     try:
         width = float(spec.get("width", 0.0) or 0.0)
     except (TypeError, ValueError):
@@ -140,6 +162,11 @@ def normalize(spec):
         "rotation": rotation,
         "line_spacing": leading,
         "letter_spacing": track,
+        "paragraph_spacing": paragraph,
+        "case": case,
+        "underline": bool(spec.get("underline", False)),
+        "strikethrough": bool(spec.get("strikethrough", False)),
+        "opacity": opacity,
         "stroke": _norm_stroke(spec.get("stroke")),
         "shadow": _norm_shadow(spec.get("shadow")),
         "width": width,
@@ -163,13 +190,17 @@ def clone(spec):
 def new_spec(text, x, y, family=None, size=DEFAULT_SIZE, bold=False,
              italic=False, color="#000000", align="left", rotation=0.0,
              line_spacing=DEFAULT_LINE_SPACING, letter_spacing=0.0,
-             stroke=None, shadow=None, width=0.0, wrap=False):
+             stroke=None, shadow=None, width=0.0, wrap=False,
+             case="normal", underline=False, strikethrough=False,
+             paragraph_spacing=0, opacity=MAX_OPACITY):
     """Build a normalised text object anchored at document ``(x, y)``."""
     return normalize({
         "text": text, "family": family, "size": size, "bold": bold,
         "italic": italic, "color": color, "align": align, "rotation": rotation,
         "line_spacing": line_spacing, "letter_spacing": letter_spacing,
         "stroke": stroke, "shadow": shadow, "width": width, "wrap": wrap,
+        "case": case, "underline": underline, "strikethrough": strikethrough,
+        "paragraph_spacing": paragraph_spacing, "opacity": opacity,
         "x": x, "y": y,
     })
 
@@ -208,6 +239,64 @@ def letter_spacing(spec):
         return float(spec.get("letter_spacing", 0.0) or 0.0)
     except (TypeError, ValueError):
         return 0.0
+
+
+def paragraph_spacing(spec):
+    """Extra pixels inserted between paragraphs."""
+    try:
+        return max(0, min(MAX_PARAGRAPH_SPACING,
+                          int(round(float(spec.get("paragraph_spacing", 0) or 0)))))
+    except (TypeError, ValueError):
+        return 0
+
+
+def opacity(spec):
+    """The text's opacity as a 0-1 fraction."""
+    try:
+        value = int(round(float(spec.get("opacity", MAX_OPACITY))))
+    except (TypeError, ValueError):
+        value = MAX_OPACITY
+    return max(0, min(MAX_OPACITY, value)) / float(MAX_OPACITY)
+
+
+def case_mode(spec):
+    """The spec's case transform, normalised to one of :data:`CASE_MODES`."""
+    mode = str(spec.get("case") or "normal").lower()
+    return mode if mode in CASE_MODES else "normal"
+
+
+def _case_char(char, mode):
+    """Map one character, keeping it unchanged when the mapping changes length.
+
+    Upper-casing can expand a character (``ß`` becomes ``SS``); keeping the
+    original then means the rendered string stays the same length as the stored
+    text, so caret offsets and selections still line up.
+    """
+    mapped = char.upper() if mode == "upper" else char.lower()
+    return mapped if len(mapped) == 1 else char
+
+
+def display_text(spec):
+    """``spec``'s text with its case transform applied, preserving length."""
+    text = spec.get("text", "")
+    mode = case_mode(spec)
+    if mode == "normal":
+        return text
+    if mode == "title":
+        result = []
+        word_start = True
+        for char in text:
+            if char.isalnum():
+                result.append(_case_char(char, "upper" if word_start else "lower"))
+                word_start = False
+            else:
+                result.append(char)
+                # Keep apostrophes inside the word ("don't", "O'Neill") while
+                # punctuation and spaces start a new one.
+                if char not in "'\u2019" and not _is_combining(char):
+                    word_start = True
+        return "".join(result)
+    return "".join(_case_char(char, mode) for char in text)
 
 
 def box_width(spec):
@@ -280,11 +369,6 @@ def _metrics(font, spec):
         return size * 0.8, size * 0.2
 
 
-def _line_advance(font, spec):
-    ascent, descent = _metrics(font, spec)
-    return ascent + descent + line_spacing(spec)
-
-
 def _prefix_width(font, prefix, track):
     """Width of a partial line including its inter-glyph tracking.
 
@@ -350,13 +434,14 @@ def _wrap_segment(font, line, max_width, track):
 
 
 def visual_lines(spec):
-    """The laid-out rows, as ``{"text", "start"}`` with ``start`` a caret index.
+    """The laid-out rows, as ``{"text", "start", "para_end"}``.
 
-    A single logical line becomes several rows when wrapping is on and the box
-    is narrower than the text; ``start`` always indexes the spec's full ``text``
-    so a caret offset can be located in any row.
+    ``start`` is a caret index into the spec's full ``text`` so a caret offset
+    can be located in any row. ``para_end`` marks the last visual row of a
+    logical line, which is where paragraph spacing goes and where justification
+    stops stretching.
     """
-    text = spec.get("text", "")
+    text = display_text(spec)
     font = load_font(spec)
     track = letter_spacing(spec)
     width = box_width(spec)
@@ -366,9 +451,35 @@ def visual_lines(spec):
     for logical in text.split("\n"):
         pieces = _wrap_segment(font, logical, width, track) if wrap else [(0, logical)]
         for offset, chunk in pieces:
-            rows.append({"text": chunk, "start": cursor + offset})
+            rows.append({
+                "text": chunk,
+                "start": cursor + offset,
+                "para_end": offset + len(chunk) >= len(logical),
+            })
         cursor += len(logical) + 1
     return rows
+
+
+def _row_tops(spec, rows):
+    """Top offsets of ``rows`` plus the block height and base line advance.
+
+    Paragraph spacing is inserted after the last visual row of each logical
+    line, so wrapped rows stay tight while paragraphs breathe. The returned
+    height is measured from the first row's top to the last row's bottom.
+    """
+    font = load_font(spec)
+    ascent, descent = _metrics(font, spec)
+    advance = ascent + descent + line_spacing(spec)
+    gap = paragraph_spacing(spec)
+    tops = []
+    y = 0.0
+    for index, row in enumerate(rows):
+        tops.append(y)
+        y += advance
+        if row.get("para_end") and index < len(rows) - 1:
+            y += gap
+    height = tops[-1] + ascent + descent if tops else 0.0
+    return tops, height, advance
 
 
 # --------------------------------------------------------------- geometry
@@ -399,10 +510,11 @@ def transform(spec, matrix):
     """Map a text object through an affine ``matrix`` (in place).
 
     The anchor moves as a point, the block's rotation picks up the matrix's
-    rotation, and the font size (with the pixel-valued tracking and wrap width)
-    scales by :func:`matrix_scale`-style ``sqrt(|det|)``. This is exact for a
-    similarity (translate/rotate/uniform-scale) transform; a skew or non-uniform
-    scale is approximated by that single scalar, since a text block has one size.
+    rotation, and the font size (with the pixel-valued tracking, paragraph
+    spacing and wrap width) scales by :func:`matrix_scale`-style
+    ``sqrt(|det|)``. This is exact for a similarity (translate/rotate/uniform-
+    scale) transform; a skew or non-uniform scale is approximated by that single
+    scalar, since a text block has one size.
     """
     a, b, c, d, e, f = matrix
     x = float(spec.get("x", 0.0) or 0.0)
@@ -417,7 +529,7 @@ def transform(spec, matrix):
                 1, int(round(int(spec.get("size", DEFAULT_SIZE)) * scale)))
         except (TypeError, ValueError):
             pass
-        for key in ("letter_spacing", "width"):
+        for key in ("letter_spacing", "paragraph_spacing", "width"):
             try:
                 value = float(spec.get(key, 0.0) or 0.0)
             except (TypeError, ValueError):
@@ -440,8 +552,9 @@ def local_rect(spec):
     if width < 1:
         width = max(3.0, _length(font, " "))
     ascent, descent = _metrics(font, spec)
-    gap = line_spacing(spec)
-    height = (len(rows) - 1) * (ascent + descent + gap) + ascent + descent
+    _tops, height, _advance = _row_tops(spec, rows)
+    if not rows:
+        height = ascent + descent
     return (0.0, 0.0, float(width), float(height))
 
 
@@ -542,6 +655,35 @@ def _align_offset(align, box_width, line_width):
     return 0.0
 
 
+def _justify_space(spec, row, line_width, max_width):
+    """Extra pixels added after each space to justify ``row``.
+
+    Justification needs a layout box and skips the last row of a paragraph, so
+    paragraph endings stay ragged. A row without spaces cannot stretch and is
+    left as-is.
+    """
+    if spec.get("align") != "justify" or box_width(spec) <= 0:
+        return 0.0
+    if row.get("para_end"):
+        return 0.0
+    spaces = row.get("text", "").count(" ")
+    if spaces <= 0:
+        return 0.0
+    return max(0.0, max_width - line_width) / spaces
+
+
+def _row_offset(spec, line_width, max_width):
+    """Left edge of a row; justified rows always start at the box edge."""
+    if spec.get("align") == "justify":
+        return 0.0
+    return _align_offset(spec.get("align", "left"), max_width, line_width)
+
+
+def _justified_prefix_width(font, prefix, track, per_space):
+    """Advance width of ``prefix`` including its share of justification."""
+    return _prefix_width(font, prefix, track) + per_space * prefix.count(" ")
+
+
 def _caret_row(rows, caret):
     """Index of the laid-out row holding ``caret`` (the later row on a break)."""
     index = 0
@@ -555,7 +697,7 @@ def _caret_row(rows, caret):
 
 def caret_point(spec, caret):
     """``(dx, dy, height)`` of the caret for ``caret``, in local space."""
-    text = spec.get("text", "")
+    text = display_text(spec)
     try:
         caret = int(caret)
     except (TypeError, ValueError):
@@ -567,38 +709,49 @@ def caret_point(spec, caret):
     widths = [_prefix_width(font, row["text"], track) for row in rows]
     box = box_width(spec)
     max_width = box if box > 0 else (max(widths) if widths else 0.0)
+    tops, _height, _advance = _row_tops(spec, rows)
     index = _caret_row(rows, caret)
     row = rows[index] if rows else {"text": "", "start": 0}
     line_width = widths[index] if index < len(widths) else 0.0
+    per_space = _justify_space(spec, row, line_width, max_width)
     col = max(0, min(caret - row["start"], len(row["text"])))
-    dx = _prefix_width(font, row["text"][:col], track)
-    dx += _align_offset(spec.get("align", "left"), max_width, line_width)
+    dx = _justified_prefix_width(font, row["text"][:col], track, per_space)
+    dx += _row_offset(spec, line_width, max_width)
     ascent, descent = _metrics(font, spec)
-    advance = ascent + descent + line_spacing(spec)
-    return dx, index * advance, ascent + descent
+    dy = tops[index] if index < len(tops) else 0.0
+    return dx, dy, ascent + descent
 
 
 def caret_from_point(spec, x, y):
     """The caret index nearest document ``(x, y)`` (used when clicking the text)."""
     font = load_font(spec)
     track = letter_spacing(spec)
-    advance = _line_advance(font, spec)
     lx, ly = to_local(spec, x, y)
     rows = visual_lines(spec)
     if not rows:
         return 0
-    index = int(ly // advance) if advance > 0 else 0
-    index = max(0, min(len(rows) - 1, index))
-    row = rows[index]
-    line = row["text"]
     widths = [_prefix_width(font, item["text"], track) for item in rows]
     box = box_width(spec)
     max_width = box if box > 0 else (max(widths) if widths else 0.0)
-    rel_x = lx - _align_offset(spec.get("align", "left"), max_width, widths[index])
+    tops, _height, _advance = _row_tops(spec, rows)
+    index = 0
+    for position, top in enumerate(tops):
+        if ly >= top:
+            index = position
+        else:
+            break
+    index = max(0, min(len(rows) - 1, index))
+    row = rows[index]
+    line = row["text"]
+    line_width = widths[index]
+    per_space = _justify_space(spec, row, line_width, max_width)
+    rel_x = lx - _row_offset(spec, line_width, max_width)
     best = None
     col = 0
     for position in range(len(line) + 1):
-        distance = abs(_prefix_width(font, line[:position], track) - rel_x)
+        distance = abs(
+            _justified_prefix_width(font, line[:position], track, per_space) - rel_x
+        )
         if best is None or distance < best:
             best = distance
             col = position
@@ -686,7 +839,7 @@ def caret_vertical(spec, caret, direction):
     across soft-wrapped rows because it walks the laid-out rows, not logical
     lines.
     """
-    text = spec.get("text", "")
+    text = display_text(spec)
     caret = max(0, min(len(text), int(caret)))
     rows = visual_lines(spec)
     if not rows:
@@ -696,19 +849,21 @@ def caret_vertical(spec, caret, direction):
     widths = [_prefix_width(font, row["text"], track) for row in rows]
     box = box_width(spec)
     max_width = box if box > 0 else (max(widths) if widths else 0.0)
-    align = spec.get("align", "left")
     index = _caret_row(rows, caret)
     target = index + (1 if direction > 0 else -1)
     if target < 0 or target >= len(rows):
         return caret
     current_x, _dy, _height = caret_point(spec, caret)
     row = rows[target]
-    offset = _align_offset(align, max_width, widths[target])
+    line_width = widths[target]
+    per_space = _justify_space(spec, row, line_width, max_width)
+    offset = _row_offset(spec, line_width, max_width)
     best = None
     col = 0
     for position in range(len(row["text"]) + 1):
         distance = abs(
-            offset + _prefix_width(font, row["text"][:position], track) - current_x
+            offset + _justified_prefix_width(
+                font, row["text"][:position], track, per_space) - current_x
         )
         if best is None or distance < best:
             best = distance
@@ -724,7 +879,7 @@ def selection_rects(spec, start, end):
     own. A selected line break adds a small sliver past the end of the row so
     the newline is visible.
     """
-    text = spec.get("text", "")
+    text = display_text(spec)
     start, end = sorted((int(start), int(end)))
     start = max(0, min(len(text), start))
     end = max(0, min(len(text), end))
@@ -736,9 +891,8 @@ def selection_rects(spec, start, end):
     widths = [_prefix_width(font, row["text"], track) for row in rows]
     box = box_width(spec)
     max_width = box if box > 0 else (max(widths) if widths else 0.0)
-    align = spec.get("align", "left")
     ascent, descent = _metrics(font, spec)
-    advance = ascent + descent + line_spacing(spec)
+    tops, _block_height, _advance = _row_tops(spec, rows)
     height = ascent + descent
     break_width = max(_length(font, " "), 2.0)
     quads = []
@@ -754,12 +908,16 @@ def selection_rects(spec, start, end):
         )
         if lo >= hi and not covers_break:
             continue
-        offset = _align_offset(align, max_width, widths[index])
-        x0 = offset + _prefix_width(font, line[:lo - row_start], track)
-        x1 = offset + _prefix_width(font, line[:hi - row_start], track)
+        line_width = widths[index]
+        per_space = _justify_space(spec, row, line_width, max_width)
+        offset = _row_offset(spec, line_width, max_width)
+        x0 = offset + _justified_prefix_width(
+            font, line[:lo - row_start], track, per_space)
+        x1 = offset + _justified_prefix_width(
+            font, line[:hi - row_start], track, per_space)
         if covers_break:
             x1 += break_width
-        y0 = index * advance
+        y0 = tops[index] if index < len(tops) else 0.0
         y1 = y0 + height
         quads.append([
             to_doc(spec, x0, y0), to_doc(spec, x1, y0),
@@ -797,24 +955,31 @@ def session_geometry(spec, caret, anchor=None, pivot=None):
 # ----------------------------------------------------------------- render
 def _draw_lines(draw, spec, origin, fill, stroke_fill=None, stroke_width=0):
     """Draw ``spec``'s laid-out rows with tracking and stroke, at ``origin``."""
-    text = spec.get("text", "")
+    text = display_text(spec)
     if not text:
         return
     font = load_font(spec)
     track = letter_spacing(spec)
     rows = visual_lines(spec)
-    ascent, descent = _metrics(font, spec)
-    advance = ascent + descent + line_spacing(spec)
+    ascent, _descent = _metrics(font, spec)
     widths = [_prefix_width(font, row["text"], track) for row in rows]
     box = box_width(spec)
     max_width = box if box > 0 else (max(widths) if widths else 0.0)
-    align = spec.get("align", "left")
+    tops, _height, _advance = _row_tops(spec, rows)
+    underline = bool(spec.get("underline"))
+    strike = bool(spec.get("strikethrough"))
+    size = int(spec.get("size", DEFAULT_SIZE))
+    thickness = max(1, int(round(size / 14.0)))
+    underline_offset = max(1.0, size * 0.08)
+    strike_offset = ascent * 0.55
     ox, oy = origin
     for index, row in enumerate(rows):
         line = row["text"]
-        y = oy + index * advance
-        x = ox + _align_offset(align, max_width, widths[index])
-        if track == 0:
+        line_width = widths[index]
+        per_space = _justify_space(spec, row, line_width, max_width)
+        x = ox + _row_offset(spec, line_width, max_width)
+        y = oy + (tops[index] if index < len(tops) else 0.0)
+        if track == 0 and per_space == 0:
             draw.text(
                 (x, y), line, font=font, fill=fill,
                 stroke_width=stroke_width, stroke_fill=stroke_fill,
@@ -834,12 +999,25 @@ def _draw_lines(draw, spec, origin, fill, stroke_fill=None, stroke_width=0):
                         stroke_width=stroke_width, stroke_fill=stroke_fill,
                     )
                     cursor += _cluster_width(font, cluster) + track
+                    if cluster == " ":
+                        cursor += per_space
                 cluster = char
             if cluster:
                 draw.text(
                     (cursor, y), cluster, font=font, fill=fill,
                     stroke_width=stroke_width, stroke_fill=stroke_fill,
                 )
+        drawn_width = line_width + per_space * line.count(" ")
+        if drawn_width <= 0:
+            continue
+        if underline:
+            uy = y + ascent + underline_offset
+            draw.line([(x, uy), (x + drawn_width, uy)],
+                      fill=fill, width=thickness)
+        if strike:
+            sy = y + strike_offset
+            draw.line([(x, sy), (x + drawn_width, sy)],
+                      fill=fill, width=thickness)
 
 
 def _compose_sprite(spec):
@@ -857,10 +1035,11 @@ def _compose_sprite(spec):
     origin = (pad - x0, pad - y0)
 
     block = Image.new("RGBA", (block_w, block_h), (0, 0, 0, 0))
+    alpha = int(round(255 * opacity(spec)))
     _draw_lines(
         ImageDraw.Draw(block), spec, origin,
-        rgba(spec.get("color", "#000000")),
-        stroke_fill=rgba(stroke["color"]) if stroke else None,
+        rgba(spec.get("color", "#000000"), alpha),
+        stroke_fill=rgba(stroke["color"], alpha) if stroke else None,
         stroke_width=stroke_width,
     )
     anchor_px = (pad - x0, pad - y0)
@@ -872,7 +1051,10 @@ def _compose_sprite(spec):
     margin = int(math.ceil(max(abs(dx), abs(dy)) + blur * 2)) + 2
     sprite = Image.new("RGBA", (block_w + 2 * margin, block_h + 2 * margin), (0, 0, 0, 0))
     shadow_img = Image.new("RGBA", (block_w, block_h), (0, 0, 0, 0))
-    _draw_lines(ImageDraw.Draw(shadow_img), spec, origin, rgba(shadow["color"]))
+    _draw_lines(
+        ImageDraw.Draw(shadow_img), spec, origin,
+        rgba(shadow["color"], alpha),
+    )
     if blur > 0:
         shadow_img = shadow_img.filter(ImageFilter.GaussianBlur(blur))
     sprite.alpha_composite(shadow_img, dest=(margin + dx, margin + dy))

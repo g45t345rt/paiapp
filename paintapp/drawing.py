@@ -3,6 +3,7 @@
 import math
 import time
 import tkinter as tk
+import tkinter.font as tkfont
 from tkinter import ttk
 
 from PIL import Image, ImageChops, ImageDraw, ImageFilter, ImageTk
@@ -3725,6 +3726,85 @@ class ToolsPanel(tk.Frame):
         self.path_show_handles = bool(self._path_handles_var.get())
         self._refresh_path()
 
+    @staticmethod
+    def _text_clamped_int(value, default, low, high):
+        """Parse ``value`` to an int clamped to ``[low, high]``."""
+        try:
+            number = int(round(float(value)))
+        except (TypeError, ValueError):
+            return default
+        return max(low, min(high, number))
+
+    def _text_style_toggle(self, parent, text, var, font=None):
+        """A compact B/I/U/S toggle button for the text panel's style row."""
+        options = dict(
+            text=text, variable=var, command=self._text_style_changed,
+            indicatoron=False, width=2, padx=1, pady=1, bd=1,
+            relief=tk.FLAT, overrelief=tk.RAISED,
+        )
+        if font is not None:
+            options["font"] = font
+        return tk.Checkbutton(parent, **options)
+
+    def _text_slider_row(self, parent, label, var, low, high, suffix=""):
+        """A label, slider and spinbox sharing one numeric text variable.
+
+        The slider uses its own ``IntVar`` and is mirrored from ``var`` through
+        a guarded trace. Sharing ``var`` directly would make Tk reject the empty
+        string a spinbox produces mid-typing, and a programmatic set (opening a
+        text object) must update the slider without firing the style callback.
+        """
+        row = tk.Frame(parent)
+        row.pack(fill=tk.X, pady=(3, 0))
+        tk.Label(row, text=label, width=9, anchor="w").pack(side=tk.LEFT)
+        slider_var = tk.IntVar(value=self._text_clamped_int(
+            var.get(), low, low, high))
+        busy = {"value": False}
+
+        def from_slider(value):
+            if busy["value"]:
+                return
+            try:
+                number = int(round(float(value)))
+            except (TypeError, ValueError):
+                return
+            busy["value"] = True
+            try:
+                var.set(str(number))
+            finally:
+                busy["value"] = False
+            self._text_style_changed()
+
+        def from_var(*_args):
+            if busy["value"]:
+                return
+            try:
+                number = int(round(float(var.get())))
+            except (tk.TclError, TypeError, ValueError):
+                return
+            number = max(low, min(high, number))
+            if slider_var.get() != number:
+                busy["value"] = True
+                try:
+                    slider_var.set(number)
+                finally:
+                    busy["value"] = False
+
+        var.trace_add("write", from_var)
+        tk.Scale(
+            row, from_=low, to=high, orient=tk.HORIZONTAL, variable=slider_var,
+            command=from_slider, length=64, showvalue=False,
+        ).pack(side=tk.LEFT, fill=tk.X, expand=True)
+        box = tk.Spinbox(
+            row, from_=low, to=high, width=4, textvariable=var,
+            command=self._text_style_changed,
+        )
+        box.pack(side=tk.LEFT, padx=(2, 0))
+        box.bind("<KeyRelease>", lambda _e: self._text_style_changed())
+        if suffix:
+            tk.Label(row, text=suffix).pack(side=tk.LEFT, padx=(2, 0))
+        return row
+
     def _settings_for_text(self):
         style = self._get_text_style() if self._get_text_style else {}
         self._text_family_var = tk.StringVar(
@@ -3735,9 +3815,49 @@ class ToolsPanel(tk.Frame):
         )
         self._text_bold_var = tk.BooleanVar(value=bool(style.get("bold", False)))
         self._text_italic_var = tk.BooleanVar(value=bool(style.get("italic", False)))
+        self._text_underline_var = tk.BooleanVar(
+            value=bool(style.get("underline", False)))
+        self._text_strikethrough_var = tk.BooleanVar(
+            value=bool(style.get("strikethrough", False)))
+        case = style.get("case", "normal")
+        self._text_case_var = tk.StringVar(
+            value=case if case in textrender.CASE_MODES else "normal")
         self._text_align_var = tk.StringVar(value=style.get("align", "left"))
         self._text_color = style.get("color") or "#000000"
+        try:
+            leading_pct = float(style.get(
+                "line_spacing", textrender.DEFAULT_LINE_SPACING)) * 100
+        except (TypeError, ValueError):
+            leading_pct = 15
+        self._text_line_var = tk.StringVar(value=str(self._text_clamped_int(
+            leading_pct, 15, -50, 300)))
+        self._text_track_var = tk.StringVar(value=str(self._text_clamped_int(
+            style.get("letter_spacing", 0.0), 0, -50, 200)))
+        self._text_para_var = tk.StringVar(value=str(self._text_clamped_int(
+            style.get("paragraph_spacing", 0), 0,
+            0, textrender.MAX_PARAGRAPH_SPACING)))
+        self._text_opacity_var = tk.StringVar(value=str(self._text_clamped_int(
+            style.get("opacity", textrender.MAX_OPACITY), textrender.MAX_OPACITY,
+            0, textrender.MAX_OPACITY)))
 
+        # Styled toggle labels read like Photoshop's character bar while still
+        # being ordinary checkbuttons. Keep the font objects alive with the
+        # widget, since Tk deletes a named font when its Python object is freed.
+        self._text_toggle_fonts = []
+        try:
+            base_font = tkfont.nametofont("TkDefaultFont")
+        except tk.TclError:
+            base_font = None
+        for options in ({"weight": "bold"}, {"slant": "italic"},
+                        {"underline": True}, {"overstrike": True}):
+            if base_font is None:
+                self._text_toggle_fonts.append(None)
+                continue
+            font = base_font.copy()
+            font.configure(**options)
+            self._text_toggle_fonts.append(font)
+
+        self._section_header(self.settings, "Character")
         tk.Label(self.settings, text="Font", anchor="w").pack(fill=tk.X)
         self._font_picker = fontpicker.FontPicker(
             self.settings, family=self._text_family_var.get(),
@@ -3752,68 +3872,63 @@ class ToolsPanel(tk.Frame):
             size_row, from_=textrender.MIN_SIZE, to=textrender.MAX_SIZE, width=5,
             textvariable=self._text_size_var, command=self._text_style_changed,
         )
-        size_box.pack(side=tk.LEFT, padx=(4, 0))
+        size_box.pack(side=tk.LEFT, padx=(4, 4))
         size_box.bind("<KeyRelease>", lambda _e: self._text_style_changed())
-        tk.Checkbutton(
-            size_row, text="B", variable=self._text_bold_var,
-            command=self._text_style_changed,
-        ).pack(side=tk.LEFT, padx=(6, 0))
-        tk.Checkbutton(
-            size_row, text="I", variable=self._text_italic_var,
-            command=self._text_style_changed,
-        ).pack(side=tk.LEFT)
+        bold_font, italic_font, underline_font, strike_font = \
+            self._text_toggle_fonts
+        for text, var, font, tip in (
+            ("B", self._text_bold_var, bold_font, "Bold"),
+            ("I", self._text_italic_var, italic_font, "Italic"),
+            ("U", self._text_underline_var, underline_font, "Underline"),
+            ("S", self._text_strikethrough_var, strike_font, "Strikethrough"),
+        ):
+            button = self._text_style_toggle(size_row, text, var, font)
+            button.pack(side=tk.LEFT, padx=(1, 0))
+            self._action_tips.append(Tooltip(button, tip))
 
-        align_row = tk.Frame(self.settings)
-        align_row.pack(fill=tk.X, pady=(4, 0))
-        tk.Label(align_row, text="Align", anchor="w").pack(side=tk.LEFT)
-        for value, label in (("left", "Left"), ("center", "Center"),
-                             ("right", "Right")):
-            tk.Radiobutton(
-                align_row, text=label, value=value,
-                variable=self._text_align_var, command=self._text_style_changed,
-            ).pack(side=tk.LEFT, padx=(4, 0))
-
-        # Wrapping only bites once a box width is set, which the side handles do.
-        self._text_wrap_var = tk.BooleanVar(value=bool(style.get("wrap", True)))
-        tk.Checkbutton(
-            self.settings, text="Wrap to box (drag side handles)", anchor="w",
-            variable=self._text_wrap_var, command=self._text_style_changed,
-        ).pack(fill=tk.X, pady=(4, 0))
+        self._menu_row(
+            self.settings, "Case", self._text_case_var,
+            (("normal", "Normal"), ("upper", "UPPERCASE"),
+             ("lower", "lowercase"), ("title", "Title Case")),
+            self._text_style_changed,
+        )
 
         color_row = tk.Frame(self.settings)
-        color_row.pack(fill=tk.X, pady=(4, 0))
-        tk.Label(color_row, text="Color", anchor="w").pack(side=tk.LEFT)
+        color_row.pack(fill=tk.X, pady=(3, 0))
+        tk.Label(color_row, text="Color", width=9, anchor="w").pack(side=tk.LEFT)
         self._text_color_btn = tk.Button(
-            color_row, width=3, command=lambda: self._choose_text_paint("color"),
+            color_row, command=lambda: self._choose_text_paint("color"),
         )
         # The button doubles as a swatch, so its background is content, not chrome.
         theme.skip(self._text_color_btn)
-        self._text_color_btn.pack(side=tk.LEFT, padx=(4, 0))
+        self._text_color_btn.pack(side=tk.LEFT, fill=tk.X, expand=True)
 
-        self._text_line_var = tk.StringVar(
-            value=str(int(round(style.get(
-                "line_spacing", textrender.DEFAULT_LINE_SPACING) * 100)))
-        )
-        self._text_track_var = tk.StringVar(
-            value=str(int(round(style.get("letter_spacing", 0.0) or 0.0)))
-        )
-        line_row = tk.Frame(self.settings)
-        line_row.pack(fill=tk.X, pady=(4, 0))
-        tk.Label(line_row, text="Line %", anchor="w").pack(side=tk.LEFT)
-        line_box = tk.Spinbox(
-            line_row, from_=-50, to=300, width=4,
-            textvariable=self._text_line_var, command=self._text_style_changed,
-        )
-        line_box.pack(side=tk.LEFT, padx=(4, 0))
-        line_box.bind("<KeyRelease>", lambda _e: self._text_style_changed())
-        tk.Label(line_row, text="Track", anchor="w").pack(side=tk.LEFT, padx=(8, 0))
-        track_box = tk.Spinbox(
-            line_row, from_=-5, to=50, width=4,
-            textvariable=self._text_track_var, command=self._text_style_changed,
-        )
-        track_box.pack(side=tk.LEFT, padx=(4, 0))
-        track_box.bind("<KeyRelease>", lambda _e: self._text_style_changed())
+        self._text_slider_row(
+            self.settings, "Opacity", self._text_opacity_var, 0,
+            textrender.MAX_OPACITY, "%")
 
+        self._section_header(self.settings, "Paragraph")
+        self._menu_row(
+            self.settings, "Align", self._text_align_var,
+            (("left", "Left"), ("center", "Center"),
+             ("right", "Right"), ("justify", "Justify")),
+            self._text_style_changed,
+        )
+        # Wrapping only bites once a box width is set, which the side handles do.
+        self._text_wrap_var = tk.BooleanVar(value=bool(style.get("wrap", True)))
+        self._check_row(
+            self.settings, "Wrap to box (drag side handles)",
+            self._text_wrap_var, self._text_style_changed,
+        )
+        self._text_slider_row(
+            self.settings, "Leading", self._text_line_var, -50, 300, "%")
+        self._text_slider_row(
+            self.settings, "Tracking", self._text_track_var, -50, 200, "px")
+        self._text_slider_row(
+            self.settings, "Para space", self._text_para_var, 0,
+            textrender.MAX_PARAGRAPH_SPACING, "px")
+
+        self._section_header(self.settings, "Effects")
         stroke = style.get("stroke") if isinstance(style.get("stroke"), dict) else {}
         self._text_stroke_var = tk.BooleanVar(value=bool(stroke))
         self._text_stroke_width_var = tk.StringVar(
@@ -3821,7 +3936,7 @@ class ToolsPanel(tk.Frame):
         )
         self._text_stroke_color = stroke.get("color") or "#000000"
         stroke_row = tk.Frame(self.settings)
-        stroke_row.pack(fill=tk.X, pady=(4, 0))
+        stroke_row.pack(fill=tk.X, pady=(3, 0))
         tk.Checkbutton(
             stroke_row, text="Outline", variable=self._text_stroke_var,
             command=self._text_style_changed,
@@ -3847,46 +3962,39 @@ class ToolsPanel(tk.Frame):
         self._text_shadow_dy_var = tk.StringVar(value=str(shadow.get("dy", 2)))
         self._text_shadow_color = shadow.get("color") or "#000000"
         shadow_row = tk.Frame(self.settings)
-        shadow_row.pack(fill=tk.X, pady=(4, 0))
+        shadow_row.pack(fill=tk.X, pady=(3, 0))
         tk.Checkbutton(
             shadow_row, text="Shadow", variable=self._text_shadow_var,
             command=self._text_style_changed,
         ).pack(side=tk.LEFT)
-        tk.Label(shadow_row, text="Blur", anchor="w").pack(side=tk.LEFT, padx=(6, 0))
-        blur_box = tk.Spinbox(
-            shadow_row, from_=0, to=50, width=3,
-            textvariable=self._text_shadow_blur_var,
-            command=self._text_style_changed,
-        )
-        blur_box.pack(side=tk.LEFT, padx=(2, 0))
-        blur_box.bind("<KeyRelease>", lambda _e: self._text_style_changed())
-        tk.Label(shadow_row, text="X", anchor="w").pack(side=tk.LEFT, padx=(6, 0))
-        shadow_dx_box = tk.Spinbox(
-            shadow_row, from_=-50, to=50, width=3,
-            textvariable=self._text_shadow_dx_var,
-            command=self._text_style_changed,
-        )
-        shadow_dx_box.pack(side=tk.LEFT, padx=(2, 0))
-        shadow_dx_box.bind("<KeyRelease>", lambda _e: self._text_style_changed())
-        tk.Label(shadow_row, text="Y", anchor="w").pack(side=tk.LEFT, padx=(6, 0))
-        shadow_dy_box = tk.Spinbox(
-            shadow_row, from_=-50, to=50, width=3,
-            textvariable=self._text_shadow_dy_var,
-            command=self._text_style_changed,
-        )
-        shadow_dy_box.pack(side=tk.LEFT, padx=(2, 0))
-        shadow_dy_box.bind("<KeyRelease>", lambda _e: self._text_style_changed())
         self._text_shadow_btn = tk.Button(
             shadow_row, width=3, command=lambda: self._choose_text_paint("shadow"),
         )
         theme.skip(self._text_shadow_btn)
         self._text_shadow_btn.pack(side=tk.LEFT, padx=(4, 0))
+
+        shadow_params = tk.Frame(self.settings)
+        shadow_params.pack(fill=tk.X, pady=(2, 0))
+        tk.Label(shadow_params, text="", width=9).pack(side=tk.LEFT)
+        for label, var in (("Blur", self._text_shadow_blur_var),
+                           ("X", self._text_shadow_dx_var),
+                           ("Y", self._text_shadow_dy_var)):
+            tk.Label(shadow_params, text=label, anchor="w").pack(
+                side=tk.LEFT, padx=(4, 0))
+            box = tk.Spinbox(
+                shadow_params, from_=-50, to=50, width=3,
+                textvariable=var, command=self._text_style_changed,
+            )
+            box.pack(side=tk.LEFT, padx=(2, 0))
+            box.bind("<KeyRelease>", lambda _e: self._text_style_changed())
+
         self._apply_text_swatches()
+        self._section_header(self.settings, "Options")
         self.text_new_layer_var = tk.BooleanVar(value=self.text_new_layer)
-        tk.Checkbutton(
-            self.settings, text="Create as new layer", anchor="w",
-            variable=self.text_new_layer_var, command=self._on_text_new_layer,
-        ).pack(fill=tk.X, pady=(4, 0))
+        self._check_row(
+            self.settings, "Create as new layer",
+            self.text_new_layer_var, self._on_text_new_layer,
+        )
 
     def _on_font_picked(self, family):
         self._text_family_var.set(family)
@@ -3955,17 +4063,26 @@ class ToolsPanel(tk.Frame):
                 "dx": self._text_int(self._text_shadow_dx_var, 2, -50, 50),
                 "dy": self._text_int(self._text_shadow_dy_var, 2, -50, 50),
             }
+        case = self._text_case_var.get()
         self._on_text_style({
             "family": self._text_family_var.get() or fonts.default_family(),
             "size": self._text_size_value(),
             "bold": self._text_bold_var.get(),
             "italic": self._text_italic_var.get(),
+            "underline": self._text_underline_var.get(),
+            "strikethrough": self._text_strikethrough_var.get(),
+            "case": case if case in textrender.CASE_MODES else "normal",
             "align": self._text_align_var.get() or "left",
             "color": self._text_color,
             "line_spacing": self._text_int(self._text_line_var, 15, -50, 300) / 100.0,
             "letter_spacing": float(
-                self._text_int(self._text_track_var, 0, -5, 50)
+                self._text_int(self._text_track_var, 0, -50, 200)
             ),
+            "paragraph_spacing": self._text_int(
+                self._text_para_var, 0, 0, textrender.MAX_PARAGRAPH_SPACING),
+            "opacity": self._text_int(
+                self._text_opacity_var, textrender.MAX_OPACITY, 0,
+                textrender.MAX_OPACITY),
             "stroke": stroke,
             "shadow": shadow,
             "wrap": self._text_wrap_var.get(),
@@ -3992,19 +4109,33 @@ class ToolsPanel(tk.Frame):
         self._text_size_var.set(str(size))
         self._text_bold_var.set(bool(style.get("bold", False)))
         self._text_italic_var.set(bool(style.get("italic", False)))
+        self._text_underline_var.set(bool(style.get("underline", False)))
+        self._text_strikethrough_var.set(bool(style.get("strikethrough", False)))
+        case = style.get("case", "normal")
+        self._text_case_var.set(
+            case if case in textrender.CASE_MODES else "normal")
         align = style.get("align", "left")
         self._text_align_var.set(align if align in textrender.ALIGNMENTS else "left")
         self._text_color = style.get("color") or "#000000"
         leading = style.get("line_spacing", textrender.DEFAULT_LINE_SPACING)
         try:
-            self._text_line_var.set(str(int(round(float(leading) * 100))))
+            leading_pct = float(leading) * 100
         except (TypeError, ValueError):
-            self._text_line_var.set("15")
+            leading_pct = 15
+        self._text_line_var.set(
+            self._text_clamped_int(leading_pct, 15, -50, 300))
         try:
             track = float(style.get("letter_spacing", 0.0) or 0.0)
         except (TypeError, ValueError):
             track = 0.0
-        self._text_track_var.set(str(int(round(track))))
+        self._text_track_var.set(
+            self._text_clamped_int(track, 0, -50, 200))
+        self._text_para_var.set(self._text_clamped_int(
+            style.get("paragraph_spacing", 0), 0,
+            0, textrender.MAX_PARAGRAPH_SPACING))
+        self._text_opacity_var.set(self._text_clamped_int(
+            style.get("opacity", textrender.MAX_OPACITY), textrender.MAX_OPACITY,
+            0, textrender.MAX_OPACITY))
         stroke = style.get("stroke")
         self._text_stroke_var.set(bool(stroke))
         if stroke:
@@ -10607,8 +10738,9 @@ class DrawingController:
             return
         merged = dict(spec)
         for key in ("family", "size", "bold", "italic", "color", "align",
-                    "line_spacing", "letter_spacing", "stroke", "shadow",
-                    "wrap"):
+                    "line_spacing", "letter_spacing", "paragraph_spacing",
+                    "case", "underline", "strikethrough", "opacity",
+                    "stroke", "shadow", "wrap"):
             if key in style:
                 merged[key] = style[key]
         if merged.get("wrap") and textrender.box_width(merged) <= 0:

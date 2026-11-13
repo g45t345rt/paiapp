@@ -158,9 +158,62 @@ def test_presets_and_settings_update_in_place():
         root.destroy()
 
 
+def test_text_settings_show_the_opened_style():
+    import tkinter as tk
+
+    from paintapp import icons
+    from paintapp.drawing import ToolsPanel
+
+    # Photos belong to the Tk root that made them; earlier tests used another.
+    icons.clear()
+    try:
+        root = tk.Tk()
+    except Exception as exc:  # no display, or Tk missing
+        SKIPPED.append(f"text settings test skipped: {exc}")
+        return
+    try:
+        applied = []
+        panel = ToolsPanel(
+            root, lambda: None, lambda *_a: None, lambda: None,
+            on_text_style=applied.append)
+        panel.pack(fill=tk.BOTH, expand=True)
+        panel.select("text")
+        root.update()
+        check("text panel starts with the default case",
+              panel._text_case_var.get(), "normal")
+        panel.set_text_style({
+            "family": "Arial", "size": 40, "underline": True,
+            "strikethrough": True, "case": "upper", "align": "justify",
+            "paragraph_spacing": 12, "opacity": 55,
+        })
+        root.update()
+        # Opening an object only points the panel at its style; it must not
+        # apply the style back to the object.
+        check("opening a text object does not apply its style", applied, [])
+        check("opening shows underline", panel._text_underline_var.get(), True)
+        check("opening shows strikethrough",
+              panel._text_strikethrough_var.get(), True)
+        check("opening shows the case", panel._text_case_var.get(), "upper")
+        check("opening shows justification",
+              panel._text_align_var.get(), "justify")
+        check("opening shows paragraph spacing",
+              panel._text_para_var.get(), "12")
+        check("opening shows opacity", panel._text_opacity_var.get(), "55")
+        # A spinbox can be empty mid-typing; the mirrored slider must not make
+        # Tk reject the value or fire the style callback.
+        panel._text_opacity_var.set("")
+        root.update()
+        check("empty numeric field is tolerated",
+              panel._text_opacity_var.get(), "")
+        check("empty numeric field does not apply a style", applied, [])
+    finally:
+        root.destroy()
+
+
 def main():
     test_mode_changes_update_in_place()
     test_presets_and_settings_update_in_place()
+    test_text_settings_show_the_opened_style()
     for note in SKIPPED:
         print(f"skip  {note}")
     if FAILED:

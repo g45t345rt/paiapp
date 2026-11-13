@@ -43,6 +43,89 @@ def test_normalize_clamps_fields():
     check("leading clamped", spec["line_spacing"], 3.0)
 
 
+def test_normalize_effects_defaults_and_clamps():
+    spec = textrender.normalize({"text": "x"})
+    check("case default", spec["case"], "normal")
+    check("underline default", spec["underline"], False)
+    check("strikethrough default", spec["strikethrough"], False)
+    check("paragraph spacing default", spec["paragraph_spacing"], 0)
+    check("opacity default", spec["opacity"], textrender.MAX_OPACITY)
+    clamped = textrender.normalize({
+        "text": "x", "case": "bogus", "paragraph_spacing": 1e9,
+        "opacity": 999,
+    })
+    check("case falls back", clamped["case"], "normal")
+    check("justify alignment kept",
+          textrender.normalize({"text": "x", "align": "justify"})["align"],
+          "justify")
+    check("paragraph spacing clamped", clamped["paragraph_spacing"],
+          textrender.MAX_PARAGRAPH_SPACING)
+    check("opacity clamped", clamped["opacity"], textrender.MAX_OPACITY)
+
+
+def test_case_transform_preserves_length():
+    upper = textrender.new_spec("Hello World", 0, 0, case="upper")
+    title = textrender.new_spec("hello world", 0, 0, case="title")
+    apostrophe = textrender.new_spec("don't stop", 0, 0, case="title")
+    check("upper case", textrender.display_text(upper), "HELLO WORLD")
+    check("title case", textrender.display_text(title), "Hello World")
+    check("title case keeps apostrophes",
+          textrender.display_text(apostrophe), "Don't Stop")
+    check("case keeps caret offsets", len(textrender.display_text(upper)),
+          len(upper["text"]))
+
+
+def test_paragraph_spacing_grows_the_block():
+    plain = textrender.new_spec("one\ntwo", 0, 0, size=40)
+    spaced = textrender.new_spec("one\ntwo", 0, 0, size=40,
+                                 paragraph_spacing=12)
+    check("paragraph spacing adds height",
+          textrender.local_rect(spaced)[3] - textrender.local_rect(plain)[3],
+          12.0)
+
+
+def test_justify_stretches_rows_but_not_the_last():
+    text = "one two three four"
+    spec = textrender.new_spec(
+        text, 0, 0, family="Default", size=20,
+        width=100.0, wrap=True, align="justify",
+    )
+    left = textrender.new_spec(
+        text, 0, 0, family="Default", size=20,
+        width=100.0, wrap=True, align="left",
+    )
+    rows = textrender.visual_lines(spec)
+    check("text wraps into several rows", len(rows) > 1, True)
+    # The last caret position in the first (non-final) row is pushed right by
+    # justification, while the final row keeps its ragged left-aligned width.
+    first_end = textrender.caret_point(spec, len(rows[0]["text"]) - 1)[0]
+    left_end = textrender.caret_point(left, len(rows[0]["text"]) - 1)[0]
+    check("non-final row is stretched", first_end > left_end, True)
+    check("last row stays ragged",
+          textrender.caret_point(spec, len(text))[0] < 100.0, True)
+
+
+def test_underline_and_strikethrough_add_ink():
+    def ink(**options):
+        layer = Layer("t", (200, 100), (0, 0, 0, 0))
+        spec = textrender.new_spec("Hello", 0, 0, family="Default", size=40,
+                                   **options)
+        textrender.paste(layer.image, spec, (0, 0))
+        return sum(1 for alpha in layer.image.getchannel("A").getdata() if alpha)
+
+    plain = ink()
+    check("underline adds pixels", ink(underline=True) > plain, True)
+    check("strikethrough adds pixels", ink(strikethrough=True) > plain, True)
+
+
+def test_opacity_scales_alpha():
+    spec = textrender.new_spec("Hi", 0, 0, family="Default", size=40,
+                               opacity=50)
+    sprite, _anchor = textrender._compose_sprite(spec)
+    check("half opacity halves alpha",
+          max(alpha for alpha in sprite.getchannel("A").getdata()), 128)
+
+
 def test_clone_is_independent():
     spec = textrender.new_spec("hello", 0, 0)
     copy = textrender.clone(spec)
