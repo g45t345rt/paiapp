@@ -1369,7 +1369,10 @@ class Layer:
         ox = offset[0] + box[0]
         oy = offset[1] + box[1]
         for spec in self.gradients:
-            sub = gradient.paste(sub, spec, (ox, oy))
+            sub = gradient.paste(
+                sub, spec, (ox, oy),
+                draft=bool(getattr(self, "gradient_draft", False)),
+            )
         for spec in self.texts:
             sub = textrender.paste(sub, spec, (ox, oy))
         for spec in self.fills:
@@ -1391,15 +1394,20 @@ class Layer:
     def _gradient_overlay(self, image, offset=None):
         """``image`` with every gradient object drawn over it (cached)."""
         offset = self.content_offset() if offset is None else offset
+        draft = bool(getattr(self, "gradient_draft", False))
         key = (
             self._image_token, filters.chain_key(self.filters),
-            self._gradient_token, tuple(offset),
+            self._gradient_token, tuple(offset), draft,
         )
         if self._gradient_cache is not None and self._gradient_key == key:
             return self._gradient_cache
-        result = image.copy()
+        # gradient.paste never mutates its input (it composites into a copy),
+        # so only copy when no gradient drew anything.
+        result = image
         for spec in self.gradients:
-            result = gradient.paste(result, spec, offset)
+            result = gradient.paste(result, spec, offset, draft=draft)
+        if result is image:
+            result = image.copy()
         self._gradient_cache = result
         self._gradient_key = key
         return result

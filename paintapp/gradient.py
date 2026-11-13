@@ -37,6 +37,13 @@ MODES = [
 
 SPREADS = [("clamp", "Clamp"), ("repeat", "Repeat"), ("mirror", "Mirror")]
 
+# Fields larger than this are sampled through a lookup table of this many
+# entries (well above the 256 output levels, so banding is not introduced).
+_LUT_SIZE = 4096
+
+# Downscale factor for draft (live-edit) gradient renders.
+DRAFT_FACTOR = 2
+
 # Fixed presets, expressed as stop lists. Presets that follow the tool's own
 # From/To colours are resolved by :func:`preset_stops` instead.
 PRESET_STOPS = {
@@ -127,12 +134,16 @@ def _field(size, start, end, mode):
     width, height = max(1, int(size[0])), max(1, int(size[1]))
     ax, ay = float(start[0]), float(start[1])
     bx, by = float(end[0]), float(end[1])
-    grid_x, grid_y = np.meshgrid(
-        np.arange(width, dtype=np.float32), np.arange(height, dtype=np.float32)
-    )
+    # Broadcast a row and a column instead of materialising two full meshgrids;
+    # on large canvases (A4 at 300 dpi is ~8.7M px) this halves the work.
+    grid_x = np.arange(width, dtype=np.float32)[None, :]
+    grid_y = np.arange(height, dtype=np.float32)[:, None]
     dx, dy = bx - ax, by - ay
     span2 = dx * dx + dy * dy
     radius = math.sqrt(span2)
+
+    def _zeros():
+        return np.zeros((height, width), dtype=np.float32)
 
     if mode == "conical":
         angle = np.arctan2(-(grid_y - ay), grid_x - ax)
@@ -140,7 +151,7 @@ def _field(size, start, end, mode):
         return ((angle - base) % (2.0 * math.pi)) / (2.0 * math.pi)
     if mode in ("radial", "square", "diamond"):
         if radius <= 1e-6:
-            return np.zeros_like(grid_x)
+            return _zeros()
         off_x, off_y = grid_x - ax, grid_y - ay
         if mode == "square":
             return np.maximum(np.abs(off_x), np.abs(off_y)) / radius
@@ -150,7 +161,7 @@ def _field(size, start, end, mode):
 
     # linear / reflected share the projected distance along the drag vector.
     if span2 <= 1e-6:
-        return np.zeros_like(grid_x)
+        return _zeros()
     u = ((grid_x - ax) * dx + (grid_y - ay) * dy) / span2
     if mode == "reflected":
         folded = np.abs(np.mod(u, 2.0))
@@ -164,15 +175,52 @@ def _sample(t, stops):
     colors = np.array([rgba(s[1])[:3] for s in stops], dtype=np.float32)
     alphas = np.array([float(s[2]) for s in stops], dtype=np.float32)
     shape = t.shape
-    flat = t.ravel()
-    channels = [np.interp(flat, positions, colors[:, index]) for index in range(3)]
-    alpha = np.interp(flat, positions, alphas)
-    rgb = np.stack(channels, axis=-1).reshape(shape[0], shape[1], 3)
-    alpha = alpha.reshape(shape)
-    return (
-        np.clip(rgb, 0, 255).astype(np.uint8),
-        np.clip(alpha, 0, 255).astype(np.uint8),
-    )
+    if t.size <= _LUT_SIZE:
+        flat = t.ravel()
+        channels = [
+            np.interp(flat, positions, colors[:, index]) for index in range(3)
+        ]
+        alpha = np.interp(flat, positions, alphas)
+        rgb = np.stack(channels, axis=-1).reshape(shape[0], shape[1], 3)
+        alpha = alpha.reshape(shape)
+        return (
+            np.clip(rgb, 0, 255).astype(np.uint8),
+            np.clip(alpha, 0, 255).astype(np.uint8),
+        )
+    # Large fields: build a lookup table once and index it, which is far
+    # cheaper than four full-size np.interp passes plus float->uint8 copies.
+    rgb_image, alpha_image = _sample_images(t, stops)
+    return np.asarray(rgb_image), np.asarray(alpha_image)
+
+
+def _packed_lut(stops):
+    """A ``_LUT_SIZE`` table of stops packed as little-endian RGBA uint32."""
+    positions = np.array([float(s[0]) for s in stops], dtype=np.float32)
+    colors = np.array([rgba(s[1])[:3] for s in stops], dtype=np.float32)
+    alphas = np.array([float(s[2]) for s in stops], dtype=np.float32)
+    ramp = np.linspace(0.0, 1.0, _LUT_SIZE, dtype=np.float32)
+    lut = np.empty((_LUT_SIZE, 4), dtype=np.uint8)
+    for index in range(3):
+        lut[:, index] = np.clip(
+            np.rint(np.interp(ramp, positions, colors[:, index])), 0, 255
+        )
+    lut[:, 3] = np.clip(np.rint(np.interp(ramp, positions, alphas)), 0, 255)
+    return lut.view("<u4").ravel()
+
+
+def _sample_images(t, stops):
+    """Sample ``stops`` at ``t`` straight into ``(RGB, L)`` PIL images.
+
+    One uint32 gather fills every RGBA pixel at once; PIL then splits the
+    channels natively, avoiding numpy strided copies of the full canvas.
+    """
+    height, width = t.shape
+    idx = np.clip(t, 0.0, 1.0, out=np.empty(t.shape, dtype=np.float32))
+    idx *= _LUT_SIZE - 1
+    idx += 0.5
+    packed = _packed_lut(stops)[idx.astype(np.uint16)]
+    image = Image.frombuffer("RGBA", (width, height), packed, "raw", "RGBA", 0, 1)
+    return image.convert("RGB"), image.getchannel("A")
 
 
 def gradient_layers(size, start, end, mode="linear", stops=None,
@@ -189,6 +237,8 @@ def gradient_layers(size, start, end, mode="linear", stops=None,
         stops = stops * 2 if stops else [[0.0, "#000000", 255],
                                          [1.0, "#ffffff", 255]]
     t = _spread(_field(size, start, end, mode), spread)
+    if t.size > _LUT_SIZE:
+        return _sample_images(t, stops)
     rgb, alpha = _sample(t, stops)
     return Image.fromarray(rgb, "RGB"), Image.fromarray(alpha, "L")
 
@@ -354,12 +404,14 @@ def mask_for_size(spec, size):
     return fitted
 
 
-def paste(image, spec, offset=(0, 0)):
+def paste(image, spec, offset=(0, 0), draft=False):
     """Draw one gradient object over ``image`` (RGBA) at ``offset``.
 
     The gradient covers the full layer buffer, like the Gradient tool's fill,
     and is composited through the spec's stops' alpha, opacity, blend and
-    optional selection mask.
+    optional selection mask. ``draft`` rasterises the ramp at a reduced
+    resolution and upscales it, for fast feedback while settings are being
+    dragged; gradients are smooth, so the difference is barely visible.
     """
     if spec.get("hidden"):
         return image
@@ -370,10 +422,27 @@ def paste(image, spec, offset=(0, 0)):
     ox, oy = int(offset[0]), int(offset[1])
     start = (normalized["start"][0] - ox, normalized["start"][1] - oy)
     end = (normalized["end"][0] - ox, normalized["end"][1] - oy)
-    rgb, alpha = gradient_layers(
-        (width, height), start, end, normalized["mode"],
-        stops=normalized["stops"], spread=normalized["spread"],
-    )
+    factor = DRAFT_FACTOR if draft and width * height > 1_000_000 else 1
+    if factor > 1:
+        small = (max(1, -(-width // factor)), max(1, -(-height // factor)))
+        rgb, alpha = gradient_layers(
+            small,
+            (start[0] / factor, start[1] / factor),
+            (end[0] / factor, end[1] / factor),
+            normalized["mode"],
+            stops=normalized["stops"], spread=normalized["spread"],
+        )
+        full = (small[0] * factor, small[1] * factor)
+        rgb = rgb.resize(full, Image.NEAREST)
+        alpha = alpha.resize(full, Image.NEAREST)
+        if full != (width, height):
+            rgb = rgb.crop((0, 0, width, height))
+            alpha = alpha.crop((0, 0, width, height))
+    else:
+        rgb, alpha = gradient_layers(
+            (width, height), start, end, normalized["mode"],
+            stops=normalized["stops"], spread=normalized["spread"],
+        )
     coverage = alpha
     mask = mask_for_size(normalized, (width, height))
     if mask is not None:

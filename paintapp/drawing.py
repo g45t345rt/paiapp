@@ -1770,10 +1770,26 @@ class ToolsPanel(tk.Frame):
         self._notify_gradient_change()
 
     def _notify_gradient_change(self):
-        """Tell the controller a live gradient's settings changed."""
+        """Tell the controller a live gradient's settings changed.
+
+        Slider drags and stop drags fire many events per second while a full
+        canvas re-render of a large document takes far longer, so updates are
+        coalesced: only the latest state is pushed once Tk is idle again.
+        """
         if self._gradient_loading or self._on_gradient_change is None:
             return
-        self._on_gradient_change()
+        if getattr(self, "_gradient_notify_job", None) is not None:
+            return
+        try:
+            self._gradient_notify_job = self.after(15, self._flush_gradient_change)
+        except (tk.TclError, RuntimeError):
+            self._gradient_notify_job = None
+            self._on_gradient_change()
+
+    def _flush_gradient_change(self):
+        self._gradient_notify_job = None
+        if self._on_gradient_change is not None:
+            self._on_gradient_change()
 
     def set_gradient_spec(self, spec):
         """Point the built Gradient panel at a gradient object's settings.
@@ -5588,9 +5604,36 @@ class DrawingController:
             self.app._push_undo("Edit gradient")
             self._gradient_edit_pushed = True
         spec.update(settings)
+        # Render a reduced-resolution draft while edits keep arriving, then
+        # repaint at full quality once they settle.
+        layer.gradient_draft = True
         layer.invalidate_gradients()
         self.app.render()
         self.app.set_result("Updated live gradient.")
+        self._schedule_gradient_final(layer)
+
+    def _schedule_gradient_final(self, layer):
+        root = getattr(self.app, "root", None) or getattr(self.app, "tools", None)
+        job = getattr(self, "_gradient_final_job", None)
+        if root is None:
+            self._finish_gradient_draft(layer)
+            return
+        if job is not None:
+            try:
+                root.after_cancel(job)
+            except Exception:
+                pass
+        self._gradient_final_job = root.after(
+            250, lambda: self._finish_gradient_draft(layer)
+        )
+
+    def _finish_gradient_draft(self, layer):
+        self._gradient_final_job = None
+        if not getattr(layer, "gradient_draft", False):
+            return
+        layer.gradient_draft = False
+        layer.invalidate_gradients()
+        self.app.render()
 
     def edit_gradient_object(self, layer, index):
         """Open a committed gradient object for live editing."""
