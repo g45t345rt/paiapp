@@ -90,6 +90,24 @@ _RESAMPLE_FILTERS = {
 # DPI assumed for a print page when the export dialog leaves the DPI field blank.
 _PRINT_FALLBACK_DPI = 300
 
+# Files accepted by the OS drag-and-drop handler. Raster formats match the Open
+# Image dialog; SVG and .pai are handled by their vector/project importers.
+_DROPPABLE_IMAGE_EXTENSIONS = (
+    ".png", ".jpg", ".jpeg", ".bmp", ".gif", ".webp", ".svg", ".tif", ".tiff",
+)
+_DROPPABLE_PROJECT_EXTENSION = ".pai"
+
+
+def _dropped_file_kind(path):
+    """Classify a path dropped from the OS: ``"project"``, ``"image"`` or None."""
+    extension = os.path.splitext(path)[1].lower()
+    if extension == _DROPPABLE_PROJECT_EXTENSION:
+        return "project"
+    if extension in _DROPPABLE_IMAGE_EXTENSIONS:
+        return "image"
+    return None
+
+
 # Milliseconds between live-stroke repaints. The stroke dabs are stamped on every
 # motion event; only the viewport repaint is deferred to this timer, so the event
 # loop keeps collecting pointer samples instead of stalling on a render per
@@ -537,6 +555,9 @@ class PaintApp:
         # :meth:`unisolate_layer`; ``None`` when no layer is isolated.
         self._isolate_state = None
         self.modified = False
+        # Status-bar text to restore after a file drag leaves the window (see
+        # ``_on_drop_enter``); ``None`` when no drag is over the window.
+        self._pre_drop_status = None
         # Set while project.load pushes the saved generation state into the
         # panel, so those writes are not stored back onto the loaded canvas.
         self._loading_project = False
@@ -597,6 +618,8 @@ class PaintApp:
         self.render()
         self.root.after(100, self._poll_queue)
         theme.apply()
+        # Accept files dragged from the OS file manager once the window exists.
+        self._setup_file_drop()
         # Set the icon once the body is built: the Windows path maps the window
         # to reach its frame, and doing that earlier would flash an empty window.
         self._set_app_icon()
@@ -7638,19 +7661,23 @@ class PaintApp:
         self.set_result("")
 
     def _import_svg_path(self, path):
-        """Import an SVG file as editable vector lines on a new vector layer."""
+        """Import an SVG file as editable vector lines on a new vector layer.
+
+        Returns ``True`` when a layer was added, ``False`` when the file could
+        not be read or held no geometry (the reason is reported here).
+        """
         try:
             doc = svgimport.load(path)
         except (OSError, ValueError) as exc:
             dialogs.show_error(
                 self.root, "Open Image", f"Could not import SVG:\n{exc}"
             )
-            return
+            return False
         specs = doc.get("strokes") or []
         fill_specs = doc.get("fills") or []
         if not specs and not fill_specs:
             self.set_result("That SVG has no vector geometry to import.")
-            return
+            return False
         self._push_undo("Import vector")
         if self.current is None:
             self._new_canvas()
@@ -7671,6 +7698,7 @@ class PaintApp:
             f"Imported {total} vector shape"
             f"{'s' if total != 1 else ''} from {os.path.basename(path)}."
         )
+        return True
 
     def copy_vector_svg(self):
         """Copy the active layer's vector lines to the clipboard as SVG text."""
@@ -7843,28 +7871,147 @@ class PaintApp:
         )
         if not path:
             return
-        if path.lower().endswith(".svg"):
-            self._import_svg_path(path)
+        self.open_image_paths([path])
+
+    # ------------------------------------------------- drag and drop from the OS
+    def _setup_file_drop(self):
+        """Accept files dragged from the OS file manager onto the window.
+
+        ``tkinterdnd2`` is optional: without it (or its native tkdnd library)
+        the app simply has no drop target. Registering the toplevel is enough,
+        because tkdnd walks up from the widget under the pointer to find it.
+        """
+        try:
+            from tkinterdnd2 import DND_FILES
+        except Exception:
+            return
+        if not hasattr(self.root, "drop_target_register"):
             return
         try:
-            image = Image.open(path)
-        except Exception as exc:
-            dialogs.show_error(
-                self.root, "Open Image", f"Could not open image:\n{exc}"
+            self.root.drop_target_register(DND_FILES)
+            self.root.dnd_bind("<<DropEnter>>", self._on_drop_enter)
+            self.root.dnd_bind("<<DropLeave>>", self._on_drop_leave)
+            self.root.dnd_bind("<<Drop>>", self._on_drop_files)
+        except (tk.TclError, RuntimeError):
+            pass
+
+    def _on_drop_enter(self, event):
+        """Mention the drop action in the status bar while a file is over."""
+        if self._pre_drop_status is None:
+            self._pre_drop_status = self.statusbar.status.cget("text")
+        self.statusbar.set_status("drop to open image or project")
+        return getattr(event, "action", None) or "copy"
+
+    def _on_drop_leave(self, _event):
+        if self._pre_drop_status is not None:
+            self.statusbar.set_status(self._pre_drop_status)
+            self._pre_drop_status = None
+
+    def _on_drop_files(self, event):
+        """Open the files dropped from the OS, then accept the drop."""
+        paths = self._dropped_paths(getattr(event, "data", ""))
+        if self._pre_drop_status is not None:
+            self.statusbar.set_status(self._pre_drop_status)
+            self._pre_drop_status = None
+        if paths:
+            self.open_dropped_files(paths)
+        return getattr(event, "action", None) or "copy"
+
+    def _dropped_paths(self, data):
+        """The existing files in a tkdnd drop payload, de-duplicated."""
+        try:
+            items = self.root.tk.splitlist(data)
+        except (tk.TclError, TypeError):
+            items = [data]
+        paths = []
+        seen = set()
+        for item in items:
+            path = os.path.abspath(os.path.expanduser(str(item)))
+            if os.path.isfile(path) and path not in seen:
+                seen.add(path)
+                paths.append(path)
+        return paths
+
+    def open_dropped_files(self, paths):
+        """Open dropped files: a project replaces the workspace, images stack."""
+        projects = [p for p in paths if _dropped_file_kind(p) == "project"]
+        images = [p for p in paths if _dropped_file_kind(p) == "image"]
+        if projects:
+            if len(paths) > 1:
+                self.set_result(
+                    "Drop one project at a time; "
+                    "opening the first dropped project.",
+                    "warn",
+                )
+            self._confirm_discard_changes(
+                lambda: self._start_project_load(projects[0])
             )
             return
-        self._push_undo("Open image")
+        if images:
+            self.open_image_paths(images)
+            return
+        self.set_result("Drop an image or a .pai project to open it.", "warn")
+
+    def open_image_paths(self, paths):
+        """Open image/SVG files as new layers above the active one.
+
+        One undo entry covers a batch of raster images, so a multi-file drop is
+        undone in a single step. SVG files import through the vector path,
+        which records its own entry. Unreadable files are reported together and
+        do not stop the readable ones from opening.
+        """
+        if not paths:
+            return
         if self.current is None:
             self._new_canvas()
             self.area.add(self.canvases[-1])
             self.active_canvas = len(self.canvases) - 1
-        image = self._import_to_working(image)
-        layer = self._add_layer(name=os.path.basename(path), index=self.active + 1)
-        layer.set_image(self.current.fit_image(image))
-        self.active = self.layers.index(layer)
-        self._refresh_layer_list()
-        self.render()
-        self.set_result(f"Opened {os.path.basename(path)} as a new layer.")
+        raster = [p for p in paths if not p.lower().endswith(".svg")]
+        vectors = [p for p in paths if p.lower().endswith(".svg")]
+        opened = 0
+        raster_opened = 0
+        failed = []
+        if raster:
+            self._push_undo(
+                "Open image" if len(raster) == 1 else "Open images"
+            )
+            for path in raster:
+                try:
+                    image = Image.open(path)
+                    image.load()
+                except Exception as exc:
+                    failed.append(f"{os.path.basename(path)}: {exc}")
+                    continue
+                image = self._import_to_working(image)
+                layer = self._add_layer(
+                    name=os.path.basename(path), index=self.active + 1
+                )
+                layer.set_image(self.current.fit_image(image))
+                self.active = self.layers.index(layer)
+                opened += 1
+                raster_opened += 1
+            if raster_opened:
+                self._refresh_layer_list()
+                self.render()
+        for path in vectors:
+            if self._import_svg_path(path):
+                opened += 1
+        if failed:
+            dialogs.show_error(
+                self.root, "Open Image",
+                "Could not open these files:\n" + "\n".join(failed),
+            )
+        if not opened:
+            return
+        if not raster_opened and len(paths) == 1:
+            # The SVG importer already reported what it added.
+            return
+        if opened == 1:
+            self.set_result(
+                f"Opened {os.path.basename(paths[0])} as a new layer."
+            )
+        else:
+            self.set_result(f"Opened {opened} files as new layers.")
 
     def _import_to_working(self, image):
         """Convert an opened image into the active canvas's working space.

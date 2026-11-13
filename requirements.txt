@@ -10,6 +10,11 @@ scipy==1.18.1
 # glyphs, so the rest of the UI is unaffected.
 resvg-py==0.5.0
 
+# Files dragged from the OS file manager (images, .pai projects) are accepted
+# through tkdnd. Optional at runtime: the launcher falls back to plain tk.Tk
+# when the package or its native library is unavailable.
+tkinterdnd2==0.4.3
+
 # GPU rendering for the Poses tool (paintapp/mesh_gpu.py): a real 3D character is
 # rasterised by an OpenGL 3.3 shader instead of the numpy fallback, which is the
 # difference between ~3 ms and ~340 ms a frame. Optional at runtime — if this

@@ -95,9 +95,26 @@ def _set_app_user_model_id():
         pass
 
 
+def _create_root():
+    """Create the Tk root, with tkdnd loaded when it is installed.
+
+    ``tkinterdnd2`` lets the window accept files dragged from the OS file
+    manager. It is optional: when the package or its native tkdnd library is
+    unavailable, a plain root is returned and the app starts as usual.
+    """
+    try:
+        from tkinterdnd2 import TkinterDnD
+    except Exception:
+        return tk.Tk(className="Pai")
+    try:
+        return TkinterDnD.Tk(className="Pai")
+    except Exception:
+        return tk.Tk(className="Pai")
+
+
 def main():
     _set_app_user_model_id()
-    root = tk.Tk(className="Pai")
+    root = _create_root()
     PaintApp(root)
     root.mainloop()
 
