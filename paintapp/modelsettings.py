@@ -48,7 +48,7 @@ The settings are laid out as tabs in a notebook:
   models are editable lists (add / remove / reorder) of candidate files; each row
   shows the detected kind beside its path. "Scan folder…"
   browses a folder (and its subfolders, bounded) and appends its component
-  files to the matching pool (or the pool picked under "Add to").
+  files to the matching pool.
 * **Recipes** — the saved per-model presets (steps / CFG / sampler / scheduler /
   denoise, plus the output width and height) the Generate panel offers, grouped
   by model. Add a recipe for any model — a new one starts from that model's
@@ -479,14 +479,16 @@ class ModelSettingsDialog:
         body = tk.Frame(self.window)
         body.pack(fill=tk.BOTH, expand=True)
 
+        self._build_header(body)
+
         notebook = ttk.Notebook(body)
         self.notebook = notebook
         notebook.pack(fill=tk.BOTH, expand=True, padx=10, pady=(10, 0))
 
-        self._build_folders_tab(notebook)
         self._build_models_tab(notebook)
         self._build_components_tab(notebook)
         self._build_recipes_tab(notebook)
+        self._build_folders_tab(notebook)
 
         if not self._kinds_ready:
             self._build_progress()
@@ -505,6 +507,53 @@ class ModelSettingsDialog:
             buttons, text="Show full paths", variable=self._show_full_var,
             command=self._on_toggle_full_paths, anchor="w",
         ).pack(side=tk.LEFT, padx=(12, 0))
+
+    def _build_header(self, body):
+        """The shared actions and help note above the tab container.
+
+        Scanning and downloading act on the whole dialog, so they live outside
+        the tabs; ``_scan_folder_action`` picks the model or component scan from
+        the active tab.
+        """
+        actions = tk.Frame(body)
+        actions.pack(fill=tk.X, padx=10, pady=(10, 0))
+        tk.Button(
+            actions, text="Scan folder\u2026", command=self._scan_folder_action,
+        ).pack(side=tk.LEFT)
+        tk.Button(
+            actions, text="Browse Hugging Face\u2026", command=self._browse_hub,
+        ).pack(side=tk.LEFT, padx=(6, 0))
+        tk.Button(
+            actions, text="Download model wizard\u2026", command=self._download_wizard,
+        ).pack(side=tk.LEFT, padx=(6, 0))
+        tk.Button(
+            actions, text="Download tools\u2026", command=self._download_tools,
+        ).pack(side=tk.LEFT, padx=(6, 0))
+
+        tk.Label(
+            body, text="Adds model files from a folder (and subfolders) or the Hub.",
+            anchor="w", fg=theme.color("muted"),
+        ).pack(fill=tk.X, padx=10, pady=(4, 0))
+
+        info = tk.Frame(body)
+        info.pack(fill=tk.X, padx=10, pady=(6, 0))
+        self._info_box(
+            info,
+            "Already have models downloaded (ComfyUI, or anywhere else)? You do "
+            "not have to move them: use \u201cScan folder\u2026\u201d above, "
+            "or add a model row and type its full path. "
+        )
+
+    def _scan_folder_action(self):
+        """Scan from the shared bar: components on the Components tab, else models."""
+        try:
+            title = self.notebook.tab(self.notebook.select(), "text")
+        except tk.TclError:
+            title = ""
+        if title == "Components":
+            self._scan_component_folder()
+        else:
+            self._scan_folder()
 
     def _new_tab(self, notebook, title):
         """Add a scrollable page to ``notebook`` and target it for building.
@@ -525,11 +574,11 @@ class ModelSettingsDialog:
         # The canvas is only a scroll viewport (not content), so paint it with
         # the theme background instead of Tk's default white.
         canvas = tk.Canvas(
-            page, highlightthickness=0, width=640, height=470, bg=theme.color("bg"),
+            page, highlightthickness=0, width=640, height=340, bg=theme.color("bg"),
         )
         scroll = AutoScrollbar(rail, orient="vertical", command=canvas.yview)
         canvas.configure(yscrollcommand=scroll.set)
-        scroll.pack(fill=tk.Y)
+        scroll.pack(side=tk.RIGHT, fill=tk.Y)
         canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         inner = tk.Frame(canvas, padx=12, pady=10)
         window_id = canvas.create_window((0, 0), window=inner, anchor="nw")
@@ -562,18 +611,6 @@ class ModelSettingsDialog:
         """
         canvas, inner = self._new_tab(notebook, "Folders")
         self._folders_canvas = canvas
-        table = self.table
-
-        info = tk.Frame(table, padx=8, pady=6, highlightthickness=1)
-        info.grid(row=self._row, column=0, columnspan=3, sticky="we", pady=(0, 8))
-        self._row += 1
-        self._info_box(
-            info,
-            "Already have models downloaded (ComfyUI, or anywhere else)? You do "
-            "not have to move them: use \u201cScan folder\u2026\u201d on the "
-            "Models or Components tab, or add a model row and type its full "
-            "path. These folders only set where new downloads land.",
-        )
 
         cfg = engine_settings.section("models")
         self._folder_parts = {key: part for _label, key, part in _FOLDER_KINDS}
@@ -609,11 +646,15 @@ class ModelSettingsDialog:
         self._bind_wheel(inner, canvas)
 
     def _info_box(self, frame, text):
-        """A muted note inside ``frame``, pinned to the theme's info colors."""
+        """A muted note inside ``frame``, with an info icon and theme info colors."""
+        frame.configure(padx=8, pady=6, highlightthickness=1)
         theme.register(frame, bg="info_bg", highlightbackground="border")
+        icon = tk.Label(frame, text="\u2139", anchor="nw")
+        theme.register(icon, bg="info_bg", fg="info")
+        icon.pack(side=tk.LEFT, anchor="n", padx=(0, 6))
         label = tk.Label(frame, text=text, anchor="w", justify="left", wraplength=540)
         theme.register(label, bg="info_bg", fg="info")
-        label.pack(fill=tk.X)
+        label.pack(side=tk.LEFT, fill=tk.X, expand=True)
 
     def _display_path(self, path):
         """A path as shown in the dialog (whole, or tail only -- see the toggle)."""
@@ -1364,35 +1405,13 @@ class ModelSettingsDialog:
         return items
 
     def _build_pools(self):
-        """The scan bar plus the grouped add/remove/reorder pool lists."""
+        """The grouped add/remove/reorder pool lists."""
         holder = tk.Frame(self.table)
         holder.grid(row=self._row, column=0, columnspan=4, sticky="we")
         self._row += 1
 
-        bar = tk.Frame(holder)
-        bar.pack(fill=tk.X, pady=(4, 2))
-        tk.Button(
-            bar, text="Scan folder\u2026", command=self._scan_component_folder,
-        ).pack(side=tk.LEFT)
-        tk.Button(
-            bar, text="Browse Hugging Face\u2026", command=self._browse_hub,
-        ).pack(side=tk.LEFT, padx=(6, 0))
-        tk.Label(bar, text="Add to:", anchor="w").pack(side=tk.LEFT, padx=(8, 2))
-        self._scan_pool_choices = {
-            title: name for title, name in _POOL_CATEGORIES
-        }
-        self._scan_pool_var = tk.StringVar(value="Auto-detect")
-        ttk.Combobox(
-            bar, textvariable=self._scan_pool_var, state="readonly", width=18,
-            values=["Auto-detect"] + list(self._scan_pool_choices),
-        ).pack(side=tk.LEFT)
-        tk.Label(
-            holder, text="Adds component files from a folder (and subfolders) or the Hub.", anchor="w",
-            fg=theme.color("muted"),
-        ).pack(fill=tk.X, pady=(0, 2))
-
         self._pools_body = tk.Frame(holder)
-        self._pools_body.pack(fill=tk.X, pady=(2, 0))
+        self._pools_body.pack(fill=tk.X, pady=(4, 0))
         self._pool_group_frames = {}
         self._rebuild_pools()
 
@@ -1806,29 +1825,10 @@ class ModelSettingsDialog:
         self._loaded_entry_paths = {entry["path"].strip() for entry in self.entries}
 
     def _build_model_list(self):
-        """The Scan button plus the grouped header/rows table for entries."""
+        """The grouped header/rows table for entries."""
         holder = tk.Frame(self.table)
         holder.grid(row=self._row, column=0, columnspan=4, sticky="we")
         self._row += 1
-
-        bar = tk.Frame(holder)
-        bar.pack(fill=tk.X, pady=(4, 2))
-        tk.Button(bar, text="Scan folder\u2026", command=self._scan_folder).pack(
-            side=tk.LEFT
-        )
-        tk.Button(
-            bar, text="Browse Hugging Face\u2026", command=self._browse_hub,
-        ).pack(side=tk.LEFT, padx=(6, 0))
-        tk.Button(
-            bar, text="Download model wizard\u2026", command=self._download_wizard,
-        ).pack(side=tk.LEFT, padx=(6, 0))
-        tk.Button(
-            bar, text="Download tools\u2026", command=self._download_tools,
-        ).pack(side=tk.LEFT, padx=(6, 0))
-        tk.Label(
-            holder, text="Adds model files from a folder (and subfolders) or the Hub.", anchor="w",
-            fg=theme.color("muted"),
-        ).pack(fill=tk.X, pady=(0, 2))
 
         self._entries_body = tk.Frame(holder)
         self._entries_body.pack(fill=tk.X, pady=(2, 0))
@@ -2481,8 +2481,7 @@ class ModelSettingsDialog:
         )
         if not folder:
             return
-        forced = self._scan_pool_choices.get(self._scan_pool_var.get())
-        added, found, new_items = self._scan_components(folder, forced)
+        added, found, new_items = self._scan_components(folder, None)
         for name, item in new_items:
             self._finish(self._new_pool_row(name, item), self._pools_canvas)
         for name in {name for name, _item in new_items}:
@@ -2491,8 +2490,7 @@ class ModelSettingsDialog:
         if not added and found:
             dialogs.show_info(
                 self.window, "Scan folder",
-                "No component files matched in that folder. Choose a pool under "
-                "\u201cAdd to\u201d and scan again.",
+                "No component files matched in that folder.",
             )
 
     def _scan_components(self, folder, forced_pool):
@@ -2502,8 +2500,7 @@ class ModelSettingsDialog:
         retargeted onto an existing row, how many candidate files were seen, and
         the ``(pool, item)`` pairs appended so the caller can draw only those
         rows. Subfolders are scanned up to ``_SCAN_MAX_DEPTH`` deep. A file goes
-        to the pool picked under "Add to",
-        else to the pool named by the folder it sits in (a known component
+        to the pool named by the folder it sits in (a known component
         folder, or a folder named for a pool), else to the pool its filename
         suggests. A wrong guess is one Remove away from fixed, like the model
         scan.
@@ -2516,7 +2513,7 @@ class ModelSettingsDialog:
         # it, so filing it into a pool would show the same model twice.
         known |= {_path_key(entry.get("path")) for entry in self.entries}
         # Model folders hold diffusion models, not components, so a file sitting
-        # in one is skipped unless the user forced a pool under "Add to".
+        # in one is skipped unless a pool is forced.
         model_dirs = [
             engine_paths.checkpoints_dir(),
             engine_paths.diffusion_dir(),

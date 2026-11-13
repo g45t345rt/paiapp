@@ -180,11 +180,6 @@ class HubBrowserDialog:
         )
         sort_box.pack(side=tk.LEFT, padx=(6, 0))
         sort_box.bind("<<ComboboxSelected>>", lambda _e: self._search())
-        self.desc_var = tk.BooleanVar(value=True)
-        tk.Checkbutton(
-            controls, text="Descending", variable=self.desc_var,
-            command=self._search,
-        ).pack(side=tk.LEFT, padx=(8, 0))
 
         tk.Label(controls, text="Filter").pack(side=tk.LEFT, padx=(16, 0))
         self.filter_var = tk.StringVar(value=engine_hub.FILTERS[0][0])
@@ -243,13 +238,12 @@ class HubBrowserDialog:
         query = self.query_var.get().strip()
         sort = dict(engine_hub.SORTS).get(self.sort_var.get(), engine_hub.DEFAULT_SORT)
         tag = dict(engine_hub.FILTERS).get(self.filter_var.get())
-        descending = bool(self.desc_var.get())
         self.status.config(text="Searching\u2026")
         self.download_btn.config(state=tk.DISABLED)
 
         def work():
             return engine_hub.search_models(
-                query=query, sort=sort, descending=descending, tag=tag, limit=_LIMIT,
+                query=query, sort=sort, tag=tag, limit=_LIMIT,
             )
 
         _run_async(self.window, work, self._show_results)

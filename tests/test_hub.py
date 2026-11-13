@@ -110,6 +110,32 @@ def test_is_archive():
     check("onnx false", hub.is_archive("sam.onnx"), False)
 
 
+def test_search_direction():
+    """Descending omits the direction hint; ascending is only for Newest."""
+    seen = []
+    real = hub._get_json
+
+    def fake(path, timeout=30):
+        seen.append(path)
+        return []
+
+    hub._get_json = fake
+    try:
+        hub.search_models(sort="downloads", descending=True)
+        check("descending never sends 1", "direction=1" in seen[-1], False)
+        check("descending sends -1", "direction=-1" in seen[-1], True)
+        try:
+            hub.search_models(sort="downloads", descending=False)
+        except hub.HubError:
+            check("ascending downloads refused", True, True)
+        else:
+            check("ascending downloads refused", False, True)
+        hub.search_models(sort="createdAt", descending=False)
+        check("ascending newest sent", "direction=1" in seen[-1], True)
+    finally:
+        hub._get_json = real
+
+
 def test_extract_archive():
     import zipfile
 

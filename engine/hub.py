@@ -45,6 +45,12 @@ SORTS = (
 
 DEFAULT_SORT = "downloads"
 
+# The Hub only honours an ascending ``direction`` for the "Newest" sort; every
+# other key rejects ``direction=1`` with a 400 ("only descending sort is
+# supported for ..."). Descending is the server default, so we simply omit the
+# parameter unless the user asked for it.
+ASCENDING_SORTS = frozenset({"createdAt"})
+
 # Optional tag filters, paired with their display label. ``None`` means "no
 # filter". These are the tags that line up with the families the engine runs.
 FILTERS = (
@@ -134,11 +140,21 @@ def search_models(query="", sort=DEFAULT_SORT, descending=True, tag=None,
     tag filter from :data:`FILTERS`. ``cursor`` continues a previous page. Gated
     repos are excluded, so every result can be downloaded without an account.
     The raw dicts are passed to :func:`model_summary` for display.
+
+    The Hub only sorts ascending for the "Newest" key (:data:`ASCENDING_SORTS`);
+    the other keys reject ``direction=1`` with a 400, so ascending is refused
+    here with a :class:`HubError` instead of surfacing the server error.
     """
-    params = {
-        "limit": int(limit), "sort": sort, "direction": -1 if descending else 1,
-        "gated": "false",
-    }
+    params = {"limit": int(limit), "sort": sort, "gated": "false"}
+    if descending:
+        params["direction"] = -1
+    elif sort in ASCENDING_SORTS:
+        params["direction"] = 1
+    else:
+        raise HubError(
+            "Hugging Face only sorts ascending by Newest; use descending for"
+            " this sort."
+        )
     if query:
         params["search"] = query
     if tag:
