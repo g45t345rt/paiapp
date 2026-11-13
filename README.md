@@ -87,7 +87,7 @@ Generation runs through the model family you pick in the Generate panel:
 
 | Family | Notes |
 | --- | --- |
-| Anima | Cosmos-Predict2 DiT with a T5 adapter, aesthetic-tuned |
+| Anima | Cosmos-Predict2 DiT with a T5 adapter |
 | Qwen-Image 2.1 | Qwen3-VL text encoder, GGUF quantized DiT |
 | Flux | FLUX.1 dev |
 | Z-Image | Z-Image Turbo, including NitroFusion2 1–2 step distillation |
@@ -96,7 +96,7 @@ Generation runs through the model family you pick in the Generate panel:
 | MiniMax H3 | Qwen3-VL-32B text encoder with video VAE |
 | MiniMax H3 Image | 6-step PDD image DiT with reference-image editing |
 | Fibo 2.0 | Bria Fibo 2.0 |
-| Stable Diffusion | SD 1.x / 2.x / SDXL, including Pony/Illustrious-style finetunes |
+| Stable Diffusion | SD 1.x / 2.x / SDXL |
 
 Each family loads its components (DiT, text encoder, VAE) from separate files, so you can mix and match quantizations. Model Settings lets you point any slot at a custom file.
 
