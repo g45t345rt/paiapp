@@ -6613,10 +6613,13 @@ class PaintApp:
             self.set_result(f"Cut layer '{layer.name}'.")
         self._remember_clipboard_origin()
 
-    def paste(self):
-        if self.current is None:
-            self.set_result("There is no canvas. Add a canvas first.")
-            return
+    def _paste_choice(self):
+        """The Paste destination and fit option, asking when configured to.
+
+        Returns ``(dest, fit)`` or ``None`` when the destination dialog was
+        dismissed. Shared by Paste and the OS file drop so both place images
+        the same way.
+        """
         dest = self.tools.paste_dest
         fit = self.tools.paste_fit_canvas
         if self.tools.paste_ask:
@@ -6624,8 +6627,18 @@ class PaintApp:
             chosen = dialogs.ask_paste_dest(
                 self.root, layer.name if layer is not None else None)
             if chosen is None:
-                return
+                return None
             dest, fit = chosen
+        return dest, fit
+
+    def paste(self):
+        if self.current is None:
+            self.set_result("There is no canvas. Add a canvas first.")
+            return
+        choice = self._paste_choice()
+        if choice is None:
+            return
+        dest, fit = choice
         # Prefer the app's own clipboard (regions/layers copied inside the app);
         # fall back to an image sitting on the OS clipboard. The in-app copy is
         # only reused while the OS clipboard still holds what it did at copy
@@ -7956,7 +7969,7 @@ class PaintApp:
         return paths
 
     def open_dropped_files(self, paths):
-        """Open dropped files: a project replaces the workspace, images stack."""
+        """Open dropped files: a project replaces the workspace, images paste."""
         projects = [p for p in paths if _dropped_file_kind(p) == "project"]
         images = [p for p in paths if _dropped_file_kind(p) == "image"]
         if projects:
@@ -7971,9 +7984,52 @@ class PaintApp:
             )
             return
         if images:
-            self.open_image_paths(images)
+            self.paste_dropped_images(images)
             return
         self.set_result("Drop an image or a .pai project to open it.", "warn")
+
+    def paste_dropped_images(self, paths):
+        """Place dropped image files the same way Paste would.
+
+        Each file follows the Paste destination setting ("New Layer", "This
+        Layer" or "Assets") and the "Fit to canvas" option, and the paste
+        destination dialog is shown when enabled. SVG files keep their
+        editable-vector path, which the paste pipeline also uses.
+        """
+        if not paths:
+            return
+        choice = self._paste_choice()
+        if choice is None:
+            return
+        dest, fit = choice
+        if self.current is None:
+            self._new_canvas()
+            self.area.add(self.canvases[-1])
+            self.active_canvas = len(self.canvases) - 1
+        placed = 0
+        failed = []
+        for path in paths:
+            if path.lower().endswith(".svg") and dest != "asset":
+                if self._paste_clipboard_svg(dest=dest, data=[path]):
+                    placed += 1
+                else:
+                    failed.append(os.path.basename(path))
+                continue
+            if self._paste_external_image([path], dest=dest, fit=fit):
+                placed += 1
+            else:
+                failed.append(os.path.basename(path))
+        if failed:
+            dialogs.show_error(
+                self.root, "Drop Files",
+                "Could not open these files:\n" + "\n".join(failed),
+            )
+        if not placed:
+            return
+        if placed == 1:
+            self.set_result(f"Pasted {os.path.basename(paths[0])}.")
+        else:
+            self.set_result(f"Pasted {placed} files.")
 
     def open_image_paths(self, paths):
         """Open image/SVG files as new layers above the active one.
