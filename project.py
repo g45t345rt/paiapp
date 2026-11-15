@@ -15,7 +15,8 @@ written before groups existed simply have no ``groups`` entry. Files written
 before version 19 kept assets per canvas (``canvases/NNNN/assets/``); those
 load into the one project-wide asset list. Version 20 adds asset groups, tags,
 favorites and a project-wide asset group counter; older files load with every
-asset ungrouped and untagged.
+asset ungrouped and untagged. Version 21 adds stable canvas ids and canvas
+links; older files load with one assigned per canvas and no canvas links.
 
 The functions take the running :class:`paint.PaintApp` so the caller can keep
 all of its state (canvases, palette, generation panel) in one place.
@@ -41,7 +42,7 @@ from paintapp import filters, gradient, path, poses, textrender, vector
 from paintapp.document import AssetLibrary, Canvas, Group, normalize_blend
 
 FORMAT = "pai"
-VERSION = 20
+VERSION = 21
 MANIFEST = "project.json"
 
 # Maps manifest keys to the tkinter variables that hold the generate panel.
@@ -351,6 +352,9 @@ def snapshot(app):
         view_state, exploded_view_state = _canvas_view_states(canvas)
         entry = {
             "name": canvas.name,
+            # Stable identity for canvas links; names and tab indices can
+            # change, so a link stores this instead.
+            "canvas_id": getattr(canvas, "canvas_id", None),
             "width": canvas.width,
             "height": canvas.height,
             "active": canvas.active,
@@ -421,6 +425,9 @@ def snapshot(app):
                 "is_master": bool(getattr(layer, "is_master", False)),
                 "master_id": getattr(layer, "master_id", None),
                 "link_id": getattr(layer, "link_id", None),
+                # A canvas link names its source canvas; ``link_id`` is left
+                # None because no master layer is needed for this kind of link.
+                "link_canvas_id": getattr(layer, "link_canvas_id", None),
                 # Per-instance transform of a link layer (content pixels to
                 # document), or ``None`` when the link shows the master as-is.
                 "transform": (
@@ -675,16 +682,26 @@ def read(app, path, progress=None, cancel=None):
 
 
 def _relink(canvases):
-    """Point every link layer at its master (mirrors ``PaintApp._relink_masters``)."""
+    """Point every link layer at its source (mirrors ``PaintApp._relink_masters``)."""
     masters = {
         layer.master_id: layer
         for canvas in canvases for layer in canvas.layers
         if getattr(layer, "is_master", False) and layer.master_id is not None
     }
+    by_id = {
+        canvas.canvas_id: canvas
+        for canvas in canvases
+        if getattr(canvas, "canvas_id", None) is not None
+    }
     for canvas in canvases:
         for layer in canvas.layers:
             if getattr(layer, "link_id", None) is not None:
                 layer.master = masters.get(layer.link_id)
+            if getattr(layer, "link_canvas_id", None) is not None:
+                source = by_id.get(layer.link_canvas_id)
+                layer.canvas_source = (
+                    source.link_source() if source is not None else None
+                )
 
 
 def _warm_caches(canvases, cancel=None, progress=None):
@@ -735,6 +752,9 @@ def _build_canvases(payload, cancel=None):
         height = int(entry.get("height") or 0)
         size = (width, height) if width and height else (fallback or (800, 640))
         doc = Canvas(entry.get("name", f"Canvas {canvas_index + 1}"), size)
+        saved_id = entry.get("canvas_id")
+        if saved_id:
+            doc.canvas_id = str(saved_id)
         doc.library = library
         canvases.append(doc)
         doc.layers = []
@@ -763,11 +783,15 @@ def _build_canvases(payload, cancel=None):
             layer = doc.add_layer(name=layer_entry.get("name", "Layer"))
             offset = layer_entry.get("offset") or (0, 0)
             offset = (int(offset[0]), int(offset[1]))
-            # A link re-renders its master's content at its own offset instead
-            # of keeping the stored pixels, so keep its saved buffer frame and
+            # A link re-renders its source's content at its own offset instead of
+            # keeping the stored pixels, so keep its saved buffer frame and
             # offset as-is: placing it would enlarge the buffer and recentre a
             # positive offset to (0, 0), dropping the instance's move on reload.
-            if image is not None and layer_entry.get("link_id") is None:
+            is_link = (
+                layer_entry.get("link_id") is not None
+                or layer_entry.get("link_canvas_id") is not None
+            )
+            if image is not None and not is_link:
                 placed, placed_offset = _place_layer(image, doc.size, offset)
                 layer.set_image(placed)
             else:
@@ -777,7 +801,7 @@ def _build_canvases(payload, cancel=None):
             layer.offset = placed_offset
             mask = masks.get((canvas_index, layer_index))
             if mask is not None:
-                if layer_entry.get("link_id") is not None:
+                if is_link:
                     # A link's mask is stored in its own buffer frame, which is
                     # what it is composited in; placing it would shift it.
                     layer.mask = mask
@@ -795,6 +819,7 @@ def _build_canvases(payload, cancel=None):
             layer.is_master = bool(layer_entry.get("is_master", False))
             layer.master_id = layer_entry.get("master_id")
             layer.link_id = layer_entry.get("link_id")
+            layer.link_canvas_id = layer_entry.get("link_canvas_id")
             transform = layer_entry.get("transform")
             layer.transform = (
                 tuple(float(value) for value in transform)

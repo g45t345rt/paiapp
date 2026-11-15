@@ -1074,6 +1074,7 @@ class PaintApp:
             on_unlink=self.unlink_layer,
             on_select_master=self.select_master,
             on_link_reset_transform=self.reset_link_transform,
+            on_link_canvas=self.link_layer_to_canvas,
             get_master_choices=self.master_choices,
             on_move_to_canvas=self.move_layer_to_canvas,
             get_canvas_choices=self.canvas_move_choices,
@@ -1448,6 +1449,8 @@ class PaintApp:
             for layer in self.canvases[index].layers
             if getattr(layer, "is_master", False) and layer.master_id is not None
         ]
+        doomed_canvas = self.canvases[index]
+        self._unlink_canvas_links_to(doomed_canvas)
         del self.canvases[index]
         for master_id, master in doomed_masters:
             self._unlink_links_to(master_id, master)
@@ -2027,9 +2030,14 @@ class PaintApp:
             self.set_result("There is no layer. Add a layer first.")
             return True
         if layer.is_link and not mask:
-            self.set_result(
-                f"Layer '{layer.name}' is a link layer. Edit its master layer."
-            )
+            if getattr(layer, "link_canvas_id", None) is not None:
+                self.set_result(
+                    f"Layer '{layer.name}' is a link to a canvas. Edit that canvas."
+                )
+            else:
+                self.set_result(
+                    f"Layer '{layer.name}' is a link layer. Edit its master layer."
+                )
             return True
         # The exploded view shows every layer, so a hidden layer is editable
         # there; only the explicit lock still blocks it.
@@ -3721,14 +3729,18 @@ class PaintApp:
         return self.master_counter
 
     def _relink_masters(self):
-        """Re-point every link layer at its master after a structural rebuild.
+        """Re-point every link layer at its source after a structural rebuild.
 
         Called after a project load, an undo/redo restore or a canvas delete:
-        the layers are rebuilt, so each link's resolved ``master`` object is
-        stale and must be found again by ``link_id``.
+        the layers are rebuilt, so each link's resolved ``master`` or
+        ``canvas_source`` is stale and must be found again by id. Layer links
+        resolve through ``link_id`` and canvas links through
+        ``link_canvas_id``; both can point at any canvas in the project.
         """
         masters = {}
+        canvases = {}
         for canvas in self.canvases:
+            canvases[getattr(canvas, "canvas_id", None)] = canvas
             for layer in canvas.layers:
                 if getattr(layer, "is_master", False) and layer.master_id is not None:
                     masters[layer.master_id] = layer
@@ -3736,6 +3748,11 @@ class PaintApp:
             for layer in canvas.layers:
                 if getattr(layer, "link_id", None) is not None:
                     layer.master = masters.get(layer.link_id)
+                if getattr(layer, "link_canvas_id", None) is not None:
+                    source = canvases.get(layer.link_canvas_id)
+                    layer.canvas_source = (
+                        source.link_source() if source is not None else None
+                    )
 
     def _links_to_master(self, master_id):
         """Every ``(canvas, layer)`` whose link layer points at ``master_id``."""
@@ -3868,6 +3885,107 @@ class PaintApp:
             choices.append((label, layer))
         return choices
 
+    def _canvas_link_reaches(self, canvas, target_id, seen=None):
+        """True when ``canvas`` already shows ``target_id`` (directly or not).
+
+        Used to refuse a link that would make two canvases render each other,
+        which is a cycle rather than a useful composition.
+        """
+        if canvas.canvas_id == target_id:
+            return True
+        seen = set() if seen is None else seen
+        if canvas.canvas_id in seen:
+            return False
+        seen.add(canvas.canvas_id)
+        for layer in canvas.layers:
+            link_id = getattr(layer, "link_canvas_id", None)
+            if link_id is None:
+                continue
+            source = getattr(layer, "canvas_source", None)
+            target = (
+                source.canvas if source is not None
+                else next(
+                    (doc for doc in self.canvases if doc.canvas_id == link_id),
+                    None,
+                )
+            )
+            if target is not None and self._canvas_link_reaches(
+                target, target_id, seen
+            ):
+                return True
+        return False
+
+    def link_layer_to_canvas(self, canvas_index):
+        """Make the selected layer(s) render another canvas's contents.
+
+        No master layer is needed: the target canvas itself is the source, so
+        edits to any of its layers show up in every link to it. The layer keeps
+        its position, opacity, blend mode, filters and per-instance mask, and
+        becomes read-only like a normal link layer.
+        """
+        if self.current is None:
+            self.set_result("There is no canvas to link from.")
+            return
+        if not (0 <= canvas_index < len(self.canvases)):
+            self.set_result("That canvas no longer exists.")
+            return
+        target = self.canvases[canvas_index]
+        if target is self.current:
+            self.set_result("A canvas cannot be linked into itself.")
+            return
+        if self._canvas_link_reaches(target, self.current.canvas_id):
+            self.set_result(
+                "That link would be circular: the target canvas shows this one."
+            )
+            return
+        multi = self._multi_layer_selection()
+        if multi is not None:
+            layers = [self.layers[index] for index in multi]
+        else:
+            layer = self.active_layer()
+            layers = [layer] if layer is not None else []
+        eligible = [
+            layer for layer in layers
+            if layer is not None and not layer.is_link and not layer.is_master
+        ]
+        if not eligible:
+            self.set_result("The selected layer is already a link or a master.")
+            return
+        self._push_undo("Link layer to canvas")
+        for layer in eligible:
+            layer.link_id = None
+            layer.master = None
+            layer.link_canvas_id = target.canvas_id
+            layer.canvas_source = target.link_source()
+            # A transform belongs to the old link identity; start the new
+            # canvas link untransformed so its content appears as authored.
+            layer.transform = None
+        self._refresh_layer_list()
+        self.render()
+        if self._transform_mode_active():
+            self.drawing.sync_transform()
+        if len(eligible) == 1:
+            self.set_result(
+                f"Layer '{eligible[0].name}' now shows canvas '{target.name}'."
+            )
+        else:
+            self.set_result(
+                f"{len(eligible)} layers now show canvas '{target.name}'."
+            )
+
+    def _unlink_canvas_links_to(self, canvas):
+        """Break every link to a deleted ``canvas`` into a local copy."""
+        for doc in self.canvases:
+            for layer in doc.layers:
+                if layer.link_canvas_id != canvas.canvas_id:
+                    continue
+                source = layer.canvas_source
+                if source is None:
+                    source = canvas.link_source()
+                layer.adopt_content(source)
+                layer.link_canvas_id = None
+                layer.canvas_source = None
+
     def create_link_layer(self, master):
         """Add a link layer to the active canvas pointing at ``master``."""
         if self.current is None:
@@ -3904,7 +4022,9 @@ class PaintApp:
             for layer in targets:
                 layer.adopt_content(layer.content_source())
                 layer.link_id = None
+                layer.link_canvas_id = None
                 layer.master = None
+                layer.canvas_source = None
             self._refresh_layer_list(multi)
             self.render()
             if self._transform_mode_active():
@@ -3919,7 +4039,9 @@ class PaintApp:
         self._push_undo("Unlink layer")
         layer.adopt_content(source)
         layer.link_id = None
+        layer.link_canvas_id = None
         layer.master = None
+        layer.canvas_source = None
         self._refresh_layer_list()
         self.render()
         if self._transform_mode_active():
@@ -3974,10 +4096,28 @@ class PaintApp:
         self.set_result(f"Reset the transform on '{layer.name}'.")
 
     def select_master(self):
-        """Jump to the active link layer's master (its canvas and row)."""
+        """Jump to the active link layer's source (its canvas and row)."""
         layer = self.active_layer()
         if layer is None or not layer.is_link:
             self.set_result("The active layer is not a link layer.")
+            return
+        if layer.link_canvas_id is not None:
+            source = layer.canvas_source
+            target = (
+                source.canvas if source is not None
+                else next(
+                    (
+                        canvas for canvas in self.canvases
+                        if canvas.canvas_id == layer.link_canvas_id
+                    ),
+                    None,
+                )
+            )
+            if target is None:
+                self.set_result("The source canvas could not be found.")
+                return
+            self._activate_canvas(self.canvases.index(target))
+            self.set_result(f"Selected source canvas '{target.name}'.")
             return
         master = layer.master
         if master is None:

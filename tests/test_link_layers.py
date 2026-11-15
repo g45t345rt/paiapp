@@ -67,6 +67,7 @@ def fake_app(doc):
         active_layer=doc.active_layer,
         _push_undo=lambda *_a, **_k: None,
         _refresh_layer_list=lambda *_a, **_k: None,
+        _multi_layer_selection=lambda: None,
         _group_sel=None,
         set_result=lambda *_a, **_k: None,
         render=lambda *_a, **_k: None,
@@ -86,6 +87,9 @@ def fake_app(doc):
     app._active_mask_layer = lambda: PaintApp._active_mask_layer(app)
     app._mask_from_selection = lambda layer, invert=False: (
         PaintApp._mask_from_selection(app, layer, invert)
+    )
+    app._remap_inpaint_mask = lambda doc, size, dx, dy: (
+        PaintApp._remap_inpaint_mask(app, doc, size, dx, dy)
     )
     return app
 

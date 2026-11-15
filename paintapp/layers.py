@@ -328,7 +328,7 @@ class LayerPanel(tk.Frame):
                  on_reorder=None, on_add_to_assets=None, on_master_convert=None,
                  on_master_remove=None,
                  on_link_create=None, on_unlink=None, on_select_master=None,
-                 on_link_reset_transform=None,
+                 on_link_reset_transform=None, on_link_canvas=None,
                  get_master_choices=None, on_move_to_canvas=None,
                  get_canvas_choices=None, on_group_duplicate=None,
                  on_text_duplicate=None, on_text_toggle=None,
@@ -430,6 +430,7 @@ class LayerPanel(tk.Frame):
         self._on_unlink = on_unlink
         self._on_select_master = on_select_master
         self._on_link_reset_transform = on_link_reset_transform
+        self._on_link_canvas = on_link_canvas
         self._get_master_choices = get_master_choices
         self._on_move_to_canvas = on_move_to_canvas
         self._get_canvas_choices = get_canvas_choices
@@ -2975,11 +2976,34 @@ class LayerPanel(tk.Frame):
             menu.add_command(
                 "Create Link Layer", command=lambda: None, enabled=False
             )
+        canvas_choices = (
+            self._get_canvas_choices() if self._get_canvas_choices else []
+        )
+        if canvas_choices:
+            canvas_link_menu = PopupMenu(menu)
+            for label, index in canvas_choices:
+                canvas_link_menu.add_command(
+                    label,
+                    command=lambda i=index: self._handle_link_canvas(i),
+                    enabled=any_plain,
+                )
+            menu.add_cascade(
+                "Link Layer to Canvas", canvas_link_menu, enabled=any_plain
+            )
+        else:
+            menu.add_command(
+                "Link Layer to Canvas", command=lambda: None, enabled=False
+            )
         menu.add_command(
             "Unlink Layer", command=self._handle_unlink, enabled=any_link
         )
+        select_label = (
+            "Select Source Canvas"
+            if single and layer is not None and getattr(layer, "link_canvas_id", None)
+            else "Select Master"
+        )
         menu.add_command(
-            "Select Master", command=self._handle_select_master, enabled=is_link
+            select_label, command=self._handle_select_master, enabled=is_link
         )
         menu.add_command(
             "Reset Link Transform", command=self._handle_link_reset_transform,
@@ -2998,6 +3022,10 @@ class LayerPanel(tk.Frame):
     def _handle_link_create(self, master):
         if self._on_link_create is not None:
             self._on_link_create(master)
+
+    def _handle_link_canvas(self, index):
+        if self._on_link_canvas is not None:
+            self._on_link_canvas(index)
 
     def _handle_unlink(self):
         if self._on_unlink is not None:

@@ -2,6 +2,8 @@
 
 import itertools
 import math
+import threading
+import uuid
 
 from PIL import Image, ImageChops, ImageDraw
 
@@ -23,6 +25,11 @@ MAX_BACKDROP_PIXELS = 12_000_000
 # its content had, and the layer panel's thumbnail cache (keyed on ``uid`` and
 # token) still hits instead of rebuilding every preview on each undo/redo.
 _counter = itertools.count(1)
+
+# Canvas sources are flattened on demand. A stack of the canvases currently
+# being flattened detects a link cycle (A shows B while B shows A), which would
+# otherwise recurse forever; the innermost repeat renders transparent instead.
+_canvas_source_state = threading.local()
 
 
 def next_token():
@@ -747,10 +754,18 @@ class Layer:
         # content at its own offset while keeping its own opacity/blend/
         # visibility. ``master`` is the resolved source object, rebuilt by the
         # app's relink pass after a project load or an undo restore.
+        #
+        # A link can also target a whole canvas instead of a layer. In that
+        # case ``link_canvas_id`` names the source canvas (project-stable) and
+        # ``canvas_source`` is the resolved :class:`CanvasSource` that renders
+        # it; ``link_id``/``master`` stay ``None``. Canvas links need no
+        # separate "master" step: any canvas in the project can be a source.
         self.is_master = False
         self.master_id = None
         self.link_id = None
         self.master = None
+        self.link_canvas_id = None
+        self.canvas_source = None
         # Per-instance transform for a link layer: a 6-tuple mapping the
         # master's *content* pixels into this layer's own buffer. ``None`` means
         # the content is shown untransformed. ``set_transform`` normalises the
@@ -892,6 +907,8 @@ class Layer:
         duplicate.master_id = self.master_id
         duplicate.link_id = self.link_id
         duplicate.master = self.master
+        duplicate.link_canvas_id = self.link_canvas_id
+        duplicate.canvas_source = self.canvas_source
         duplicate.transform = (
             tuple(self.transform) if self.transform is not None else None
         )
@@ -1591,16 +1608,19 @@ class Layer:
 
     @property
     def is_link(self):
-        """True when this layer renders another (master) layer's content."""
-        return self.link_id is not None
+        """True when this layer renders another layer's or canvas's content."""
+        return self.link_id is not None or self.link_canvas_id is not None
 
     def content_source(self):
-        """The layer holding the content this layer shows.
+        """The object holding the content this layer shows.
 
-        A resolved link returns its master; every other layer (a normal layer,
+        A resolved layer link returns its master; a resolved canvas link
+        returns its :class:`CanvasSource`; every other layer (a normal layer,
         a master, or an unresolved link) returns itself, so callers can treat
         content uniformly.
         """
+        if self.link_canvas_id is not None and self.canvas_source is not None:
+            return self.canvas_source
         if self.link_id is not None and self.master is not None:
             return self.master
         return self
@@ -1970,6 +1990,11 @@ class Canvas:
 
     def __init__(self, name, size):
         self.name = name
+        # Project-stable identity for canvas links. A canvas can be linked to
+        # by ``Layer.link_canvas_id``; names and tab indices are not stable
+        # enough (both can change), so links resolve through this id.
+        self.canvas_id = uuid.uuid4().hex
+        self._canvas_source = None
         self.width = int(size[0])
         self.height = int(size[1])
         self.layers = []
@@ -2069,6 +2094,17 @@ class Canvas:
         if not (0 <= self.active < len(self.layers)):
             return None
         return self.layers[self.active]
+
+    def link_source(self):
+        """The shared :class:`CanvasSource` that link layers render.
+
+        Cached so every link to this canvas shares the same flattened image
+        and content version, and relinking after load/undo does not need to
+        rebuild the source object.
+        """
+        if self._canvas_source is None:
+            self._canvas_source = CanvasSource(self)
+        return self._canvas_source
 
     def add_layer(self, name=None, fill=(0, 0, 0, 0), index=None, vector=False):
         self.layer_counter += 1
@@ -2200,6 +2236,7 @@ class Canvas:
                 "is_master": bool(layer.is_master),
                 "master_id": layer.master_id,
                 "link_id": layer.link_id,
+                "link_canvas_id": layer.link_canvas_id,
                 "filters": [filters.clone(spec) for spec in layer.filters],
                 "texts": [
                     clone for clone in (textrender.clone(spec) for spec in layer.texts)
@@ -2321,7 +2358,9 @@ class Canvas:
             layer.is_master = bool(layer_entry.get("is_master", False))
             layer.master_id = layer_entry.get("master_id")
             layer.link_id = layer_entry.get("link_id")
+            layer.link_canvas_id = layer_entry.get("link_canvas_id")
             layer.master = None
+            layer.canvas_source = None
             layer.filters = [
                 spec
                 for spec in (
@@ -3223,3 +3262,147 @@ class Canvas:
         out = Image.new("RGBA", (width, height), (0, 0, 0, 0))
         out.paste(resized, ((width - nw) // 2, (height - nh) // 2), resized)
         return out
+
+
+class CanvasSource:
+    """A layer-compatible source that renders a whole :class:`Canvas`.
+
+    A link layer normally points at a master :class:`Layer`. To link to a
+    canvas instead, the layer's ``canvas_source`` is one of these adapters, so
+    all the existing link rendering (offset, per-instance transform and mask,
+    read-only behaviour, unlink) works unchanged. The adapter exposes the same
+    small surface the link renderer uses: a flattened RGBA ``image``, content
+    tokens, an empty mask and empty editable-object lists.
+    """
+
+    def __init__(self, canvas):
+        self.canvas = canvas
+        self.uid = ("canvas", canvas.canvas_id)
+        self.offset = (0, 0)
+        self.visible = True
+        self.locked = False
+        self.is_master = False
+        self.master_id = None
+        self.link_id = None
+        self.link_canvas_id = None
+        self.transform = None
+        self.mask = None
+        self.filters = []
+        self.texts = []
+        self.gradients = []
+        self.vector = False
+        self.strokes = []
+        self.fills = []
+        self.paths = []
+        self.poses = []
+        self.pose_scene = None
+        self._image = None
+        self._key = None
+        self._token = next_token()
+
+    @property
+    def size(self):
+        return self.canvas.size
+
+    @property
+    def name(self):
+        return self.canvas.name
+
+    def content_offset(self):
+        return (0, 0)
+
+    def content_source(self):
+        return self
+
+    @property
+    def image(self):
+        return self._ensure()
+
+    def filtered_image(self):
+        return self._ensure()
+
+    def _composited_image_at(self, offset, include_mask=True):
+        return self._ensure()
+
+    def _composited_region_at(self, box, offset):
+        return self._ensure().crop(box)
+
+    def _signature(self):
+        """Every input that changes the flattened canvas."""
+        canvas = self.canvas
+        return (
+            canvas.canvas_id,
+            canvas.width,
+            canvas.height,
+            tuple(Canvas._layer_signature(layer) for layer in canvas.layers),
+            tuple(
+                (
+                    group.uid,
+                    group.visible,
+                    group.opacity,
+                    bool(group.keep_empty),
+                    filters.chain_key(getattr(group, "filters", []) or []),
+                )
+                for group in canvas.groups
+            ),
+        )
+
+    def _ensure(self):
+        """The canvas's current flatten, rebuilt only when its content changes."""
+        canvas = self.canvas
+        active = getattr(_canvas_source_state, "active", None)
+        if active is None:
+            active = set()
+            _canvas_source_state.active = active
+        if canvas.canvas_id in active:
+            # A link cycle: this canvas is already being flattened higher up
+            # the stack, so its contribution here is empty.
+            self._token = ("cycle", canvas.canvas_id)
+            return Image.new("RGBA", canvas.size, (0, 0, 0, 0))
+        active.add(canvas.canvas_id)
+        try:
+            key = self._signature()
+            if self._image is None or self._key != key:
+                self._image = canvas.composite_transparent()
+                self._key = key
+                self._token = next_token()
+            return self._image
+        finally:
+            active.discard(canvas.canvas_id)
+
+    # The link renderer reads these content versions; they all track the one
+    # flattened canvas so any source edit invalidates every link that shows it.
+    @property
+    def _image_token(self):
+        self._ensure()
+        return self._token
+
+    @property
+    def _text_token(self):
+        self._ensure()
+        return self._token
+
+    @property
+    def _vector_token(self):
+        self._ensure()
+        return self._token
+
+    @property
+    def _poses_token(self):
+        self._ensure()
+        return self._token
+
+    @property
+    def _path_token(self):
+        self._ensure()
+        return self._token
+
+    @property
+    def _gradient_token(self):
+        self._ensure()
+        return self._token
+
+    @property
+    def _mask_token(self):
+        self._ensure()
+        return self._token
