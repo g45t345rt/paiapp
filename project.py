@@ -33,6 +33,7 @@ import io
 import json
 import math
 import os
+import shutil
 import zipfile
 from concurrent.futures import ThreadPoolExecutor
 
@@ -496,15 +497,126 @@ def _app_library(app):
     return library if library is not None else AssetLibrary()
 
 
+def _flush_file(path):
+    """Flush ``path``'s data to disk before it is moved into place.
+
+    Without this, a power cut can persist the rename but not the file's
+    contents, leaving a correctly-sized project full of zeros.
+    """
+    fd = os.open(path, os.O_RDWR)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def _sync_directory(path):
+    """Persist a rename in ``path``'s directory (POSIX only, best effort)."""
+    if os.name != "posix":
+        return
+    directory = os.path.dirname(os.path.abspath(path)) or os.curdir
+    try:
+        fd = os.open(directory, os.O_RDONLY)
+    except OSError:
+        return
+    try:
+        os.fsync(fd)
+    except OSError:
+        pass
+    finally:
+        os.close(fd)
+
+
+def _move_file_write_through(source, destination):
+    """Move ``source`` over ``destination`` with a write-through rename."""
+    import ctypes
+    from ctypes import wintypes
+
+    move_file_ex = ctypes.windll.kernel32.MoveFileExW
+    move_file_ex.argtypes = [
+        wintypes.LPCWSTR, wintypes.LPCWSTR, wintypes.DWORD,
+    ]
+    move_file_ex.restype = wintypes.BOOL
+    # MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH
+    flags = 0x1 | 0x8
+    if not move_file_ex(
+        os.fsdecode(source), os.fsdecode(destination), flags
+    ):
+        raise ctypes.WinError()
+
+
+def _replace_durably(source, destination):
+    """Move ``source`` over ``destination``, flushing the rename to disk."""
+    if os.name == "nt":
+        try:
+            _move_file_write_through(source, destination)
+            return
+        except OSError:
+            # Some filesystems reject write-through moves. The data itself is
+            # already flushed, so fall back to a plain atomic replace.
+            pass
+    os.replace(source, destination)
+    _sync_directory(destination)
+
+
+def _verify_archive(path, members):
+    """Reopen a freshly written archive and check it before using it.
+
+    ``members`` are the files the manifest refers to; every one must be present
+    or the archive would fail to load.
+    """
+    with zipfile.ZipFile(path) as archive:
+        broken = archive.testzip()
+        if broken is not None:
+            raise OSError(f"archive member {broken!r} failed its checksum")
+        names = set(archive.namelist())
+        if MANIFEST not in names:
+            raise OSError("archive is missing its project manifest")
+        missing = [name for name in members if name not in names]
+        if missing:
+            raise OSError(
+                f"archive is missing {len(missing)} member(s), "
+                f"starting with {missing[0]!r}"
+            )
+        try:
+            json.loads(archive.read(MANIFEST).decode("utf-8"))
+        except (UnicodeDecodeError, ValueError) as exc:
+            raise OSError(f"archive manifest is not valid JSON: {exc}") from exc
+
+
+_BACKUPS = 1
+
+
+def _backup_project(path):
+    """Rotate the previous saves to ``.bak``, ``.bak.1``, ... before replacing.
+
+    The newest backup is always ``path + ".bak"``; older generations move up a
+    suffix so a corrupt intermediate save cannot overwrite the last good copy.
+    """
+    if not os.path.exists(path):
+        return None
+    for index in range(_BACKUPS - 1, 0, -1):
+        older = f"{path}.bak.{index}"
+        newer = f"{path}.bak.{index - 1}" if index > 1 else f"{path}.bak"
+        if os.path.exists(newer):
+            os.replace(newer, older)
+    backup = path + ".bak"
+    shutil.copyfile(path, backup)
+    _flush_file(backup)
+    return backup
+
+
 def write(payload, path, progress=None, cancel=None):
     """Encode a :func:`snapshot` payload into a ``.pai`` archive at ``path``.
 
     Runs on a worker thread, so it touches no widgets: it writes one PNG per
     copied image plus the manifest, reporting ``progress(frac)`` once per
     written image (a layer's PNG, plus one more when it carries a mask) and
-    checking ``cancel`` before each. The archive is built at ``path + ".tmp"``
-    and moved into place, so a crash or a cancelled write never damages an
-    existing project.
+    checking ``cancel`` before each. The archive is built at ``path + ".tmp"``,
+    flushed and verified, then moved into place; the previous file is kept as
+    ``path + ".bak"``, so a crash or a cancelled write never damages it. The
+    manifest is written first, so even a truncated archive still records the
+    layers it was meant to contain.
     """
     manifest = payload["manifest"]
     images = payload["images"]
@@ -515,22 +627,27 @@ def write(payload, path, progress=None, cancel=None):
 
     tmp = path + ".tmp"
     try:
+        filenames = [
+            asset_entry.get("file")
+            for asset_entry in manifest.get("assets", []) or []
+        ]
+        for entry in manifest["canvases"]:
+            filenames += [
+                layer_entry.get(key)
+                for layer_entry in entry["layers"]
+                for key in ("file", "mask")
+            ]
+        members = [filename for filename in filenames if filename]
+        jobs = [
+            (filename, images[filename])
+            for filename in filenames
+            if filename and images.get(filename) is not None
+        ]
+
         with zipfile.ZipFile(tmp, "w", zipfile.ZIP_DEFLATED) as zf:
-            filenames = [
-                asset_entry.get("file")
-                for asset_entry in manifest.get("assets", []) or []
-            ]
-            for entry in manifest["canvases"]:
-                filenames += [
-                    layer_entry.get(key)
-                    for layer_entry in entry["layers"]
-                    for key in ("file", "mask")
-                ]
-            jobs = [
-                (filename, images[filename])
-                for filename in filenames
-                if filename and images.get(filename) is not None
-            ]
+            # The manifest goes first so a truncated archive still records
+            # every layer it was meant to hold.
+            zf.writestr(MANIFEST, json.dumps(manifest, indent=2))
 
             def store(index, data):
                 nonlocal done
@@ -544,8 +661,10 @@ def write(payload, path, progress=None, cancel=None):
             _run_parallel(
                 lambda _name, image: _encode_png(image), jobs, store, cancel
             )
-            zf.writestr(MANIFEST, json.dumps(manifest, indent=2))
-        os.replace(tmp, path)
+        _flush_file(tmp)
+        _verify_archive(tmp, members)
+        _backup_project(path)
+        _replace_durably(tmp, path)
     except BaseException:
         try:
             os.remove(tmp)

@@ -6,9 +6,11 @@ stand-in app and check the fractions it reports and that the archive it writes
 round-trips through :func:`project.read`.
 """
 
+import json
 import os
 import sys
 import tempfile
+import zipfile
 from types import SimpleNamespace
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -364,6 +366,100 @@ def test_malformed_view_state_is_ignored():
     check("nan anchor", project._load_view_state(
         {"zoom": 2.0, "anchor": [float("nan"), 0]}
     ), None)
+
+
+def test_manifest_is_written_first():
+    app = fake_app([fake_layer("A", (1, 2, 3, 255))])
+    with tempfile.TemporaryDirectory() as tmp:
+        path = os.path.join(tmp, "sample.pai")
+        project.save(app, path)
+        with zipfile.ZipFile(path) as zf:
+            names = zf.namelist()
+    check("manifest is the first member", names[0], project.MANIFEST)
+
+
+def test_save_keeps_previous_versions_as_backup():
+    def saved_layer_name(path):
+        with zipfile.ZipFile(path) as zf:
+            manifest = json.loads(zf.read(project.MANIFEST))
+        return manifest["canvases"][0]["layers"][0]["name"]
+
+    first = fake_app([fake_layer("First", (255, 0, 0, 255))])
+    second = fake_app([fake_layer("Second", (0, 255, 0, 255))])
+    third = fake_app([fake_layer("Third", (0, 0, 255, 255))])
+    with tempfile.TemporaryDirectory() as tmp:
+        path = os.path.join(tmp, "sample.pai")
+        project.save(first, path)
+        check("no backup before the second save", os.path.exists(path + ".bak"), False)
+        project.save(second, path)
+        project.save(third, path)
+        check("newest backup holds the previous save",
+              saved_layer_name(path + ".bak"), "Second")
+        check("older backup holds the save before that",
+              saved_layer_name(path + ".bak.1"), "First")
+        check("current file holds the latest save",
+              saved_layer_name(path), "Third")
+
+
+def test_failed_verification_keeps_original():
+    app = fake_app([fake_layer("A", (1, 2, 3, 255))])
+    with tempfile.TemporaryDirectory() as tmp:
+        path = os.path.join(tmp, "sample.pai")
+        project.save(app, path)
+        with open(path, "rb") as handle:
+            original = handle.read()
+
+        real_verify = project._verify_archive
+
+        def fail_verify(*_args, **_kwargs):
+            raise OSError("simulated corruption")
+
+        project._verify_archive = fail_verify
+        try:
+            raised = False
+            try:
+                project.save(app, path)
+            except OSError:
+                raised = True
+        finally:
+            project._verify_archive = real_verify
+
+        with open(path, "rb") as handle:
+            after = handle.read()
+        check("save fails when verification fails", raised, True)
+        check("original survives a failed save", after, original)
+        check("temp file is cleaned up", os.path.exists(path + ".tmp"), False)
+
+
+def test_verify_rejects_missing_member():
+    with tempfile.TemporaryDirectory() as tmp:
+        path = os.path.join(tmp, "bad.pai")
+        with zipfile.ZipFile(path, "w") as zf:
+            zf.writestr(project.MANIFEST, "{}")
+        raised = False
+        try:
+            project._verify_archive(path, ["missing.png"])
+        except OSError:
+            raised = True
+    check("verification catches a missing member", raised, True)
+
+
+def test_verify_rejects_bad_checksum():
+    with tempfile.TemporaryDirectory() as tmp:
+        path = os.path.join(tmp, "bad.pai")
+        with zipfile.ZipFile(path, "w", zipfile.ZIP_STORED) as zf:
+            zf.writestr(project.MANIFEST, "{}")
+            zf.writestr("layer.png", b"payload")
+        data = bytearray(open(path, "rb").read())
+        data[data.find(b"payload")] = ord("P")
+        with open(path, "wb") as handle:
+            handle.write(data)
+        raised = False
+        try:
+            project._verify_archive(path, ["layer.png"])
+        except OSError:
+            raised = True
+    check("verification catches a bad checksum", raised, True)
 
 
 def main():
