@@ -1143,13 +1143,14 @@ class PaintApp:
         content = self._add_panel("references", "References")
         self.references_panel = ReferencesPanel(
             content, on_settings=self._on_reference_settings,
-            on_capture=self._capture_reference_selection,
+            on_capture=self._capture_selection_binding,
         )
         self.references_panel.pack(fill=tk.X)
 
         content = self._add_panel("controlnet", "ControlNet")
         self.controlnet_panel = ControlNetPanel(
             content, on_settings=self._on_control_settings,
+            on_capture=self._capture_selection_binding,
         )
         self.controlnet_panel.pack(fill=tk.X)
 
@@ -9299,7 +9300,9 @@ class PaintApp:
         Each row picks its own source, so different adapters can steer from
         different images (the 3D-pose mesh and the regional colour map, for
         instance). ``Source`` reuses the run's own source image, matching the
-        historical single-ControlNet behaviour.
+        historical single-ControlNet behaviour. A row whose source is a layer
+        or asset resolves its pinned binding, falling back to the current
+        selection when the row was never assigned (old projects).
         """
         images = []
         for row in rows:
@@ -9307,17 +9310,15 @@ class PaintApp:
             if hint == HINT_CANVAS:
                 image = self.composite()
             elif hint == HINT_LAYER:
-                layer = self.active_layer()
-                if layer is None:
+                image = self._binding_image(row.get("binding") or {"source": "layer"})
+                if image is None:
                     self.set_result("Select a layer for the control hint.", "warn")
                     return None
-                image = self._layer_init_image(layer)
             elif hint == HINT_ASSET:
-                asset = self.selected_asset()
-                if asset is None:
+                image = self._binding_image(row.get("binding") or {"source": "asset"})
+                if image is None:
                     self.set_result("Select an asset for the control hint.", "warn")
                     return None
-                image = self._asset_init_image(asset)
             else:
                 if init_image is None:
                     self.set_result(
@@ -9329,13 +9330,14 @@ class PaintApp:
             images.append(image)
         return images
 
-    def _capture_reference_selection(self, kind):
-        """Snapshot the current selection of ``kind`` into a reference binding.
+    def _capture_selection_binding(self, kind):
+        """Snapshot the current selection of ``kind`` into a binding.
 
         ``kind`` is ``"asset"``, ``"layer"`` or ``"canvas"``. The returned dict
         pins a specific asset id or layer name (or the canvas) together with a
-        display label, so two reference rows can hold two different assets.
-        ``None`` (with a warning) means there was nothing of that kind selected.
+        display label, so two rows (reference or control hint) can hold two
+        different assets. ``None`` (with a warning) means there was nothing of
+        that kind selected.
         """
         if kind == "canvas":
             if self.current is None:
@@ -9358,7 +9360,7 @@ class PaintApp:
         return None
 
     def _binding_image(self, binding):
-        """Resolve one reference binding to a plain RGB image, or ``None``.
+        """Resolve one binding to a plain RGB image, or ``None``.
 
         A binding pinned to an asset id or layer name resolves that exact item;
         a binding with only a kind (an unassigned row, or an old project) falls

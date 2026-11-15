@@ -29,7 +29,7 @@ re-resolve a shared "current selection" for every row at generate time.
 
 The panel is a form only: it reports its fields through ``on_settings`` and asks
 the coordinator to capture an image through ``on_capture`` (see
-:meth:`~paintapp.app.PaintApp._capture_reference_selection`); the coordinator
+:meth:`~paintapp.app.PaintApp._capture_selection_binding`); the coordinator
 folds the bindings into the run config and captures the images (see
 :meth:`~paintapp.app.PaintApp.start_generate`). The family is pushed in by the
 coordinator with :meth:`ReferencesPanel.set_family` (it owns the model picker).

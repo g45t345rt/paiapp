@@ -8,9 +8,19 @@ each row carries everything one adapter needs: the model, where its control
 image comes from, the control type (preprocessor), the strength and the step
 range (start/end fraction) over which it applies.
 
-The panel is a form only: it reports its rows through ``on_settings`` and the
-coordinator resolves each row's hint image and folds the rows into the run
-config (see :func:`~engine.pipeline.generate`).
+The control image comes from one of four places. ``Source`` reuses the run's
+own init image and ``Canvas`` reads the live composite, so both stay live. The
+two selection kinds are *assigned*: pick ``Selected layer`` or ``Selected
+asset``, press **Assign**, and the row pins that exact layer name or asset id.
+Pinning is what lets two adapters steer from two different layers or assets --
+a live "current selection" would point every row at the same one. An
+unassigned row falls back to the current selection when the run starts, so
+projects saved before assignments existed keep working.
+
+The panel is a form only: it reports its rows through ``on_settings``, asks the
+coordinator to capture a selection through ``on_capture``, and the coordinator
+resolves each row's hint image and folds the rows into the run config (see
+:func:`~engine.pipeline.generate`).
 """
 
 import os
@@ -35,6 +45,13 @@ HINT_CANVAS = "Canvas"
 HINT_LAYER = "Selected layer"
 HINT_ASSET = "Selected asset"
 HINT_CHOICES = (HINT_SOURCE, HINT_CANVAS, HINT_LAYER, HINT_ASSET)
+
+# The kinds that pin a captured selection. Source and Canvas read a live image
+# and have no identity to pin, so their Target line stays hidden.
+ASSIGNABLE_HINTS = (HINT_LAYER, HINT_ASSET)
+# A row's hint kind <-> the canonical token stored in its binding.
+_HINT_TOKENS = {HINT_LAYER: "layer", HINT_ASSET: "asset"}
+_TOKEN_HINTS = {token: label for label, token in _HINT_TOKENS.items()}
 
 # Families whose control adapters the panel can offer, mapped to the ``kind``
 # the engine expects in a config entry.
@@ -91,11 +108,15 @@ class ControlNetPanel(tk.Frame):
     else. For an unsupported family the stack is emptied and adding is disabled.
     """
 
-    def __init__(self, parent, on_settings=None):
+    def __init__(self, parent, on_settings=None, on_capture=None):
         super().__init__(parent)
         # Called with the row list whenever a row changes, so the coordinator can
         # remember the stack on the active canvas and layer.
         self._on_settings = on_settings
+        # ``on_capture(kind)`` pins the current selection of ``kind``
+        # ("asset"/"layer") into a binding, or returns ``None`` after warning.
+        # Supplied by the coordinator.
+        self._on_capture = on_capture
         self._family = None
         self._rows = []
         # Guards programmatic writes (set_settings/rebuilds) from echoing back.
@@ -170,7 +191,7 @@ class ControlNetPanel(tk.Frame):
 
     # -------------------------------------------------------------------- rows
     def add_row(self, model=None, hint=None, preprocessor=None, strength=1.0,
-                start=0.0, end=1.0):
+                start=0.0, end=1.0, binding=None):
         """Append an adapter row, optionally seeded from stored settings."""
         if not self.supported():
             return
@@ -205,27 +226,46 @@ class ControlNetPanel(tk.Frame):
         hint_menu.grid(row=1, column=1, columnspan=2, sticky="ew", padx=(4, 0), pady=(3, 0))
         row["hint_menu"] = hint_menu
 
-        # Line 3: the control type (preprocessor applied to the control image).
-        caption(2, "Preprocess:")
+        # Line 3: the pinned selection for the assignable kinds. Source and
+        # Canvas read a live image, so this line is hidden for them.
+        target_caption = caption(2, "Target:")
+        target_frame = tk.Frame(frame)
+        target_frame.grid(row=2, column=1, columnspan=2, sticky="ew",
+                          padx=(4, 0), pady=(3, 0))
+        target_var = tk.StringVar()
+        assign = tk.Button(
+            target_frame, text="Assign", width=6,
+            command=lambda: self._assign_row(row),
+        )
+        assign.pack(side=tk.LEFT)
+        target_label = tk.Label(target_frame, textvariable=target_var, anchor="w")
+        target_label.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(4, 0))
+        row["target_caption"] = target_caption
+        row["target_frame"] = target_frame
+        row["target_var"] = target_var
+        row["assign"] = assign
+
+        # Line 4: the control type (preprocessor applied to the control image).
+        caption(3, "Preprocess:")
         type_menu = ttk.Combobox(
             frame, textvariable=tk.StringVar(),
             values=list(engine_preprocess.PREPROCESSORS), state="readonly", width=8,
         )
-        type_menu.grid(row=2, column=1, columnspan=2, sticky="ew", padx=(4, 0), pady=(3, 0))
+        type_menu.grid(row=3, column=1, columnspan=2, sticky="ew", padx=(4, 0), pady=(3, 0))
         row["type_menu"] = type_menu
 
-        # Line 4: how strongly the adapter steers the run.
-        caption(3, "Strength:")
+        # Line 5: how strongly the adapter steers the run.
+        caption(4, "Strength:")
         strength_spin = tk.Spinbox(
             frame, from_=0.0, to=2.0, increment=0.05, width=5,
         )
-        strength_spin.grid(row=3, column=1, columnspan=2, sticky="ew", padx=(4, 0), pady=(3, 0))
+        strength_spin.grid(row=4, column=1, columnspan=2, sticky="ew", padx=(4, 0), pady=(3, 0))
         row["strength_spin"] = strength_spin
 
-        # Line 5: the step range (as start/end fractions) the adapter applies over.
-        caption(4, "Steps:")
+        # Line 6: the step range (as start/end fractions) the adapter applies over.
+        caption(5, "Steps:")
         step_frame = tk.Frame(frame)
-        step_frame.grid(row=4, column=1, columnspan=2, sticky="ew", padx=(4, 0), pady=(3, 0))
+        step_frame.grid(row=5, column=1, columnspan=2, sticky="ew", padx=(4, 0), pady=(3, 0))
         step_frame.columnconfigure(0, weight=1)
         step_frame.columnconfigure(2, weight=1)
         start_spin = tk.Spinbox(step_frame, from_=0.0, to=1.0, increment=0.05, width=5)
@@ -239,9 +279,13 @@ class ControlNetPanel(tk.Frame):
         # A hairline under every row separates the several adapters a run can
         # stack; the line rides on the row, so removing one keeps it right.
         divider = tk.Frame(frame, height=1, bd=0, highlightthickness=0)
-        divider.grid(row=5, column=0, columnspan=3, sticky="we", pady=(6, 0))
+        divider.grid(row=6, column=0, columnspan=3, sticky="we", pady=(6, 0))
         theme.register(divider, bg="border")
 
+        # A stored binding can supply the kind when the row has none.
+        row["binding"] = dict(binding) if binding else None
+        if hint is None and binding:
+            hint = _TOKEN_HINTS.get(binding.get("source"))
         row["model_var"] = tk.StringVar()
         row["hint_var"] = tk.StringVar(value=hint or HINT_SOURCE)
         row["type_var"] = tk.StringVar(
@@ -250,6 +294,15 @@ class ControlNetPanel(tk.Frame):
         row["strength_var"] = tk.DoubleVar(value=float(strength))
         row["start_var"] = tk.DoubleVar(value=float(start))
         row["end_var"] = tk.DoubleVar(value=float(end))
+        if row["binding"] and row["binding"].get("source") != _HINT_TOKENS.get(
+            row["hint_var"].get()
+        ):
+            # A stored binding that no longer matches the row's kind (a hand
+            # edit, or a kind changed without Assign) is stale; drop it so the
+            # row falls back to the live selection like an unassigned one.
+            row["binding"] = None
+        if row["binding"]:
+            target_var.set(row["binding"].get("label", ""))
 
         model_menu.configure(textvariable=row["model_var"])
         hint_menu.configure(textvariable=row["hint_var"])
@@ -259,16 +312,19 @@ class ControlNetPanel(tk.Frame):
         end_spin.configure(textvariable=row["end_var"])
 
         for var in (
-            row["model_var"], row["hint_var"], row["type_var"],
+            row["model_var"], row["type_var"],
             row["strength_var"], row["start_var"], row["end_var"],
         ):
             var.trace_add("write", lambda *_: self._changed())
+        # A hint change can invalidate a pin, so it needs its own handler.
+        row["hint_var"].trace_add("write", lambda *_: self._hint_changed(row))
 
         # Rows are built after the app's initial theme pass, so style them here
         # or they keep the light default chrome in dark mode.
         theme.restyle(frame)
         self._rows.append(row)
         self._rebuild_row_catalog(row, preferred=model)
+        self._sync_target_row(row)
         self._refresh_add_state()
         if model is None:
             self._changed()
@@ -299,6 +355,39 @@ class ControlNetPanel(tk.Frame):
         else:
             row["model_var"].set(NONE)
 
+    def _sync_target_row(self, row):
+        """Show the Assign line only for the kinds that pin a selection."""
+        if row["hint_var"].get() in ASSIGNABLE_HINTS:
+            row["target_caption"].grid()
+            row["target_frame"].grid()
+        else:
+            row["target_caption"].grid_remove()
+            row["target_frame"].grid_remove()
+
+    def _hint_changed(self, row):
+        """Drop a pin that no longer matches the row's hint kind."""
+        token = _HINT_TOKENS.get(row["hint_var"].get())
+        binding = row["binding"]
+        if binding is not None and binding.get("source") != token:
+            row["binding"] = None
+            row["target_var"].set("")
+        self._sync_target_row(row)
+        self._changed()
+
+    def _assign_row(self, row):
+        """Pin the current selection of the row's kind into the row."""
+        if self._on_capture is None:
+            return
+        token = _HINT_TOKENS.get(row["hint_var"].get())
+        if token is None:
+            return
+        binding = self._on_capture(token)
+        if not binding:
+            return
+        row["binding"] = dict(binding)
+        row["target_var"].set(binding.get("label", ""))
+        self._changed()
+
     def _refresh_add_state(self):
         supported = self.supported()
         enabled = supported and self.enabled()
@@ -307,11 +396,13 @@ class ControlNetPanel(tk.Frame):
             self._family in SINGLE_ADAPTER_FAMILIES and self._rows
         )
         self.add_btn.config(state=tk.NORMAL if allows_more else tk.DISABLED)
+        assignable = enabled and self._on_capture is not None
         for row in self._rows:
             for key in ("model_menu", "hint_menu", "type_menu"):
                 row[key].config(state="readonly" if enabled else "disabled")
             for key in ("strength_spin", "start_spin", "end_spin"):
                 row[key].config(state=tk.NORMAL if enabled else tk.DISABLED)
+            row["assign"].config(state=tk.NORMAL if assignable else tk.DISABLED)
 
     def _update_hint(self):
         if not self.supported():
@@ -334,7 +425,7 @@ class ControlNetPanel(tk.Frame):
             model = (row["choices"] or {}).get(row["model_var"].get())
             if not model:
                 continue
-            rows.append({
+            entry = {
                 "kind": FAMILY_KIND.get(self._family),
                 "model": model,
                 "display": row["model_var"].get(),
@@ -343,7 +434,10 @@ class ControlNetPanel(tk.Frame):
                 "strength": self._number(row["strength_var"], 1.0),
                 "start": self._number(row["start_var"], 0.0),
                 "end": self._number(row["end_var"], 1.0),
-            })
+            }
+            if row["binding"]:
+                entry["binding"] = dict(row["binding"])
+            rows.append(entry)
         return rows
 
     def set_settings(self, rows):
@@ -364,6 +458,7 @@ class ControlNetPanel(tk.Frame):
                     strength=item.get("strength", 1.0),
                     start=item.get("start", 0.0),
                     end=item.get("end", 1.0),
+                    binding=item.get("binding"),
                 )
         finally:
             self._loading = False
