@@ -4419,12 +4419,14 @@ class CanvasArea(tk.Frame):
             view.set_bg_color(bg)
 
     # ------------------------------------------------------------- preview bar
-    def show_preview_bar(self, buttons):
+    def show_preview_bar(self, buttons, info=None):
         """Overlay a floating action bar on the active page.
 
         ``buttons`` is a sequence of ``(label, callback)`` pairs, optionally
         ``(label, callback, enabled)``. Used by the generation preview to offer
         rejecting the run, or landing it in a layer or the canvas assets.
+        ``info`` is optional detail text (the asset preview shows its filename
+        and dimensions above the buttons).
         """
         self.hide_preview_bar()
         index = self.active_index()
@@ -4435,14 +4437,21 @@ class CanvasArea(tk.Frame):
             highlightbackground=theme.color("border"),
         )
         theme.register(bar, bg="panel_bg", highlightbackground="border")
-        for spec in buttons:
+        if info:
+            label = tk.Label(
+                bar, text=info, anchor="w", justify="left",
+            )
+            theme.register(label, fg="text")
+            label.pack(fill=tk.X, padx=6, pady=(6, 0))
+        for position, spec in enumerate(buttons):
             label, callback = spec[0], spec[1]
             enabled = spec[2] if len(spec) > 2 else True
             button = tk.Button(
                 bar, text=label, command=callback,
                 state=tk.NORMAL if enabled else tk.DISABLED,
             )
-            button.pack(side=tk.LEFT, padx=(0, 6), pady=6)
+            left = 6 if position == 0 else 0
+            button.pack(side=tk.LEFT, padx=(left, 6), pady=6)
         # The bar is built after the last theme pass, so theme it here: the
         # class defaults give the buttons their dark/light colors.
         theme.restyle(bar)

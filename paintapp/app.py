@@ -14,6 +14,7 @@ from PIL import PngImagePlugin
 
 import project
 
+from . import assetview
 from . import dialogs
 from . import colormanagement
 from . import combobox as _combobox
@@ -71,6 +72,14 @@ from .shortcuts import ShortcutManager
 from .sidebar import Sidebar, ToolsRail
 from .ui import PopupMenu, StatusBar, build_menubar
 from .upscale_panel import UpscalePanel
+
+
+def _file_size(path):
+    """The size of ``path`` in bytes, or ``None`` when it cannot be read."""
+    try:
+        return os.path.getsize(path)
+    except OSError:
+        return None
 
 
 # Every picker should show its full value in the drop-down, so swap in the
@@ -2747,7 +2756,7 @@ class PaintApp:
         self._set_modified(True)
         asset = self.current.add_asset(
             name=os.path.basename(path), image=image, source="imported",
-            group=self._target_asset_group(),
+            group=self._target_asset_group(), byte_size=_file_size(path),
         )
         self._refresh_asset_list()
         self._select_asset(asset, reveal=True)
@@ -6676,6 +6685,7 @@ class PaintApp:
             return
         name = "Pasted"
         image = None
+        byte_size = None
         if self._clipboard is not None and self._clipboard.getbbox() is not None:
             image = self._clipboard.copy()
         else:
@@ -6690,6 +6700,7 @@ class PaintApp:
                     except Exception:
                         continue
                     name = os.path.basename(path)
+                    byte_size = _file_size(path)
                     break
         if image is None:
             self.set_result("Clipboard is empty.")
@@ -6697,7 +6708,7 @@ class PaintApp:
         self._set_modified(True)
         asset = self.current.add_asset(
             name=name, image=image, source="imported",
-            group=self._target_asset_group(),
+            group=self._target_asset_group(), byte_size=byte_size,
         )
         self._refresh_asset_list()
         self._select_asset(asset, reveal=True)
@@ -10121,7 +10132,7 @@ class PaintApp:
                 (layer_label, self.accept_asset_preview_in_layer,
                  layer is not None),
                 ("Insert as new layer", self.accept_asset_preview_as_layer),
-            ])
+            ], info=self._asset_preview_info(preview.get("asset")))
             return
         self.area.show_preview_bar([
             ("Reject", self.reject_generation_preview),
@@ -10220,6 +10231,21 @@ class PaintApp:
         self.set_result(
             f"Preview of '{asset.name}': insert it or close the preview."
         )
+
+    def _asset_preview_info(self, asset):
+        """The header shown over an asset preview: name, dimensions and size."""
+        if asset is None:
+            return ""
+        width, height = asset.image.size
+        parts = [f"{width} \u00d7 {height}"]
+        size = assetview.format_size(assetview.asset_size(asset))
+        if size:
+            parts.append(size)
+        parts.append(assetview.asset_source(asset).capitalize())
+        tags = getattr(asset, "tags", None)
+        if tags:
+            parts.append(", ".join(tags))
+        return asset.name + "\n" + "  \u00b7  ".join(parts)
 
     def dismiss_asset_preview(self):
         """Close a pending asset preview without changing the document."""

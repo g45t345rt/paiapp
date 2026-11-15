@@ -605,15 +605,16 @@ class AssetsPanel(tk.Frame):
         return photo
 
     def _info(self, asset):
-        """The secondary line under an asset's name: size, source and tags."""
+        """The secondary line under an asset's name: dimensions, size and source."""
         width, height = asset.image.size
-        info = (
-            f"{width} \u00d7 {height}  \u00b7  "
-            f"{assetview.asset_source(asset)}"
-        )
+        parts = [f"{width} \u00d7 {height}"]
+        size = assetview.format_size(assetview.asset_size(asset))
+        if size:
+            parts.append(size)
+        parts.append(assetview.asset_source(asset))
         if asset.tags:
-            info += "  \u00b7  " + ", ".join(asset.tags)
-        return info
+            parts.append(", ".join(asset.tags))
+        return "  \u00b7  ".join(parts)
 
     def _thumb(self, image):
         """An ``RGB`` thumbnail of ``image`` over a checkerboard, fitted to a box."""

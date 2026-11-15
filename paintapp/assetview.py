@@ -7,6 +7,8 @@ It knows nothing about Tkinter; :class:`paintapp.assets.AssetsPanel` renders the
 rows it returns.
 """
 
+import io
+
 # Sort keys shown in the panel's Sort menu, in menu order.
 SORT_MANUAL = "manual"
 SORT_NAME = "name"
@@ -37,6 +39,53 @@ SOURCE_LABELS = [
 ]
 
 _SOURCE_RANK = {"generated": 0, "layer": 1, "imported": 2}
+
+_SIZE_UNITS = ("KB", "MB", "GB", "TB")
+
+
+def format_size(size):
+    """A compact human-readable byte count, or ``""`` when it is unknown."""
+    try:
+        size = int(size)
+    except (TypeError, ValueError):
+        return ""
+    if size < 0:
+        return ""
+    if size < 1024:
+        return f"{size} B"
+    value = size / 1024
+    for unit in _SIZE_UNITS:
+        if value < 1024 or unit == _SIZE_UNITS[-1]:
+            text = f"{value:.1f}".rstrip("0").rstrip(".")
+            return f"{text} {unit}"
+        value /= 1024
+    return ""
+
+
+def asset_size(asset):
+    """The byte size the Assets panel reports for ``asset``, or ``None``.
+
+    An imported asset carries the source file size in ``byte_size``. Assets made
+    from pixels have no file, so their compressed PNG size stands in for one; it
+    is cached on the asset because encoding the image is the expensive part.
+    """
+    size = getattr(asset, "byte_size", None)
+    if size is not None:
+        return size
+    cached = getattr(asset, "_encoded_size", None)
+    if cached is not None:
+        return cached
+    try:
+        buffer = io.BytesIO()
+        asset.image.save(buffer, format="PNG")
+        cached = buffer.tell()
+    except Exception:
+        cached = None
+    try:
+        asset._encoded_size = cached
+    except Exception:
+        pass
+    return cached
 
 
 def asset_source(asset):

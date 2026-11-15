@@ -1742,10 +1742,14 @@ class Asset:
     Organization lives here too: ``group`` is the owning :class:`AssetGroup` id
     (or ``None``), ``tags`` are free-form labels, and ``favorite`` pins the asset
     to the top of filtered lists.
+
+    ``byte_size`` records the size of the source file when the asset was
+    imported, so the panel can show it without re-encoding the pixels; assets
+    created from pixels leave it ``None`` and the panel derives one on demand.
     """
 
     def __init__(self, name, image, asset_id, source="", prompt="", settings=None,
-                 group=None, tags=None, favorite=False):
+                 group=None, tags=None, favorite=False, byte_size=None):
         self.name = name
         self.image = image
         self.id = asset_id
@@ -1755,6 +1759,7 @@ class Asset:
         self.group = group
         self.tags = normalize_tags(tags)
         self.favorite = bool(favorite)
+        self.byte_size = byte_size
 
     def copy(self, name=None):
         """Return an independent duplicate sharing no pixels with this asset."""
@@ -1768,6 +1773,7 @@ class Asset:
             self.group,
             list(self.tags),
             self.favorite,
+            self.byte_size,
         )
 
 
@@ -1790,13 +1796,15 @@ class AssetLibrary:
         self.group_counter = 0
 
     def add_asset(self, name=None, image=None, source="", prompt="", settings=None,
-                  index=None, size=(1, 1), group=None, tags=None, favorite=False):
+                  index=None, size=(1, 1), group=None, tags=None, favorite=False,
+                  byte_size=None):
         """Add a reference image and return it (newest first unless ``index``).
 
         The image is stored as-is (copied into RGBA) at its own dimensions. A
         ``None`` image yields a transparent ``size`` slot. ``settings`` records
         the Generate panel fields that produced a generated image. ``group`` is
         an :class:`AssetGroup` id (unknown ids are treated as ungrouped).
+        ``byte_size`` is the source file size, when it is known.
         """
         self.asset_counter += 1
         if name is None:
@@ -1809,7 +1817,7 @@ class AssetLibrary:
             group = None
         asset = Asset(
             name, image, self.asset_counter, source, prompt, settings,
-            group, tags, favorite,
+            group, tags, favorite, byte_size,
         )
         if index is None:
             self.assets.insert(0, asset)
@@ -2140,7 +2148,8 @@ class Canvas:
         self.library.asset_counter = int(value)
 
     def add_asset(self, name=None, image=None, source="", prompt="", settings=None,
-                  index=None, group=None, tags=None, favorite=False):
+                  index=None, group=None, tags=None, favorite=False,
+                  byte_size=None):
         """Add a reference image to the project's assets and return it.
 
         A ``None`` image yields a transparent canvas-sized slot. See
@@ -2148,7 +2157,7 @@ class Canvas:
         """
         return self.library.add_asset(
             name, image, source, prompt, settings, index, size=self.size,
-            group=group, tags=tags, favorite=favorite,
+            group=group, tags=tags, favorite=favorite, byte_size=byte_size,
         )
 
     def remove_asset(self, asset):

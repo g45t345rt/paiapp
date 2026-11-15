@@ -344,6 +344,7 @@ def snapshot(app):
             "group": getattr(asset, "group", None),
             "tags": list(getattr(asset, "tags", []) or []),
             "favorite": bool(getattr(asset, "favorite", False)),
+            "byte_size": getattr(asset, "byte_size", None),
             "file": filename,
         })
     for canvas_index, canvas in enumerate(app.canvases):
@@ -925,6 +926,7 @@ def _build_library(payload):
             group=group_id,
             tags=asset_entry.get("tags", []),
             favorite=asset_entry.get("favorite", False),
+            byte_size=asset_entry.get("byte_size"),
         )
         if legacy:
             next_id += 1
