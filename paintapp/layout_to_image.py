@@ -641,14 +641,18 @@ class LayoutEditor(tk.Frame):
             if enabled:
                 self._refresh_row_text(widgets)
             else:
-                widgets["text_text"].config(state=tk.DISABLED)
-                widgets["text_label"].config(state=tk.DISABLED)
+                widgets["text_label"].grid_remove()
+                widgets["text_box"].grid_remove()
 
     def _refresh_row_text(self, widgets):
         label = (widgets["label_var"].get() or "object").strip().lower()
-        state = tk.NORMAL if label in TEXT_LABELS else tk.DISABLED
-        widgets["text_text"].config(state=state)
-        widgets["text_label"].config(state=state)
+        if label in TEXT_LABELS:
+            widgets["text_label"].grid()
+            widgets["text_box"].grid()
+            widgets["text_text"].config(state=tk.NORMAL)
+        else:
+            widgets["text_label"].grid_remove()
+            widgets["text_box"].grid_remove()
 
     def _update_hint(self):
         if not self.supported:
