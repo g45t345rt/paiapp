@@ -2883,7 +2883,9 @@ class PaintApp:
             return
         self._push_undo("Insert asset")
         layer = self._add_layer(name=asset.name, index=position)
-        layer.set_image(self._centered_asset_image(asset))
+        image, origin = self._centered_asset_placement(asset)
+        layer.set_image(image)
+        layer.offset = origin
         self.active = self.layers.index(layer)
         self._refresh_layer_list()
         self.render()
@@ -2892,21 +2894,23 @@ class PaintApp:
         else:
             self.set_result(f"Inserted '{asset.name}' above '{above}'.")
 
-    def _centered_asset_image(self, asset):
-        """A canvas-sized RGBA buffer holding ``asset`` centered on the canvas.
+    def _centered_asset_placement(self, asset):
+        """The asset's pixels at their own size and a canvas-centred offset.
 
-        New layers are canvas-sized, so the asset is pasted into a full-canvas
-        buffer rather than used at its own size; centering keeps an image that
-        is smaller than the canvas from landing in the top-left corner.
+        A layer stores its own buffer plus a document offset, so using the
+        asset's own size keeps an image larger than the canvas intact instead
+        of cropping it to the canvas bounds. Centering keeps an image that is
+        smaller than the canvas from landing in the top-left corner. The image
+        is copied so later layer edits cannot mutate the asset.
         """
         image = asset.image
         if image.mode != "RGBA":
             image = image.convert("RGBA")
-        buffer = Image.new("RGBA", self.current.size, (0, 0, 0, 0))
-        x = (self.current.width - image.width) // 2
-        y = (self.current.height - image.height) // 2
-        buffer.paste(image, (x, y), image)
-        return buffer
+        else:
+            image = image.copy()
+        origin = ((self.current.width - image.width) // 2,
+                  (self.current.height - image.height) // 2)
+        return image, origin
 
     def _drag_asset_over_layer(self, asset_id, x_root, y_root):
         """While an asset is dragged, tint the layer row under the pointer."""
@@ -10211,11 +10215,7 @@ class PaintApp:
         view = getattr(doc, "widget", None)
         if view is None or not view.winfo_exists():
             return
-        image = asset.image
-        if image.mode != "RGBA":
-            image = image.convert("RGBA")
-        origin = ((doc.width - image.width) // 2,
-                  (doc.height - image.height) // 2)
+        image, origin = self._centered_asset_placement(asset)
         self._clear_generation_preview()
         self._preview = {
             "kind": "asset",
@@ -10267,10 +10267,11 @@ class PaintApp:
             self.set_result("Select an unlocked layer to add the asset into.")
             return
         asset = preview["asset"]
-        image = self._centered_asset_image(asset)
+        image, origin = self._centered_asset_placement(asset)
         self._clear_generation_preview()
         self._push_undo("Insert asset")
         layer.set_image(image)
+        layer.offset = origin
         self._show_doc(doc)
         self.set_result(f"Added '{asset.name}' to '{layer.name}'.")
 
