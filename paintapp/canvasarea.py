@@ -4419,14 +4419,16 @@ class CanvasArea(tk.Frame):
             view.set_bg_color(bg)
 
     # ------------------------------------------------------------- preview bar
-    def show_preview_bar(self, buttons, info=None):
+    def show_preview_bar(self, buttons, info=None, checkbox=None):
         """Overlay a floating action bar on the active page.
 
         ``buttons`` is a sequence of ``(label, callback)`` pairs, optionally
         ``(label, callback, enabled)``. Used by the generation preview to offer
         rejecting the run, or landing it in a layer or the canvas assets.
         ``info`` is optional detail text (the asset preview shows its filename
-        and dimensions above the buttons).
+        and dimensions above the buttons). ``checkbox`` is an optional
+        ``(label, variable)`` pair, or ``(label, variable, command)``, shown
+        above the buttons.
         """
         self.hide_preview_bar()
         index = self.active_index()
@@ -4443,6 +4445,14 @@ class CanvasArea(tk.Frame):
             )
             theme.register(label, fg="text")
             label.pack(fill=tk.X, padx=6, pady=(6, 0))
+        if checkbox:
+            text, variable = checkbox[0], checkbox[1]
+            command = checkbox[2] if len(checkbox) > 2 else None
+            check = tk.Checkbutton(
+                bar, text=text, variable=variable, command=command, anchor="w",
+            )
+            theme.register(check, bg="panel_bg", activebackground="panel_bg")
+            check.pack(fill=tk.X, padx=6, pady=(6, 0))
         for position, spec in enumerate(buttons):
             label, callback = spec[0], spec[1]
             enabled = spec[2] if len(spec) > 2 else True

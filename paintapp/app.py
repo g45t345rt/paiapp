@@ -581,6 +581,9 @@ class PaintApp:
         # ``None`` (see :meth:`_show_generation_preview` and
         # :meth:`preview_asset`).
         self._preview = None
+        # Whether the asset preview should scale the image to the canvas when
+        # it is inserted, rather than keeping its native pixels.
+        self._asset_preview_fit = tk.BooleanVar(value=False)
         # The canvas currently receiving live denoising-step preview frames, or
         # ``None`` (see :meth:`_on_gen_preview`). Cleared when the run settles.
         self._live_preview_doc = None
@@ -2856,9 +2859,9 @@ class PaintApp:
             self.tools.refresh_layout_settings()
             self._sync_layout_overlay()
 
-    def insert_asset(self, asset_id):
+    def insert_asset(self, asset_id, fit=False):
         """Insert an asset onto a new layer above the active one."""
-        self._insert_asset_above(asset_id, self.active + 1)
+        self._insert_asset_above(asset_id, self.active + 1, fit=fit)
 
     def insert_asset_at_layer(self, asset_id, layer_index):
         """Insert an asset onto a new layer above the layer at ``layer_index``.
@@ -2873,7 +2876,7 @@ class PaintApp:
             asset_id, layer_index + 1, above=self.layers[layer_index].name
         )
 
-    def _insert_asset_above(self, asset_id, position, above=None):
+    def _insert_asset_above(self, asset_id, position, above=None, fit=False):
         """Add a layer at ``position`` holding the asset with ``asset_id``."""
         if self.current is None:
             self.set_result("There is no canvas to insert into.")
@@ -2883,7 +2886,7 @@ class PaintApp:
             return
         self._push_undo("Insert asset")
         layer = self._add_layer(name=asset.name, index=position)
-        image, origin = self._centered_asset_placement(asset)
+        image, origin = self._centered_asset_placement(asset, fit=fit)
         layer.set_image(image)
         layer.offset = origin
         self.active = self.layers.index(layer)
@@ -2894,16 +2897,19 @@ class PaintApp:
         else:
             self.set_result(f"Inserted '{asset.name}' above '{above}'.")
 
-    def _centered_asset_placement(self, asset):
+    def _centered_asset_placement(self, asset, fit=False):
         """The asset's pixels at their own size and a canvas-centred offset.
 
         A layer stores its own buffer plus a document offset, so using the
         asset's own size keeps an image larger than the canvas intact instead
         of cropping it to the canvas bounds. Centering keeps an image that is
         smaller than the canvas from landing in the top-left corner. The image
-        is copied so later layer edits cannot mutate the asset.
+        is copied so later layer edits cannot mutate the asset. With ``fit``
+        the image is scaled to the canvas instead, matching Open Image.
         """
         image = asset.image
+        if fit:
+            return self.current.fit_image(image), (0, 0)
         if image.mode != "RGBA":
             image = image.convert("RGBA")
         else:
@@ -10136,7 +10142,9 @@ class PaintApp:
                 (layer_label, self.accept_asset_preview_in_layer,
                  layer is not None),
                 ("Insert as new layer", self.accept_asset_preview_as_layer),
-            ], info=self._asset_preview_info(preview.get("asset")))
+            ], info=self._asset_preview_info(preview.get("asset")),
+                checkbox=("Fit to canvas", self._asset_preview_fit,
+                          self._update_asset_preview_placement))
             return
         self.area.show_preview_bar([
             ("Reject", self.reject_generation_preview),
@@ -10217,6 +10225,7 @@ class PaintApp:
             return
         image, origin = self._centered_asset_placement(asset)
         self._clear_generation_preview()
+        self._asset_preview_fit.set(False)
         self._preview = {
             "kind": "asset",
             "doc": doc,
@@ -10231,6 +10240,27 @@ class PaintApp:
         self.set_result(
             f"Preview of '{asset.name}': insert it or close the preview."
         )
+
+    def _asset_preview_fit_enabled(self):
+        """Whether the asset preview's fit-to-canvas option is checked."""
+        variable = getattr(self, "_asset_preview_fit", None)
+        return bool(variable.get()) if variable is not None else False
+
+    def _update_asset_preview_placement(self):
+        """Re-place the asset preview after the fit-to-canvas option changes."""
+        preview = self._preview
+        if preview is None or preview.get("kind") != "asset":
+            return
+        doc = preview["doc"]
+        view = getattr(doc, "widget", None)
+        if view is None or not view.winfo_exists():
+            return
+        image, origin = self._centered_asset_placement(
+            preview["asset"], fit=self._asset_preview_fit_enabled()
+        )
+        preview["image"] = image
+        preview["origin"] = origin
+        view.set_generation_preview(image, origin)
 
     def _asset_preview_info(self, asset):
         """The header shown over an asset preview: name, dimensions and size."""
@@ -10267,7 +10297,9 @@ class PaintApp:
             self.set_result("Select an unlocked layer to add the asset into.")
             return
         asset = preview["asset"]
-        image, origin = self._centered_asset_placement(asset)
+        fit = bool(getattr(self, "_asset_preview_fit", None)
+                   and self._asset_preview_fit.get())
+        image, origin = self._centered_asset_placement(asset, fit=fit)
         self._clear_generation_preview()
         self._push_undo("Insert asset")
         layer.set_image(image)
@@ -10285,7 +10317,9 @@ class PaintApp:
         self._clear_generation_preview()
         if asset not in doc.assets:
             return
-        self.insert_asset(asset.id)
+        fit = bool(getattr(self, "_asset_preview_fit", None)
+                   and self._asset_preview_fit.get())
+        self.insert_asset(asset.id, fit=fit)
 
     # ------------------------------------------------------------ segment (AI)
     def start_segment(self, x, y):

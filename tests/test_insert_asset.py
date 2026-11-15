@@ -42,8 +42,9 @@ def fake_app(doc, asset):
         render=lambda: None,
         set_result=lambda *_args, **_kwargs: None,
     )
-    app._centered_asset_placement = lambda a: PaintApp._centered_asset_placement(
-        app, a)
+    app._centered_asset_placement = lambda a, fit=False: (
+        PaintApp._centered_asset_placement(app, a, fit=fit)
+    )
     return app
 
 
@@ -109,11 +110,25 @@ def test_in_layer_keeps_asset_larger_than_canvas():
     check("right edge kept", base.image.getpixel((127, 0)), (0, 255, 0, 255))
 
 
+def test_fit_scales_asset_to_canvas():
+    doc = Canvas("c", (64, 64))
+    doc.add_layer(name="base")
+    asset = make_asset(doc, (128, 64))
+    app = fake_app(doc, asset)
+
+    image, origin = PaintApp._centered_asset_placement(app, asset, fit=True)
+
+    check("fit buffer is canvas sized", image.size, (64, 64))
+    check("fit buffer offset", origin, (0, 0))
+    check("fit keeps aspect", image.getbbox(), (0, 16, 64, 48))
+
+
 if __name__ == "__main__":
     test_new_layer_keeps_asset_larger_than_canvas()
     test_new_layer_centres_smaller_asset()
     test_inserted_layer_does_not_share_asset_pixels()
     test_in_layer_keeps_asset_larger_than_canvas()
+    test_fit_scales_asset_to_canvas()
     if FAILED:
         print("\nFAILED:")
         for line in FAILED:
