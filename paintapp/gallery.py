@@ -251,9 +251,7 @@ class GalleryView(tk.Frame):
         cached = self._bases.get(index)
         if cached is not None:
             return cached
-        source = item["doc"].composite_transparent()
-        if source.size != (item["w"], item["h"]):
-            source = source.resize((item["w"], item["h"]), Image.LANCZOS)
+        source = _thumbnail_source(item["doc"], item["w"], item["h"])
         board = checkerboard((item["w"], item["h"]))
         board.alpha_composite(source)
         image = board.convert("RGB")
@@ -429,6 +427,38 @@ GALLERY_SIDE_LABEL_H = 18
 GALLERY_SIDE_WHEEL = 3
 
 
+def _doc_signature(doc):
+    """The document's content version, or ``None`` when it cannot report one."""
+    getter = getattr(doc, "content_signature", None)
+    if getter is None:
+        return None
+    try:
+        return getter()
+    except Exception:
+        return None
+
+
+def _thumbnail_source(doc, width, height):
+    """The document's pixels at thumbnail size, without a full-res flatten."""
+    scale = min(1.0, width / max(1, doc.width))
+    composite = getattr(doc, "composite_region", None)
+    if composite is not None:
+        try:
+            image, _origin = composite(
+                (0, 0, doc.width, doc.height), scale=scale, draft=True,
+            )
+        except Exception:
+            image = None
+        if image is not None:
+            if image.size != (width, height):
+                image = image.resize((width, height), Image.LANCZOS)
+            return image
+    image = doc.composite_transparent()
+    if image.size != (width, height):
+        image = image.resize((width, height), Image.LANCZOS)
+    return image
+
+
 class GallerySidebar(tk.Frame):
     """A vertical, scrollable filmstrip of canvas thumbnails for the dock view.
 
@@ -452,6 +482,7 @@ class GallerySidebar(tk.Frame):
         self.selected = 0
         self._items = []
         self._photos = {}
+        self._render_key = None
         self._content_h = 0
         self._last_w = 0
         self._drag = None
@@ -503,11 +534,33 @@ class GallerySidebar(tk.Frame):
         fraction = self.canvas.yview()[0] if self.documents else 0.0
         self.documents = list(documents)
         self.selected = max(0, min(int(selected), len(self.documents) - 1))
-        self._photos = {}
         self._layout()
         self._render()
         if fraction:
             self.canvas.yview_moveto(fraction)
+
+    def sync_documents(self, documents, selected=0):
+        """Refresh thumbnails cheaply, reusing cached pixels for unchanged canvases."""
+        documents = list(documents)
+        selected = max(0, min(int(selected), len(documents) - 1))
+        signatures = [_doc_signature(doc) for doc in documents]
+        self.documents = documents
+        self.selected = selected
+        self._layout()
+        key = self._render_key_for(documents, selected, signatures)
+        if key == self._render_key:
+            return
+        self._render(signatures)
+
+    def _render_key_for(self, documents, selected, signatures):
+        return (
+            self._last_w,
+            selected,
+            tuple(
+                (id(doc), getattr(doc, "name", None), sig)
+                for doc, sig in zip(documents, signatures)
+            ),
+        )
 
     def open_selected(self):
         if self.documents and self._on_activate is not None:
@@ -544,31 +597,37 @@ class GallerySidebar(tk.Frame):
             })
             y += height + GALLERY_SIDE_LABEL_H + GALLERY_SIDE_GAP
         self._content_h = max(0, y - GALLERY_SIDE_GAP + GALLERY_SIDE_MARGIN)
+        for index in list(self._photos):
+            if index >= len(self.documents):
+                del self._photos[index]
 
     # ------------------------------------------------------------- rendering
     def _base(self, item):
-        source = item["doc"].composite_transparent()
-        if source.size != (item["w"], item["h"]):
-            source = source.resize((item["w"], item["h"]), Image.LANCZOS)
-        board = checkerboard((item["w"], item["h"]))
+        width, height = item["w"], item["h"]
+        source = _thumbnail_source(item["doc"], width, height)
+        board = checkerboard((width, height))
         board.alpha_composite(source)
         return board.convert("RGB")
 
-    def _photo(self, item):
+    def _photo(self, item, signature):
         index = item["index"]
+        doc = item["doc"]
         cached = self._photos.get(index)
-        if cached is not None and cached[0] == item["w"]:
-            return cached[1]
+        if (cached is not None and cached[0] is doc
+                and cached[1] == item["w"] and cached[2] == signature):
+            return cached[3]
         photo = ImageTk.PhotoImage(self._base(item))
-        self._photos[index] = (item["w"], photo)
+        self._photos[index] = (doc, item["w"], signature, photo)
         return photo
 
-    def _render(self):
+    def _render(self, signatures=None):
         canvas = self.canvas
         canvas.delete("all")
         text_color = theme.color("text")
         border = theme.color("border")
         accent = theme.color("accent")
+        if signatures is None:
+            signatures = [_doc_signature(doc) for doc in self.documents]
         if not self._items:
             canvas.create_text(
                 self._rail_width() // 2, 40,
@@ -576,7 +635,8 @@ class GallerySidebar(tk.Frame):
             )
         for item in self._items:
             canvas.create_image(
-                item["x"], item["y"], anchor=tk.NW, image=self._photo(item),
+                item["x"], item["y"], anchor=tk.NW,
+                image=self._photo(item, signatures[item["index"]]),
             )
             selected = item["index"] == self.selected
             canvas.create_rectangle(
@@ -596,6 +656,9 @@ class GallerySidebar(tk.Frame):
         # region changes, so push the fractions to the scrollbar directly or an
         # overflowing list would keep its bar hidden.
         self.scrollbar.set(*canvas.yview())
+        self._render_key = self._render_key_for(
+            self.documents, self.selected, signatures,
+        )
 
     # ------------------------------------------------------------------- hit
     def _hit(self, y):

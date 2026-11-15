@@ -4249,6 +4249,8 @@ class CanvasArea(tk.Frame):
         self._gallery_dock = None
         self._gallery_sidebar = None
         self._gallery_side = None
+        self._gallery_refresh_job = None
+        self._gallery_refresh_pending = None
         # Floating action bar overlaid on the active page while a generation
         # preview is shown (see :meth:`show_preview_bar`).
         self._preview_bar = None
@@ -4568,6 +4570,7 @@ class CanvasArea(tk.Frame):
         rail's width.
         """
         from .gallery import GalleryDock
+        self._cancel_gallery_refresh()
         self._gallery_shown = False
         sidebar = self._ensure_gallery_sidebar()
         side = "right" if side == "right" else "left"
@@ -4595,19 +4598,47 @@ class CanvasArea(tk.Frame):
 
     def hide_gallery_side(self):
         """Remove the docked strip and let the editor take the freed space."""
+        self._cancel_gallery_refresh()
         if self._gallery_dock is None:
             self._gallery_side = None
             return
         self._gallery_side = None
         self._rebuild_layout()
 
+    def _cancel_gallery_refresh(self):
+        if self._gallery_refresh_job is not None:
+            try:
+                self.after_cancel(self._gallery_refresh_job)
+            except tk.TclError:
+                pass
+            self._gallery_refresh_job = None
+        self._gallery_refresh_pending = None
+
+    def _flush_gallery_side_refresh(self):
+        self._gallery_refresh_job = None
+        pending = self._gallery_refresh_pending
+        self._gallery_refresh_pending = None
+        if pending is None or self._gallery_side is None \
+                or self._gallery_sidebar is None:
+            return
+        documents, selected = pending
+        self._gallery_sidebar.sync_documents(documents, selected)
+
     def refresh_gallery_side(self):
         """Re-sync a docked strip's thumbnails without resetting its scroll."""
         if self._gallery_side is None or self._gallery_sidebar is None:
             return
         selected = self.active_index() or 0
-        self._gallery_sidebar.set_documents(
+        self._gallery_refresh_pending = (
             [view.doc for view in self._views], selected
+        )
+        if self._gallery_refresh_job is not None:
+            return
+        # Painting calls render() on every frame; coalesce refreshes so the
+        # strip repaints at a bounded rate instead of flattening every canvas
+        # at display rate.
+        self._gallery_refresh_job = self.after(
+            120, self._flush_gallery_side_refresh
         )
 
     def gallery_visible(self):

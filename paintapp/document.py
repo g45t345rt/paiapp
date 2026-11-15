@@ -2530,6 +2530,24 @@ class Canvas:
         """Flatten visible layers into one transparent RGBA image."""
         return self._flatten(self.layers, (0, 0, self.width, self.height))
 
+    def content_signature(self):
+        """A cheap key for every input that changes the flattened canvas."""
+        return (
+            self.width,
+            self.height,
+            tuple(self._layer_signature(layer) for layer in self.layers),
+            tuple(
+                (
+                    group.uid,
+                    group.visible,
+                    group.opacity,
+                    bool(group.keep_empty),
+                    filters.chain_key(getattr(group, "filters", []) or []),
+                )
+                for group in self.groups
+            ),
+        )
+
     def new_group(self, name=None, members=()):
         """Create a group containing ``members`` and return it.
 
