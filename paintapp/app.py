@@ -120,8 +120,9 @@ _LIVE_STROKE_RENDER_MS = 5
 # travel with the active layer, or selecting another layer would swap the
 # reference images. They are stripped from the per-layer generation settings.
 _REFERENCE_SETTING_KEYS = (
-    "ref_refs", "ref_lora", "ref_strength", "ref_guidance", "ref_correction",
-    "ref_offset", "ref_megapixels", "qwen_refs",
+    "references_enabled", "ref_refs", "ref_lora", "ref_strength",
+    "ref_guidance", "ref_correction", "ref_offset", "ref_megapixels",
+    "qwen_refs", "anypaint_lora", "anypaint_strength",
 )
 
 # Layout Control is layer-scoped: each layer draws its own set of boxes for its
@@ -9606,8 +9607,8 @@ class PaintApp:
         # adapter reads. Separate from the img2img Source.
         reference_image = None
         if self.gen.model_family() == "anima":
-            bindings = self.references_panel.reference_bindings()
-            if bindings:
+            if self.references_panel.reference_enabled():
+                bindings = self.references_panel.reference_bindings()
                 reference_image = self._resolve_anima_reference(bindings)
                 if reference_image is None:
                     return
@@ -9617,8 +9618,8 @@ class PaintApp:
         # from the Anima reference.
         qwen_ref_images = None
         if self.gen.model_family() in ("qwen_image", "h3_image"):
-            bindings = self.references_panel.qwen_reference_bindings()
-            if bindings:
+            if self.references_panel.qwen_reference_enabled():
+                bindings = self.references_panel.qwen_reference_bindings()
                 if region_entries:
                     self.set_result(
                         "Turn off Region prompts when using reference images.", "warn"

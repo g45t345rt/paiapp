@@ -127,6 +127,8 @@ def test_family_gate():
     try:
         panel._add_qwen_reference({"source": "canvas", "label": "Canvas"})
         panel._add_anima_reference({"source": "canvas", "label": "Canvas"})
+        panel.enabled_var.set(True)
+        panel._on_enabled_toggle()
 
         # The anima family folds only the Anima keys into the run config.
         config = panel.apply_config({})
@@ -147,6 +149,47 @@ def test_family_gate():
         root.destroy()
 
 
+def test_reference_toggles():
+    try:
+        root, panel = _build_panel(family="anima")
+    except Exception as exc:  # no display, or Tk missing
+        SKIPPED.append(f"toggle test skipped: {exc}")
+        return
+    try:
+        check("disabled by default", panel.enabled_var.get(), False)
+        panel._add_anima_reference({"source": "canvas", "label": "Canvas"})
+        panel._add_qwen_reference({"source": "canvas", "label": "Canvas"})
+
+        # Disabling leaves the rows in place but drops them from the run config.
+        panel.enabled_var.set(False)
+        panel._on_enabled_toggle()
+        check("anima rows kept when off", len(panel.reference_bindings()), 1)
+        check("anima off skips config", "anima_ref_lora" in panel.apply_config({}),
+              False)
+        check("anima header says off", "off" in panel._anima_section.title_var.get(),
+              True)
+        check("enabled stored", panel.settings().get("references_enabled"), False)
+
+        panel.enabled_var.set(True)
+        panel._on_enabled_toggle()
+        check("anima on applies config", "anima_ref_lora" in panel.apply_config({}),
+              True)
+
+        panel.set_family("qwen_image")
+        panel.enabled_var.set(False)
+        panel._on_enabled_toggle()
+        check("qwen off skips config", "qwen_refs" in panel.apply_config({}), False)
+        check("qwen rows kept when off", len(panel.qwen_reference_bindings()), 1)
+
+        # The switch round-trips through stored settings and resets to off.
+        panel.set_settings({"references_enabled": False})
+        check("toggle round-trip", panel.enabled_var.get(), False)
+        panel.reset()
+        check("toggle reset", panel.enabled_var.get(), False)
+    finally:
+        root.destroy()
+
+
 def test_collapsible_sections():
     try:
         root, panel = _build_panel(family="anima")
@@ -154,37 +197,34 @@ def test_collapsible_sections():
         SKIPPED.append(f"section test skipped: {exc}")
         return
     try:
-        # The active family's section opens; the other two fold to headers.
-        check("anima open", panel._anima_section.open, True)
+        # Every section starts folded, whatever the family.
+        check("anima folded", panel._anima_section.open, False)
         check("qwen folded", panel._qwen_section.open, False)
         check("anypaint folded", panel._anypaint_section.open, False)
 
         # The header rides the reference count, so a folded section still says
         # what it holds.
+        panel.enabled_var.set(True)
         panel._add_anima_reference({"source": "canvas", "label": "Canvas"})
         check("count in header", "(1)" in panel._anima_section.title_var.get(), True)
 
-        # A manual collapse hides the body but keeps the header first in its
-        # frame, so expanding later restores the order.
+        # A manual open shows the body but keeps the header first in its frame,
+        # so collapsing later restores the order.
         panel._anima_section.toggle_open()
-        check("manual collapse", panel._anima_section.open, False)
-        check("body hidden", panel._anima_section.body.winfo_manager(), "")
+        check("manual expand", panel._anima_section.open, True)
+        check("body shown", panel._anima_section.body.winfo_manager(), "pack")
         check("header stays first",
               panel._anima_section.frame.pack_slaves()[0] is
               panel._anima_section.header, True)
         panel._anima_section.toggle_open()
-        check("manual expand", panel._anima_section.open, True)
-        check("body shown", panel._anima_section.body.winfo_manager(), "pack")
+        check("manual collapse", panel._anima_section.open, False)
+        check("body hidden", panel._anima_section.body.winfo_manager(), "")
 
-        # Switching to another family moves the open section.
-        panel.set_family("qwen_image")
-        check("qwen open", panel._qwen_section.open, True)
-        check("anima folded", panel._anima_section.open, False)
-
-        # A repeated set_family for the same family keeps a manual choice.
+        # Switching family leaves the user's fold choices alone.
         panel._qwen_section.toggle_open()
         panel.set_family("qwen_image")
-        check("manual choice kept", panel._qwen_section.open, False)
+        check("qwen stays open", panel._qwen_section.open, True)
+        check("anima stays folded", panel._anima_section.open, False)
     finally:
         root.destroy()
 
@@ -207,7 +247,8 @@ def test_stitch_side_by_side():
 
 def main():
     for test in (test_reference_rows, test_assign_selected, test_family_gate,
-                 test_collapsible_sections, test_stitch_side_by_side):
+                 test_reference_toggles, test_collapsible_sections,
+                 test_stitch_side_by_side):
         try:
             test()
         except Exception as exc:  # keep going so one failure is not fatal

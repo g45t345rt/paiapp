@@ -406,7 +406,7 @@ class LayoutEditor(tk.Frame):
         label_var = tk.StringVar(value=row.get("label") or "object")
         combo = ttk.Combobox(
             frame, textvariable=label_var, values=list(FAMILY_LABELS.get(
-                self.family, LABELS)), width=10)
+                self.family, LABELS)), width=10, state="readonly")
         combo.grid(row=1, column=1, sticky="w", padx=(4, 4), pady=(4, 0))
 
         tk.Label(frame, text="Color:", anchor="w").grid(
@@ -633,7 +633,7 @@ class LayoutEditor(tk.Frame):
         self.enabled_check.config(state=tk.NORMAL)
         self.add_btn.config(state=tk.NORMAL if enabled else tk.DISABLED)
         for widgets in self._row_widgets:
-            widgets["combo"].config(state="normal" if enabled else "disabled")
+            widgets["combo"].config(state="readonly" if enabled else "disabled")
             widgets["name_entry"].config(state=tk.NORMAL if enabled else tk.DISABLED)
             widgets["color_btn"].config(state=tk.NORMAL if enabled else tk.DISABLED)
             widgets["caption_text"].config(

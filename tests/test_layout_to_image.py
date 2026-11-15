@@ -216,6 +216,7 @@ def test_editor_writes_back():
     check("change reported", bool(calls), True)
 
     widgets = editor._row_widgets[0]
+    check("label is a picker", str(widgets["combo"].cget("state")), "readonly")
     widgets["name_var"].set("robot box")
     widgets["label_var"].set("text")
     widgets["text_text"].insert("1.0", "HELLO")

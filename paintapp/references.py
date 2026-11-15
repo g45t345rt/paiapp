@@ -33,6 +33,11 @@ the coordinator to capture an image through ``on_capture`` (see
 folds the bindings into the run config and captures the images (see
 :meth:`~paintapp.app.PaintApp.start_generate`). The family is pushed in by the
 coordinator with :meth:`ReferencesPanel.set_family` (it owns the model picker).
+
+A single master switch at the top of the panel enables or disables every
+reference feature for the run without touching the configured lists, adapters
+or parameters. Only one feature is active per family, so one switch is enough.
+It starts off, so a fresh canvas makes plain (unreferenced) runs.
 """
 
 import os
@@ -69,12 +74,12 @@ _SECTION_CLOSED = "\u25b8"
 class _Section:
     """A collapsible block: a clickable glyph header over a hideable body.
 
-    The header carries an optional right-side control (Add / checkbox); the
+    The header carries an optional right-side control (e.g. Add); the
     body holds the section's rows. A short summary (e.g. the reference count)
     rides the header so a collapsed section still says what it holds.
     """
 
-    def __init__(self, parent, title, open_by_default=True):
+    def __init__(self, parent, title, open_by_default=False):
         self.title = title
         self._summary = ""
         self.frame = tk.Frame(parent)
@@ -122,9 +127,9 @@ class _Section:
 class ReferencesPanel(tk.Frame):
     """The Anima reference adapter and the Qwen multi-reference list.
 
-    Each feature is a collapsible section; the panel folds the sections for
-    other families down to their headers, and a header shows the section's
-    reference count (or ``on`` for AnyPaint) so a folded section still reads.
+    Each feature is a collapsible section, all closed by default; the user
+    opens the one they need. A header shows the section's reference count (or
+    ``on`` for AnyPaint) so a folded section still reads.
     """
 
     def __init__(self, parent, on_settings=None, on_capture=None):
@@ -143,9 +148,19 @@ class ReferencesPanel(tk.Frame):
         self._build()
 
     def _build(self):
+        # Only one reference feature is active per family, so one master switch
+        # covers them all: it keeps every list and adapter choice intact while
+        # turning references off for a run.
+        self.enabled_var = tk.BooleanVar(value=False)
+        self.enabled_check = tk.Checkbutton(
+            self, text="Enable references", variable=self.enabled_var,
+            anchor="w", command=self._on_enabled_toggle,
+        )
+        self.enabled_check.pack(fill=tk.X, pady=(0, 4))
+
         # ------------------------------------------------ anima reference adapter
         self._anima_section = _Section(
-            self, "Anima references", open_by_default=True,
+            self, "Anima references", open_by_default=False,
         )
         self.ref_header = self._anima_section.header
         self.ref_add_btn = tk.Button(
@@ -229,7 +244,7 @@ class ReferencesPanel(tk.Frame):
 
         # -------------------------------------------------- reference images
         self._qwen_section = _Section(
-            self, "Reference images", open_by_default=True,
+            self, "Reference images", open_by_default=False,
         )
         self.qref_header = self._qwen_section.header
         self.qref_add_btn = tk.Button(
@@ -247,16 +262,10 @@ class ReferencesPanel(tk.Frame):
 
         # --------------------------------------------- krea 2 anypaint (mask edit)
         self._anypaint_section = _Section(
-            self, "AnyPaint (Krea 2)", open_by_default=True,
+            self, "AnyPaint (Krea 2)", open_by_default=False,
         )
-        self.ap_header = self._anypaint_section.header
-        self.anypaint_var = tk.BooleanVar(value=False)
-        self.anypaint_check = tk.Checkbutton(
-            self.ap_header, variable=self.anypaint_var,
-            command=self._on_anypaint_toggle,
-        )
-        self.anypaint_check.grid(row=0, column=1, sticky="e", padx=(4, 0))
-        self._anypaint_section.frame.pack(fill=tk.X, pady=(2, 0))
+        # Bottom padding keeps the last section clear of the panel below.
+        self._anypaint_section.frame.pack(fill=tk.X, pady=(2, 8))
 
         body = self._anypaint_section.body
         ap_lora_row = tk.Frame(body)
@@ -301,48 +310,34 @@ class ReferencesPanel(tk.Frame):
 
     def set_family(self, family):
         """Point the panel at the selected model's family and refresh its gates."""
-        changed = family != self._family
         self._family = family
         self._refresh_reference_state()
         self._refresh_qwen_reference_state()
         self._refresh_anypaint_state()
-        if changed:
-            self._sync_section_expansion()
-
-    def _sync_section_expansion(self):
-        """Open the active family's section; fold the other two away.
-
-        Only run when the family actually changes, so a section the user
-        collapsed by hand stays collapsed across ordinary canvas switches.
-        """
-        active = {
-            "anima": getattr(self, "_anima_section", None),
-            "qwen_image": getattr(self, "_qwen_section", None),
-            "h3_image": getattr(self, "_qwen_section", None),
-            "krea2": getattr(self, "_anypaint_section", None),
-        }.get(self._family)
-        for section in (
-            getattr(self, "_anima_section", None),
-            getattr(self, "_qwen_section", None),
-            getattr(self, "_anypaint_section", None),
-        ):
-            if section is not None:
-                section.set_open(section is active)
 
     def _refresh_section_titles(self):
         """Show each section's contents on its header (useful when collapsed)."""
         if hasattr(self, "_anima_section"):
-            self._anima_section.set_summary(
-                str(len(self._anima_refs)) if self._anima_refs else ""
-            )
+            self._anima_section.set_summary(self._refs_summary(self._anima_refs))
         if hasattr(self, "_qwen_section"):
-            self._qwen_section.set_summary(
-                str(len(self._qwen_refs)) if self._qwen_refs else ""
-            )
+            self._qwen_section.set_summary(self._refs_summary(self._qwen_refs))
         if hasattr(self, "_anypaint_section"):
             self._anypaint_section.set_summary(
-                "on" if self.anypaint_var.get() else ""
+                "on" if self.anypaint_enabled() else ""
             )
+
+    def _refs_summary(self, rows):
+        """A header summary: the row count, marked ``off`` when disabled."""
+        if not rows:
+            return ""
+        count = str(len(rows))
+        return count if self.enabled_var.get() else f"{count} off"
+
+    def _on_enabled_toggle(self):
+        self._refresh_reference_state()
+        self._refresh_qwen_reference_state()
+        self._refresh_anypaint_state()
+        self._on_settings_change()
 
     # ------------------------------------------------------------ reference rows
     def _add_ref_row(self, container, store, binding=None):
@@ -460,8 +455,11 @@ class ReferencesPanel(tk.Frame):
         return self._row_bindings(self._anima_refs)
 
     def reference_enabled(self):
-        """True when an Anima reference row exists and the family supports it."""
-        return self._family == "anima" and bool(self._anima_refs)
+        """True when references are on, an Anima row exists, and the family fits."""
+        return (
+            self._family == "anima" and bool(self.enabled_var.get())
+            and bool(self._anima_refs)
+        )
 
     def ref_lora_path(self):
         """The selected reference-adapter LoRA file path, or ``None``."""
@@ -512,6 +510,14 @@ class ReferencesPanel(tk.Frame):
         """The ordered Qwen reference bindings (callers gate by family)."""
         return self._row_bindings(self._qwen_refs)
 
+    def qwen_reference_enabled(self):
+        """True when references are on, a row exists, and the family fits."""
+        return (
+            self._family in ("qwen_image", "h3_image")
+            and bool(self.enabled_var.get())
+            and bool(self._qwen_refs)
+        )
+
     def _refresh_qwen_reference_state(self):
         """Grey the reference controls out for families that do not support them."""
         supported = self._family in ("qwen_image", "h3_image")
@@ -540,8 +546,11 @@ class ReferencesPanel(tk.Frame):
             self._set_anypaint_lora(selected)
 
     def anypaint_enabled(self):
-        """True when AnyPaint is on and the family supports it."""
-        return self._family == "krea2" and bool(self.anypaint_var.get())
+        """True when references are on, an AnyPaint adapter is picked, and Krea 2."""
+        return (
+            self._family == "krea2" and bool(self.enabled_var.get())
+            and bool(self.anypaint_lora_path())
+        )
 
     def anypaint_lora_path(self):
         """The selected AnyPaint adapter LoRA file path, or ``None``."""
@@ -561,15 +570,10 @@ class ReferencesPanel(tk.Frame):
     def _refresh_anypaint_state(self):
         """Grey the AnyPaint controls out for families that do not support them."""
         supported = self._family == "krea2"
-        self.anypaint_check.configure(state=tk.NORMAL if supported else tk.DISABLED)
-        active = supported and bool(self.anypaint_var.get())
+        active = supported and bool(self.enabled_var.get())
         self.anypaint_lora_menu.configure(state="readonly" if active else "disabled")
         self.anypaint_strength_spin.configure(state=tk.NORMAL if active else tk.DISABLED)
         self._refresh_section_titles()
-
-    def _on_anypaint_toggle(self):
-        self._refresh_anypaint_state()
-        self._on_settings_change()
 
     # ------------------------------------------------------------- settings
     def settings(self):
@@ -577,6 +581,7 @@ class ReferencesPanel(tk.Frame):
         try:
             return {
                 "ref_refs": self.reference_bindings(),
+                "references_enabled": bool(self.enabled_var.get()),
                 "ref_lora": self.ref_lora_path(),
                 "ref_strength": float(self.ref_strength_var.get()),
                 "ref_guidance": float(self.ref_guidance_var.get()),
@@ -584,7 +589,6 @@ class ReferencesPanel(tk.Frame):
                 "ref_offset": float(self.ref_offset_var.get()),
                 "ref_megapixels": float(self.ref_megapixels_var.get()),
                 "qwen_refs": self.qwen_reference_bindings(),
-                "anypaint": bool(self.anypaint_var.get()),
                 "anypaint_lora": self.anypaint_lora_path(),
                 "anypaint_strength": float(self.anypaint_strength_var.get()),
             }
@@ -606,6 +610,14 @@ class ReferencesPanel(tk.Frame):
                     self._anima_refs, self.ref_rows,
                     [] if source == REF_OFF else [source],
                 )
+            if "references_enabled" in values:
+                self.enabled_var.set(bool(values["references_enabled"]))
+            elif "ref_enabled" in values or "qwen_refs_enabled" in values:
+                # Legacy per-section switches collapse into the master switch.
+                self.enabled_var.set(
+                    bool(values.get("ref_enabled", True))
+                    and bool(values.get("qwen_refs_enabled", True))
+                )
             if "ref_lora" in values:
                 self._set_ref_lora(values["ref_lora"])
             if "ref_strength" in values:
@@ -623,8 +635,6 @@ class ReferencesPanel(tk.Frame):
                 self.ref_megapixels_var.set(float(values["ref_megapixels"]))
             if "qwen_refs" in values:
                 self._set_rows(self._qwen_refs, self.qref_rows, values["qwen_refs"])
-            if "anypaint" in values:
-                self.anypaint_var.set(bool(values["anypaint"]))
             if "anypaint_lora" in values:
                 self._set_anypaint_lora(values["anypaint_lora"])
             if "anypaint_strength" in values:
@@ -640,6 +650,7 @@ class ReferencesPanel(tk.Frame):
         self._loading = True
         try:
             self._set_rows(self._anima_refs, self.ref_rows, [])
+            self.enabled_var.set(False)
             self.ref_lora_var.set("(none)")
             self.ref_strength_var.set(1.0)
             self.ref_guidance_var.set(4.5)
@@ -647,7 +658,6 @@ class ReferencesPanel(tk.Frame):
             self.ref_offset_var.set(1.0)
             self.ref_megapixels_var.set(1.0)
             self._set_rows(self._qwen_refs, self.qref_rows, [])
-            self.anypaint_var.set(False)
             self.anypaint_lora_var.set("(none)")
             self.anypaint_strength_var.set(1.0)
         finally:
@@ -655,16 +665,16 @@ class ReferencesPanel(tk.Frame):
 
     def apply_config(self, config):
         """Fold the reference fields into a run ``config`` for the current family."""
-        if self._family == "anima" and self.reference_bindings():
+        if self.reference_enabled():
             config["anima_ref_lora"] = self.ref_lora_path()
             config["anima_ref_strength"] = float(self.ref_strength_var.get())
             config["ref_guidance"] = float(self.ref_guidance_var.get())
             config["ref_correction"] = self.ref_correction_var.get()
             config["ref_offset_h"] = float(self.ref_offset_var.get())
             config["ref_megapixels"] = float(self.ref_megapixels_var.get())
-        elif self._family in ("qwen_image", "h3_image") and self.qwen_reference_bindings():
+        elif self.qwen_reference_enabled():
             config["qwen_refs"] = self.qwen_reference_bindings()
-        if self._family == "krea2" and self.anypaint_var.get():
+        if self.anypaint_enabled():
             config["anypaint"] = True
             config["anypaint_lora"] = self.anypaint_lora_path()
             config["anypaint_strength"] = float(self.anypaint_strength_var.get())
