@@ -1,5 +1,6 @@
 """Menu bar and status bar construction."""
 
+import sys
 import time
 import tkinter as tk
 from tkinter import font as tkfont, ttk
@@ -7,6 +8,7 @@ from tkinter import font as tkfont, ttk
 from . import filters
 from . import theme
 from .constants import PANELS
+from .scrollbar import AutoScrollbar
 
 # Grid cell presets offered by View > Grid Size, as ``(label, document px)``.
 GRID_SIZE_PRESETS = (
@@ -403,6 +405,73 @@ CLOSE_DELAY = 300
 _POSTING = 0
 
 
+class _MenuPoint:
+    """Minimal event carrying window-relative coordinates.
+
+    Only the top-level popup receives pointer events while a menu chain is
+    open, so clicks on a submenu's scrollbar are forwarded to it by hand.
+    """
+
+    __slots__ = ("x", "y")
+
+    def __init__(self, x, y):
+        self.x = x
+        self.y = y
+
+
+def _desktop_area(win, x, y):
+    """The usable screen rectangle a popup may occupy.
+
+    Tk's virtual-root metrics cover the whole desktop, taskbar included, so a
+    menu clamped to them can start beneath a top taskbar (hiding its first
+    rows) or run under a bottom one. On Windows ask for the work area of the
+    monitor nearest the requested point, which excludes taskbars; elsewhere
+    keep the Tk metrics.
+    """
+    vx = win.winfo_vrootx()
+    vy = win.winfo_vrooty()
+    vw = win.winfo_vrootwidth()
+    vh = win.winfo_vrootheight()
+    if sys.platform != "win32":
+        return vx, vy, vw, vh
+    try:
+        import ctypes
+
+        class _Rect(ctypes.Structure):
+            _fields_ = [
+                ("left", ctypes.c_long), ("top", ctypes.c_long),
+                ("right", ctypes.c_long), ("bottom", ctypes.c_long),
+            ]
+
+        class _Point(ctypes.Structure):
+            _fields_ = [("x", ctypes.c_long), ("y", ctypes.c_long)]
+
+        class _MonitorInfo(ctypes.Structure):
+            _fields_ = [
+                ("cbSize", ctypes.c_ulong), ("rcMonitor", _Rect),
+                ("rcWork", _Rect), ("dwFlags", ctypes.c_ulong),
+            ]
+
+        user32 = ctypes.windll.user32
+        user32.MonitorFromPoint.restype = ctypes.c_void_p
+        user32.MonitorFromPoint.argtypes = [_Point, ctypes.c_ulong]
+        user32.GetMonitorInfoW.restype = ctypes.c_int
+        user32.GetMonitorInfoW.argtypes = [
+            ctypes.c_void_p, ctypes.POINTER(_MonitorInfo),
+        ]
+        monitor = user32.MonitorFromPoint(_Point(int(x), int(y)), 2)
+        info = _MonitorInfo()
+        info.cbSize = ctypes.sizeof(_MonitorInfo)
+        if monitor and user32.GetMonitorInfoW(monitor, ctypes.byref(info)):
+            work = info.rcWork
+            return (work.left, work.top,
+                    work.right - work.left, work.bottom - work.top)
+    except Exception:
+        # Any ctypes or window-manager surprise falls back to the Tk metrics.
+        pass
+    return vx, vy, vw, vh
+
+
 class PopupMenu:
     """A Tk-drawn dropdown menu.
 
@@ -421,6 +490,12 @@ class PopupMenu:
         self._rows = []
         self._active_row = None
         self._child = None
+        # Set while the menu is taller than the desktop and its rows are shown
+        # through a scrolling canvas (see ``post``).
+        self._canvas = None
+        self._scrollbar = None
+        # The bar that a forwarded button drag is scrolling (see ``_on_click``).
+        self._bar_drag = None
         # The menu this one cascades out of; ``None`` for a top-level menu. Only
         # the top-level menu holds the pointer grab (see ``post``) so it keeps
         # receiving motion while a submenu is open and the parent rows can still
@@ -509,7 +584,10 @@ class PopupMenu:
             # remember what had focus before, to hand it back on close.
             try:
                 self._previous_focus = self._parent.winfo_toplevel().focus_get()
-            except tk.TclError:
+            except (tk.TclError, KeyError):
+                # focus_get() resolves a Tk widget name, which raises KeyError
+                # while focus sits on an internal popdown window (a native menu
+                # or combobox list) that is not part of the widget tree.
                 self._previous_focus = None
         if self._before_post is not None:
             self._before_post(self)
@@ -536,24 +614,62 @@ class PopupMenu:
         inner = tk.Frame(win, bg=panel)
         inner.pack(fill=tk.BOTH, expand=True, padx=1, pady=1)
 
+        content = tk.Frame(inner, bg=panel)
         self._rows = []
         self._active_row = None
+        self._canvas = None
+        self._scrollbar = None
         font = tkfont.nametofont("TkDefaultFont")
         for item in self._items:
-            row = self._build_row(inner, item, font, [panel, text, muted])
+            row = self._build_row(content, item, font, [panel, text, muted])
             self._rows.append((item, row))
+
+        content.update_idletasks()
+        content_width = content.winfo_reqwidth()
+        content_height = content.winfo_reqheight()
+        # Clamp to the usable area of the monitor under the requested point, not
+        # the primary monitor: on a multi-monitor setup a secondary display
+        # extends beyond (or before) the primary one, so clamping to
+        # 0..screenwidth would yank the popup back to the primary screen. The
+        # work area also keeps a top or bottom taskbar from covering menu rows.
+        vx, vy, vw, vh = _desktop_area(win, x, y)
+
+        # A menu with more rows than fit on screen scrolls instead of running
+        # off the bottom edge (which left the last entries unreachable). The
+        # rows keep their natural layout; only a viewport tall enough for the
+        # desktop is shown, with a themed scrollbar beside it.
+        max_height = max(120, vh - 8)
+        if content_height > max_height:
+            canvas = tk.Canvas(
+                inner, bg=panel, highlightthickness=0, bd=0,
+                width=content_width, height=max_height, takefocus=0,
+                yscrollincrement=24,
+            )
+            bar = AutoScrollbar(inner, orient=tk.VERTICAL, command=canvas.yview)
+            canvas.configure(yscrollcommand=bar.set)
+            bar.pack(side=tk.RIGHT, fill=tk.Y)
+            canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+            canvas.create_window(
+                (0, 0), window=content, anchor="nw", width=content_width,
+            )
+            # The rows frame is a sibling of the canvas, and siblings created
+            # later sit on top, so the canvas would hide the rows it embeds.
+            # Raise the frame after embedding so its rows actually show.
+            content.lift()
+            canvas.configure(
+                scrollregion=(0, 0, content_width, content_height),
+            )
+            self._canvas = canvas
+            self._scrollbar = bar
+            win.bind("<MouseWheel>", self._on_wheel)
+            win.bind("<Button-4>", self._on_wheel)
+            win.bind("<Button-5>", self._on_wheel)
+        else:
+            content.pack(fill=tk.BOTH, expand=True)
 
         win.update_idletasks()
         width = win.winfo_reqwidth()
         height = win.winfo_reqheight()
-        # Clamp to the virtual desktop, not the primary monitor: on a
-        # multi-monitor setup a secondary display extends beyond (or before) the
-        # primary one, so clamping to 0..screenwidth would yank the popup back
-        # to the primary screen.
-        vx = win.winfo_vrootx()
-        vy = win.winfo_vrooty()
-        vw = win.winfo_vrootwidth()
-        vh = win.winfo_vrootheight()
         x = max(vx, min(x, vx + vw - width))
         y = max(vy, min(y, vy + vh - height))
         win.geometry(f"+{x}+{y}")
@@ -580,6 +696,8 @@ class PopupMenu:
 
         win.bind("<Motion>", self._on_motion)
         win.bind("<Button-1>", self._on_click)
+        win.bind("<B1-Motion>", self._on_drag)
+        win.bind("<ButtonRelease-1>", self._on_release)
         win.bind("<Button-3>", self._on_right_click)
         win.bind("<Escape>", lambda _e: _close_all_menus())
         # Only the top-level menu grabs the pointer. A local grab redirects
@@ -769,7 +887,19 @@ class PopupMenu:
     def _on_motion(self, event):
         if _POSTING:
             return
+        if self._scrollbar is not None and event.widget is self._scrollbar:
+            # Leave the row highlight alone while the pointer is on the bar.
+            return
         hit = self._hit(event.x_root, event.y_root)
+        if hit is not None:
+            bar = hit[0]._scrollbar
+            if bar is not None and self._in_bar(bar, event.x_root, event.y_root):
+                # A scrollbar is a live control, not empty menu space: keep the
+                # menu (and any submenu the bar belongs to) open while over it.
+                self._cancel_close()
+                bar._on_hover(self._bar_point(bar, event.x_root, event.y_root))
+                return
+        self._clear_bar_hover()
         if hit is None:
             # Pointer left every open menu: drop the highlight and tuck the
             # open submenus away again. A fast move can skip the rows entirely,
@@ -787,6 +917,18 @@ class PopupMenu:
         self._cancel_close()
         menu._set_active(row)
 
+    @staticmethod
+    def _in_bar(bar, x_root, y_root):
+        bx, by = bar.winfo_rootx(), bar.winfo_rooty()
+        return (bx <= x_root < bx + bar.winfo_width()
+                and by <= y_root < by + bar.winfo_height())
+
+    @staticmethod
+    def _bar_point(bar, x_root, y_root):
+        return _MenuPoint(
+            x_root - bar.winfo_rootx(), y_root - bar.winfo_rooty(),
+        )
+
     def _clear_active(self):
         node = self._root()
         while node is not None:
@@ -794,15 +936,81 @@ class PopupMenu:
             node._active_row = None
             node = node._child
 
+    def _clear_bar_hover(self):
+        """Drop the highlight on any bar the pointer has left."""
+        node = self._root()
+        while node is not None:
+            bar = node._scrollbar
+            if bar is not None and bar._hover is not None:
+                bar._on_leave(None)
+            node = node._child
+
     def _on_click(self, event):
         if _POSTING:
             return
+        if self._scrollbar is not None and event.widget is self._scrollbar:
+            # Let the bar handle its own click; the menu stays open.
+            return
         hit = self._hit(event.x_root, event.y_root)
+        if hit is not None:
+            bar = hit[0]._scrollbar
+            if bar is not None and self._in_bar(bar, event.x_root, event.y_root):
+                # The pointer grab sends events over a submenu to this top-level
+                # menu, so a submenu's bar never sees them itself. Forward the
+                # press (and the drag that follows) by hand.
+                if event.widget is not bar:
+                    self._root()._bar_drag = bar
+                    bar._on_press(
+                        self._bar_point(bar, event.x_root, event.y_root),
+                    )
+                return
         if hit is None or hit[1] is None:
             _close_all_menus()
             return
         menu, row = hit
         menu._activate(row)
+
+    def _on_drag(self, event):
+        if _POSTING:
+            return
+        bar = self._root()._bar_drag
+        if bar is None:
+            return
+        bar._on_motion(self._bar_point(bar, event.x_root, event.y_root))
+        return "break"
+
+    def _on_release(self, event):
+        root = self._root()
+        bar = root._bar_drag
+        if bar is None:
+            return
+        root._bar_drag = None
+        bar._on_release(self._bar_point(bar, event.x_root, event.y_root))
+        return "break"
+
+    def _on_wheel(self, event):
+        """Scroll the menu under the pointer, capped to the desktop height."""
+        hit = self._hit(event.x_root, event.y_root)
+        if hit is None:
+            return
+        canvas = hit[0]._canvas
+        if canvas is None:
+            return
+        # A scrolling menu moves its rows out from under any open submenu, so
+        # close the cascade rather than leave it stranded beside the wrong row.
+        hit[0]._close_child()
+        num = getattr(event, "num", None)
+        if num == 4:
+            steps = -1
+        elif num == 5:
+            steps = 1
+        else:
+            steps = int(-event.delta / 120)
+            if steps == 0:
+                steps = -1 if event.delta > 0 else 1
+        canvas.yview_scroll(steps, "units")
+        # Keep the wheel from reaching the app-wide rail scrolling handler.
+        return "break"
 
     def _on_right_click(self, event):
         """A right-click outside the menu dismisses the whole chain.
@@ -859,7 +1067,8 @@ class PopupMenu:
         # of the desktop) it was clamped; flip it to the left of its parent.
         win = menu._window
         if win.winfo_rootx() != x:
-            left = max(win.winfo_vrootx(),
+            left_bound = _desktop_area(win, x, y)[0]
+            left = max(left_bound,
                        self._window.winfo_rootx() - win.winfo_width() + 2)
             win.geometry(f"+{left}+{y}")
             win.update_idletasks()
@@ -877,6 +1086,11 @@ class PopupMenu:
         self._window = None
         self._rows = []
         self._active_row = None
+        if self._scrollbar is not None:
+            self._scrollbar._stop_repeat()
+        self._canvas = None
+        self._scrollbar = None
+        self._bar_drag = None
         if win is None:
             return
         try:
