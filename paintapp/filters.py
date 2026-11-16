@@ -23,7 +23,6 @@ import numpy as np
 from PIL import (
     Image,
     ImageChops,
-    ImageDraw,
     ImageEnhance,
     ImageFilter,
     ImageOps,
@@ -75,6 +74,15 @@ def _choice(key, label, options, default):
     }
 
 
+def _channel_choice(label="Channel"):
+    """A param descriptor for picking the RGB composite or one channel."""
+    return _choice(
+        "channel", label,
+        [("rgb", "RGB"), ("red", "Red"), ("green", "Green"), ("blue", "Blue")],
+        "rgb",
+    )
+
+
 def _rgb_parts(image):
     """Split ``image`` into an RGB image and its alpha (or ``None``)."""
     if image.mode == "RGBA":
@@ -124,8 +132,22 @@ def _grayscale(image, params):
     if amount <= 0:
         return image
     rgb, alpha = _rgb_parts(image)
-    gray = ImageOps.grayscale(rgb).convert("RGB")
-    return _rejoin(Image.blend(rgb, gray, min(1.0, amount)), alpha)
+    red = max(0.0, float(params.get("red", 30)))
+    green = max(0.0, float(params.get("green", 59)))
+    blue = max(0.0, float(params.get("blue", 11)))
+    total = red + green + blue
+    if total <= 0.0:
+        red, green, blue, total = 30.0, 59.0, 11.0, 100.0
+    arr = np.asarray(rgb).astype(np.float32)
+    gray = (
+        arr[:, :, 0] * red + arr[:, :, 1] * green + arr[:, :, 2] * blue
+    ) / total
+    tint = np.array(rgba(params.get("tint", "#ffffff"))[:3],
+                    dtype=np.float32) / 255.0
+    gray = gray[:, :, None] * tint[None, None, :]
+    out = arr * (1.0 - amount) + gray * amount
+    out = np.clip(out, 0, 255).astype(np.uint8)
+    return _rejoin(Image.fromarray(out, "RGB"), alpha)
 
 
 def _invert(image, params):
@@ -140,19 +162,53 @@ def _invert(image, params):
 def _posterize(image, params):
     bits = max(1, min(8, int(params["bits"])))
     rgb, alpha = _rgb_parts(image)
+    if params.get("dither", False):
+        step = 255.0 / max(1, (1 << bits) - 1)
+        arr = np.asarray(rgb).astype(np.float32)
+        height, width = arr.shape[:2]
+        arr = arr + _bayer_offset(height, width)[:, :, None] * step
+        rgb = Image.fromarray(np.clip(arr, 0, 255).astype(np.uint8), "RGB")
     return _rejoin(ImageOps.posterize(rgb, bits), alpha)
 
 
 def _threshold(image, params):
-    level = int(params["level"])
+    level = float(params["level"])
     rgb, alpha = _rgb_parts(image)
-    gray = ImageOps.grayscale(rgb)
-    out = gray.point(lambda value: 255 if value > level else 0).convert("RGB")
-    return _rejoin(out, alpha)
+    arr = np.asarray(rgb).astype(np.float32)
+    channel = str(params.get("channel", "luma"))
+    if channel == "red":
+        gray = arr[:, :, 0]
+    elif channel == "green":
+        gray = arr[:, :, 1]
+    elif channel == "blue":
+        gray = arr[:, :, 2]
+    else:
+        gray = (arr[:, :, 0] * 0.299 + arr[:, :, 1] * 0.587
+                + arr[:, :, 2] * 0.114)
+    softness = max(0.0, min(100.0, float(params.get("softness", 0))))
+    if softness <= 0.0:
+        out = np.where(gray > level, 255, 0).astype(np.uint8)
+    else:
+        half = softness / 100.0 * 127.5
+        ramp = np.clip((gray - (level - half)) / (2.0 * half), 0.0, 1.0)
+        out = np.clip(ramp * 255.0 + 0.5, 0, 255).astype(np.uint8)
+    return _rejoin(Image.fromarray(out, "L").convert("RGB"), alpha)
 
 
 def _clamp01(value):
     return 0.0 if value < 0.0 else (1.0 if value > 1.0 else value)
+
+
+_BAYER4 = np.array(
+    [[0, 8, 2, 10], [12, 4, 14, 6], [3, 11, 1, 9], [15, 7, 13, 5]],
+    dtype=np.float32,
+)
+
+
+def _bayer_offset(height, width):
+    """A tiled 4x4 ordered-dither pattern in ``-0.5..0.5``."""
+    pattern = _BAYER4 / 16.0 - 0.5
+    return np.tile(pattern, (height // 4 + 1, width // 4 + 1))[:height, :width]
 
 
 def _levels_lut(params):
@@ -180,6 +236,20 @@ def _levels_lut(params):
         out = out_black + t * (out_white - out_black)
         lut.append(int(round(max(0.0, min(255.0, out)))))
     return lut
+
+
+def _channel_lut(rgb, table, channel):
+    """Apply a 256-entry ``table`` to one channel of ``rgb`` (or all of them)."""
+    def point(band):
+        return band.point(lambda value, _t=table: _t[value])
+
+    names = ("red", "green", "blue")
+    if channel not in names:
+        return rgb.point(lambda value, _t=table: _t[value])
+    bands = list(rgb.split())
+    index = names.index(channel)
+    bands[index] = point(bands[index])
+    return Image.merge("RGB", bands)
 
 
 def _spline_lut(points):
@@ -301,13 +371,13 @@ def _points_lut(params):
 def _points(image, params):
     rgb, alpha = _rgb_parts(image)
     table = _points_lut(params)
-    return _rejoin(rgb.point(lambda value, _t=table: _t[value]), alpha)
+    return _rejoin(_channel_lut(rgb, table, params.get("channel", "rgb")), alpha)
 
 
 def _levels(image, params):
     rgb, alpha = _rgb_parts(image)
     table = _levels_lut(params)
-    return _rejoin(rgb.point(lambda value, _t=table: _t[value]), alpha)
+    return _rejoin(_channel_lut(rgb, table, params.get("channel", "rgb")), alpha)
 
 
 # ---------------------------------------------------------------------- blur
@@ -336,41 +406,75 @@ def _unsharp(image, params):
 
 def _sharpen(image, params):
     rgb, alpha = _rgb_parts(image)
-    out = ImageEnhance.Sharpness(rgb).enhance(params["factor"])
+    out = rgb.filter(ImageFilter.UnsharpMask(
+        radius=max(0.0, float(params.get("radius", 1.0))),
+        percent=int(round(float(params["factor"]) * 100)),
+        threshold=max(0, min(255, int(params.get("threshold", 0)))),
+    ))
     return _rejoin(out, alpha)
 
 
 # -------------------------------------------------------------------- stylize
+def _blend_amount(original, filtered, params, key="amount"):
+    """Blend ``filtered`` over ``original`` by a 0-100 ``key`` percentage."""
+    amount = _clamp01(float(params.get(key, 100)) / 100.0)
+    if amount >= 1.0:
+        return filtered
+    return Image.blend(original, filtered, amount)
+
+
 def _edge_enhance(image, params):
     rgb, alpha = _rgb_parts(image)
     filt = ImageFilter.EDGE_ENHANCE_MORE if params["more"] else ImageFilter.EDGE_ENHANCE
-    return _rejoin(rgb.filter(filt), alpha)
+    out = rgb.filter(filt)
+    return _rejoin(_blend_amount(rgb, out, params), alpha)
 
 
-def _emboss(image, _params):
+def _emboss(image, params):
+    """A directional relief emboss around a 128-grey base."""
     rgb, alpha = _rgb_parts(image)
-    return _rejoin(rgb.filter(ImageFilter.EMBOSS), alpha)
+    gray = np.asarray(ImageOps.grayscale(rgb)).astype(np.float32)
+    height, width = gray.shape
+    angle = math.radians(float(params.get("angle", 135)))
+    strength = max(0.0, float(params.get("strength", 100))) / 100.0
+    padded = np.pad(gray, 1, mode="edge")
+    conv = np.zeros_like(gray)
+    for dy in (-1, 0, 1):
+        for dx in (-1, 0, 1):
+            if dx == 0 and dy == 0:
+                continue
+            weight = -(dx * math.cos(angle) + dy * math.sin(angle))
+            conv += padded[1 + dy:1 + dy + height, 1 + dx:1 + dx + width] * weight
+    relief = np.clip(128.0 + conv * strength * 0.5, 0, 255).astype(np.uint8)
+    out = Image.fromarray(relief, "L").convert("RGB")
+    return _rejoin(_blend_amount(rgb, out, params, "mix"), alpha)
 
 
-def _contour(image, _params):
+def _contour(image, params):
     rgb, alpha = _rgb_parts(image)
-    return _rejoin(rgb.filter(ImageFilter.CONTOUR), alpha)
+    out = rgb.filter(ImageFilter.CONTOUR)
+    return _rejoin(_blend_amount(rgb, out, params), alpha)
 
 
 def _smooth(image, params):
     rgb, alpha = _rgb_parts(image)
     filt = ImageFilter.SMOOTH_MORE if params["more"] else ImageFilter.SMOOTH
-    return _rejoin(rgb.filter(filt), alpha)
+    out = rgb.filter(filt)
+    return _rejoin(_blend_amount(rgb, out, params), alpha)
 
 
-def _detail(image, _params):
+def _detail(image, params):
     rgb, alpha = _rgb_parts(image)
-    return _rejoin(rgb.filter(ImageFilter.DETAIL), alpha)
+    out = rgb.filter(ImageFilter.DETAIL)
+    return _rejoin(_blend_amount(rgb, out, params), alpha)
 
 
-def _find_edges(image, _params):
+def _find_edges(image, params):
     rgb, alpha = _rgb_parts(image)
-    return _rejoin(rgb.filter(ImageFilter.FIND_EDGES), alpha)
+    out = rgb.filter(ImageFilter.FIND_EDGES)
+    if params.get("invert", False):
+        out = ImageOps.invert(out)
+    return _rejoin(out, alpha)
 
 
 # --------------------------------------------------------------- pixel/color
@@ -380,12 +484,33 @@ def _pixelate(image, params):
     small = image.resize(
         (max(1, width // size), max(1, height // size)), Image.BILINEAR
     )
-    return small.resize((width, height), Image.NEAREST)
+    pixelated = small.resize((width, height), Image.NEAREST)
+    if str(params.get("shape", "square")) != "circle":
+        return pixelated
+    rgb, alpha = _rgb_parts(image)
+    blocks, _ = _rgb_parts(pixelated)
+    yy, xx = np.mgrid[0:height, 0:width]
+    lx = (np.mod(xx, size) + 0.5) / size - 0.5
+    ly = (np.mod(yy, size) + 0.5) / size - 0.5
+    mask = lx * lx + ly * ly <= 0.25
+    base = np.asarray(rgb).astype(np.float32)
+    dots = np.asarray(blocks).astype(np.float32)
+    out = np.where(mask[:, :, None], dots, base).astype(np.uint8)
+    return _rejoin(Image.fromarray(out, "RGB"), alpha)
 
 
 def _quantize(image, params):
     colors = max(2, min(256, int(params["colors"])))
     rgb, alpha = _rgb_parts(image)
+    if params.get("dither", False):
+        # Ordered dithering before the adaptive palette: Pillow's adaptive
+        # conversion ignores its own dither flag, so offset each pixel by a
+        # tiled 4x4 Bayer pattern one palette step deep.
+        amount = 255.0 / max(1, colors - 1)
+        arr = np.asarray(rgb).astype(np.float32)
+        height, width = arr.shape[:2]
+        arr = arr + _bayer_offset(height, width)[:, :, None] * amount
+        rgb = Image.fromarray(np.clip(arr, 0, 255).astype(np.uint8), "RGB")
     out = rgb.convert("P", palette=Image.ADAPTIVE, colors=colors).convert("RGB")
     return _rejoin(out, alpha)
 
@@ -522,25 +647,31 @@ def _clouds(image, params):
 
 
 def _vignette(image, params):
-    strength = params["strength"] / 100.0
-    if strength <= 0:
+    strength = _clamp01(params["strength"] / 100.0)
+    if strength <= 0.0:
         return image
     rgb, alpha = _rgb_parts(image)
-    small = 64
-    mask = Image.new("L", (small, small), 0)
-    draw = ImageDraw.Draw(mask)
-    steps = 24
-    for i in range(steps):
-        frac = (i + 1) / steps
-        inset = (1 - frac) / 2 * small
-        draw.ellipse(
-            (inset, inset, small - inset - 1, small - inset - 1),
-            fill=int(255 * frac),
-        )
-    mask = mask.resize(rgb.size, Image.BILINEAR)
-    mask = mask.point(lambda value: 255 - int((255 - value) * strength))
-    out = Image.composite(rgb, Image.new("RGB", rgb.size, (0, 0, 0)), mask)
-    return _rejoin(out, alpha)
+    width, height = rgb.size
+    base = np.asarray(rgb).astype(np.float32)
+    yy, xx = np.mgrid[0:height, 0:width].astype(np.float32)
+    cx = float(params.get("center_x", 50)) / 100.0 * width
+    cy = float(params.get("center_y", 50)) / 100.0 * height
+    dx = (xx + 0.5 - cx) / max(1.0, width)
+    dy = (yy + 0.5 - cy) / max(1.0, height)
+    # Normalise so a corner is 1.0 when the centre is in the middle.
+    distance = np.hypot(dx, dy) / (0.5 * math.sqrt(2.0))
+    radius = _clamp01(float(params.get("radius", 0)) / 100.0)
+    feather = _clamp01(float(params.get("feather", 100)) / 100.0)
+    if feather <= 0.0:
+        weight = (distance > radius).astype(np.float32)
+    else:
+        t = np.clip((distance - radius) / feather, 0.0, 1.0)
+        weight = t * t * (3.0 - 2.0 * t)
+    weight = weight * strength
+    tint = np.array(rgba(params.get("color", "#000000"))[:3], dtype=np.float32)
+    out = base * (1.0 - weight[:, :, None]) + tint * weight[:, :, None]
+    out = np.clip(out, 0, 255).astype(np.uint8)
+    return _rejoin(Image.fromarray(out, "RGB"), alpha)
 
 
 # ------------------------------------------------------------- more adjustments
@@ -570,7 +701,7 @@ def _vibrance(image, params):
 
 
 def _color_balance(image, params):
-    """Shift each channel, weighting the change toward what is missing."""
+    """Shift each channel, optionally limited to one tonal range."""
     shifts = (
         float(params["red"]) / 100.0,
         float(params["green"]) / 100.0,
@@ -578,15 +709,33 @@ def _color_balance(image, params):
     )
     rgb, alpha = _rgb_parts(image)
     arr = np.asarray(rgb).astype(np.float32)
+    luma = (arr[:, :, 0] * 0.299 + arr[:, :, 1] * 0.587
+            + arr[:, :, 2] * 0.114) / 255.0
+    tonal_range = str(params.get("range", "all"))
+    if tonal_range == "shadows":
+        weight = np.clip(1.0 - 2.0 * luma, 0.0, 1.0)
+    elif tonal_range == "highlights":
+        weight = np.clip(2.0 * luma - 1.0, 0.0, 1.0)
+    elif tonal_range == "midtones":
+        weight = np.clip(1.0 - np.abs(2.0 * luma - 1.0), 0.0, 1.0)
+    else:
+        weight = np.ones_like(luma)
+    tone = weight
+    adjusted = arr.copy()
     for index, amount in enumerate(shifts):
         if amount == 0.0:
             continue
         channel = arr[:, :, index]
         if amount >= 0:
-            arr[:, :, index] = channel + (255.0 - channel) * amount
+            adjusted[:, :, index] = channel + (255.0 - channel) * amount * tone
         else:
-            arr[:, :, index] = channel + channel * amount
-    out = np.clip(arr, 0, 255).astype(np.uint8)
+            adjusted[:, :, index] = channel + channel * amount * tone
+    if params.get("preserve_luminosity", False):
+        new_luma = (adjusted[:, :, 0] * 0.299 + adjusted[:, :, 1] * 0.587
+                    + adjusted[:, :, 2] * 0.114)
+        scale = np.where(new_luma > 0.5, (luma * 255.0) / new_luma, 0.0)
+        adjusted = adjusted * scale[:, :, None]
+    out = np.clip(adjusted, 0, 255).astype(np.uint8)
     return _rejoin(Image.fromarray(out, "RGB"), alpha)
 
 
@@ -613,12 +762,15 @@ def _selective(image, params):
     ], dtype=np.float32)
     arr = np.asarray(rgb).astype(np.float32)
     adjusted = arr.copy()
+    absolute = str(params.get("mode", "relative")) == "absolute"
     for index in range(3):
         amount = shifts[index]
         if amount == 0.0:
             continue
         channel = adjusted[:, :, index]
-        if amount >= 0:
+        if absolute:
+            adjusted[:, :, index] = channel + amount * 255.0
+        elif amount >= 0:
             adjusted[:, :, index] = channel + (255.0 - channel) * amount
         else:
             adjusted[:, :, index] = channel + channel * amount
@@ -633,6 +785,12 @@ def _gradient_map(image, params):
     gray = np.asarray(ImageOps.grayscale(rgb)).astype(np.float32) / 255.0
     start = np.array(rgba(params["start"])[:3], dtype=np.float32)
     end = np.array(rgba(params["end"])[:3], dtype=np.float32)
+    if params.get("reverse", False):
+        start, end = end, start
+    mid = max(0.01, min(0.99, float(params.get("mid", 50)) / 100.0))
+    if mid != 0.5:
+        # Put the 50/50 blend of the two colours at ``mid``.
+        gray = gray ** (math.log(0.5) / math.log(mid))
     t = gray[:, :, None]
     out = start[None, None, :] * (1.0 - t) + end[None, None, :] * t
     out = np.clip(out, 0, 255).astype(np.uint8)
@@ -647,83 +805,144 @@ def _photo_filter(image, params):
     rgb, alpha = _rgb_parts(image)
     tint = Image.new("RGB", rgb.size, tuple(rgba(params["color"])[:3]))
     out = Image.blend(rgb, tint, min(1.0, density))
+    if params.get("preserve_luminosity", False):
+        base = np.asarray(rgb).astype(np.float32)
+        arr = np.asarray(out).astype(np.float32)
+        old_luma = base[:, :, 0] * 0.299 + base[:, :, 1] * 0.587 + base[:, :, 2] * 0.114
+        new_luma = arr[:, :, 0] * 0.299 + arr[:, :, 1] * 0.587 + arr[:, :, 2] * 0.114
+        scale = np.where(new_luma > 0.5, old_luma / new_luma, 0.0)
+        arr = np.clip(arr * scale[:, :, None], 0, 255).astype(np.uint8)
+        out = Image.fromarray(arr, "RGB")
     return _rejoin(out, alpha)
 
 
 # ------------------------------------------------------------- more blur/stylize
 def _motion_blur(image, params):
-    """A straight-line blur at ``angle`` degrees over ``distance`` pixels."""
+    """A directional blur with an optional centre-weighted taper."""
     distance = max(1, int(round(params["distance"])))
-    angle = float(params["angle"])
+    angle = math.radians(float(params["angle"]))
+    taper = _clamp01(float(params.get("taper", 0)) / 100.0)
     rgb, alpha = _rgb_parts(image)
-    rotated = rgb.rotate(angle, resample=Image.BILINEAR, expand=False)
-    blurred = rotated.filter(ImageFilter.BoxBlur((distance, 0)))
-    back = blurred.rotate(-angle, resample=Image.BILINEAR, expand=False)
-    return _rejoin(back, alpha)
+    arr = np.asarray(rgb).astype(np.float32)
+    height, width = arr.shape[:2]
+    pad = distance // 2 + 1
+    padded = np.pad(arr, ((pad, pad), (pad, pad), (0, 0)), mode="edge")
+    cos, sin = math.cos(angle), math.sin(angle)
+    steps = max(3, min(16, distance))
+    total = np.zeros_like(arr)
+    weight_sum = 0.0
+    for step in range(steps):
+        t = step / max(1, steps - 1) - 0.5
+        offset = t * distance
+        dx = int(round(offset * cos))
+        dy = int(round(offset * sin))
+        shifted = padded[pad + dy:pad + dy + height,
+                          pad + dx:pad + dx + width]
+        weight = 1.0 - taper * abs(t) * 2.0
+        total += shifted * weight
+        weight_sum += weight
+    out = np.clip(total / max(weight_sum, 1e-6), 0, 255).astype(np.uint8)
+    return _rejoin(Image.fromarray(out, "RGB"), alpha)
 
 
 def _radial_blur(image, params):
-    """A zoom blur: blend the image with progressively smaller copies."""
+    """A zoom or spin blur around a focal point."""
     strength = max(0.0, min(1.0, params["strength"] / 100.0))
     if strength <= 0.0:
         return image
     width, height = image.size
-    out = image.convert("RGBA")
+    cx = params.get("center_x", 50) / 100.0 * width
+    cy = params.get("center_y", 50) / 100.0 * height
+    rgb, alpha = _rgb_parts(image)
     steps = 8
-    for step in range(1, steps + 1):
-        factor = 1.0 - strength * (step / steps) * 0.25
-        small = image.resize(
-            (max(1, int(width * factor)), max(1, int(height * factor))),
-            Image.BILINEAR,
-        )
-        layer = Image.new("RGBA", (width, height), (0, 0, 0, 0))
-        layer.paste(small, ((width - small.width) // 2,
-                            (height - small.height) // 2))
-        out = Image.blend(out, layer, 0.5)
-    return out
+    total = np.zeros((height, width, 3), dtype=np.float32)
+    if str(params.get("mode", "zoom")) == "spin":
+        span = math.radians(60.0 * strength)
+        for step in range(steps):
+            angle = -span * 0.5 + span * step / max(1, steps - 1)
+            rotated = rgb.rotate(
+                math.degrees(angle), center=(cx, cy), resample=Image.BILINEAR,
+                fillcolor=None,
+            )
+            total += np.asarray(rotated, dtype=np.float32)
+    else:
+        for step in range(1, steps + 1):
+            factor = 1.0 - strength * (step / steps) * 0.25
+            small = rgb.resize(
+                (max(1, int(width * factor)), max(1, int(height * factor))),
+                Image.BILINEAR,
+            )
+            layer = Image.new("RGB", (width, height), (0, 0, 0))
+            layer.paste(
+                small,
+                (int(round(cx * (1.0 - factor))),
+                 int(round(cy * (1.0 - factor)))),
+            )
+            total += np.asarray(layer, dtype=np.float32)
+    out = np.clip(total / steps, 0, 255).astype(np.uint8)
+    return _rejoin(Image.fromarray(out, "RGB"), alpha)
 
 
 def _lens_blur(image, params):
     """A soft defocus with a highlight bloom, approximating a lens blur."""
     radius = max(0.0, float(params["radius"]))
+    threshold = max(0, min(255, int(params.get("threshold", 170))))
+    bloom_amount = _clamp01(float(params.get("bloom", 60)) / 100.0)
     rgb, alpha = _rgb_parts(image)
     blurred = rgb.filter(ImageFilter.GaussianBlur(radius))
-    highlights = rgb.point(lambda v: 255 if v > 170 else 0)
+    highlights = rgb.point(lambda v: 255 if v > threshold else 0)
     bloom = highlights.filter(ImageFilter.GaussianBlur(radius * 1.5))
-    bloom = bloom.point(lambda v: int(v * 0.6))
+    bloom = bloom.point(lambda v: int(v * bloom_amount))
     return _rejoin(ImageChops.screen(blurred, bloom), alpha)
 
 
 def _glow(image, params):
-    """Screen a blurred copy over the original for a soft bloom."""
+    """Screen a blurred, thresholded highlight layer in ``color``."""
     strength = max(0.0, min(1.0, params["strength"] / 100.0))
     if strength <= 0.0:
         return image
     radius = max(0.0, float(params["radius"]))
+    threshold = max(0, min(255, int(params.get("threshold", 170))))
     rgb, alpha = _rgb_parts(image)
-    blurred = rgb.filter(ImageFilter.GaussianBlur(radius))
-    screened = ImageChops.screen(rgb, blurred)
+    highlights = ImageOps.grayscale(rgb).point(
+        lambda v: 255 if v >= threshold else 0
+    )
+    mask = highlights.filter(ImageFilter.GaussianBlur(radius))
+    tint = Image.new("RGB", rgb.size, tuple(rgba(params.get("color", "#ffffff"))[:3]))
+    glow = Image.composite(tint, Image.new("RGB", rgb.size, (0, 0, 0)), mask)
+    screened = ImageChops.screen(rgb, glow)
     return _rejoin(Image.blend(rgb, screened, strength), alpha)
 
 
 def _oil_paint(image, params):
     """Flatten the image into painterly patches of colour."""
-    size = max(3, min(9, int(round(params["size"])) | 1))
+    size = max(3, min(15, int(round(params["size"])) | 1))
+    bits = max(1, min(8, int(params.get("cleanliness", 5))))
+    shine = _clamp01(float(params.get("shine", 0)) / 100.0)
     rgb, alpha = _rgb_parts(image)
     out = rgb.filter(ImageFilter.MedianFilter(size))
-    out = ImageOps.posterize(out, 5)
+    out = ImageOps.posterize(out, bits)
     out = out.filter(ImageFilter.ModeFilter(size))
+    if shine > 0.0:
+        bloom = out.filter(ImageFilter.GaussianBlur(size))
+        out = Image.blend(out, ImageChops.screen(out, bloom), shine)
     return _rejoin(out, alpha)
 
 
 def _watercolor(image, params):
     """Smooth washes of colour with darkened edges."""
-    size = max(3, min(9, int(round(params["size"])) | 1))
+    size = max(3, min(15, int(round(params["size"])) | 1))
+    diffusion = max(0.0, float(params.get("diffusion", 0.0)))
+    edge_strength = _clamp01(float(params.get("edges", 100)) / 100.0)
     rgb, alpha = _rgb_parts(image)
     smooth = rgb.filter(ImageFilter.MedianFilter(size))
     smooth = ImageOps.posterize(smooth, 6)
+    if diffusion > 0.0:
+        smooth = smooth.filter(ImageFilter.GaussianBlur(diffusion))
     edges = rgb.convert("L").filter(ImageFilter.FIND_EDGES)
-    lines = edges.point(lambda v: 255 - min(255, v * 2))
+    lines = edges.point(
+        lambda v: 255 - min(255, int(v * 2.0 * edge_strength))
+    )
     outline = Image.merge("RGB", (lines, lines, lines))
     return _rejoin(ImageChops.multiply(smooth, outline), alpha)
 
@@ -745,6 +964,8 @@ uniform vec2 u_tex_size;
 uniform float u_cell;
 uniform float u_angle;
 uniform int u_shape;  // 0 dot, 1 line, 2 cross
+uniform vec3 u_color;
+uniform float u_opacity;
 out vec4 f_color;
 void main() {
     vec2 pix = floor(gl_FragCoord.xy);
@@ -770,8 +991,8 @@ void main() {
     } else {
         ink = sqrt(dx * dx + dy * dy) / sqrt(2.0) < radius;
     }
-    float value = ink ? 0.0 : 1.0;
-    f_color = vec4(value, value, value, c.a);
+    vec3 screen = mix(vec3(1.0), u_color, ink ? 1.0 : 0.0);
+    f_color = vec4(mix(c.rgb, screen, u_opacity), c.a);
 }
 """
 
@@ -841,9 +1062,9 @@ def _screen_coords(height, width, size, angle):
 def _halftone(image, params):
     """Screen a grayscale copy into ink dots, lines or a crosshatch.
 
-    The printed image is pure black/white: darker tones grow the ink shape
-    (a dot, a bar, or both axes crossed) and lighter tones shrink it, which is
-    the amplitude-modulated screen a manga tone layer is built from.
+    Darker tones grow the ink shape (a dot, a bar, or both axes crossed) and
+    lighter tones shrink it. The ink is drawn in ``color`` and mixed over the
+    artwork by ``opacity`` so it can be used as a subtle overlay.
     """
     rgb, alpha = _rgb_parts(image)
     gray = np.asarray(ImageOps.grayscale(rgb)).astype(np.float32)
@@ -851,6 +1072,8 @@ def _halftone(image, params):
     cell = max(2, int(round(params["cell"])))
     angle = float(params["angle"])
     shape = str(params["shape"])
+    color = rgba(params.get("color", "#000000"))[:3]
+    opacity = _clamp01(float(params.get("opacity", 100)) / 100.0)
     if gpuimage.available():
         screened = gpuimage.render(
             _HALFTONE_FRAGMENT, (width, height), textures=[image],
@@ -859,6 +1082,8 @@ def _halftone(image, params):
                 "u_cell": float(cell),
                 "u_angle": angle,
                 "u_shape": _HALFTONE_IDS.get(shape, 0),
+                "u_color": tuple(channel / 255.0 for channel in color),
+                "u_opacity": opacity,
             },
         )
         if screened is not None:
@@ -878,8 +1103,12 @@ def _halftone(image, params):
     else:
         distance = np.sqrt(dx * dx + dy * dy) / math.sqrt(2.0)
         ink = distance < radius
-    out = np.where(ink, 0, 255).astype(np.uint8)
-    return _rejoin(Image.fromarray(out, "L").convert("RGB"), alpha)
+    screen = np.where(ink[:, :, None],
+                      np.array(color, dtype=np.float32) / 255.0, 1.0)
+    base = np.asarray(rgb, dtype=np.float32) / 255.0
+    blended = base * (1.0 - opacity) + screen * opacity
+    out = np.clip(blended * 255.0 + 0.5, 0, 255).astype(np.uint8)
+    return _rejoin(Image.fromarray(out, "RGB"), alpha)
 
 
 _SCREENTONE_PATTERNS = ("dot", "line", "cross", "grid")
@@ -1066,7 +1295,13 @@ _register(
 )
 _register(
     "grayscale", "adjust", "Grayscale",
-    [_p("amount", "Amount", 0, 100, 100, 1, "int")],
+    [
+        _p("amount", "Amount", 0, 100, 100, 1, "int"),
+        _p("red", "Red weight", 0, 200, 30, 1, "int"),
+        _p("green", "Green weight", 0, 200, 59, 1, "int"),
+        _p("blue", "Blue weight", 0, 200, 11, 1, "int"),
+        _c("tint", "Tint", "#ffffff"),
+    ],
     _grayscale, lambda p: f"Grayscale {int(p['amount'])}%",
 )
 _register(
@@ -1076,18 +1311,31 @@ _register(
 )
 _register(
     "posterize", "adjust", "Posterize",
-    [_p("bits", "Bits", 1, 8, 4, 1, "int")],
+    [
+        _p("bits", "Bits", 1, 8, 4, 1, "int"),
+        _p("dither", "Dither", 0, 1, 0, 1, "bool"),
+    ],
     _posterize, lambda p: f"Posterize {int(p['bits'])} bits",
 )
 _register(
     "threshold", "adjust", "Threshold",
-    [_p("level", "Level", 0, 255, 128, 1, "int")],
+    [
+        _choice(
+            "channel", "Channel",
+            [("luma", "Luminance"), ("red", "Red"), ("green", "Green"),
+             ("blue", "Blue")],
+            "luma",
+        ),
+        _p("level", "Level", 0, 255, 128, 1, "int"),
+        _p("softness", "Softness", 0, 100, 0, 1, "int"),
+    ],
     _threshold, lambda p: f"Threshold {int(p['level'])}",
 )
 
 _register(
     "levels", "adjust", "Levels",
     [
+        _channel_choice(),
         _p("in_black", "Input black", 0, 255, 0, 1, "int"),
         _p("in_white", "Input white", 0, 255, 255, 1, "int"),
         _p("gamma", "Gamma", 0.1, 9.99, 1.0, 0.01),
@@ -1098,34 +1346,38 @@ _register(
     lambda p: (
         f"Levels {int(p['in_black'])}\u2013{int(p['in_white'])} "
         f"\u03b3{p['gamma']:g}"
+        + ("" if p.get("channel", "rgb") == "rgb"
+           else f" ({p['channel'][0].upper()})")
     ),
 )
 _register(
     "curves", "adjust", "Curves",
-    [_curve_p("points", "Curve", default_curve())],
+    [_channel_choice(), _curve_p("points", "Curve", default_curve())],
     _points,
-    lambda p: f"Curves ({len(coerce_curve(p.get('points')))} pts)",
+    lambda p: f"Curves ({len(coerce_curve(p.get('points')))} pts)"
+              + ("" if p.get("channel", "rgb") == "rgb"
+                 else f" ({p['channel'][0].upper()})"),
 )
 
 _register(
     "gaussian_blur", "blur", "Gaussian Blur",
-    [_p("radius", "Radius", 0.0, 50.0, 4.0, 0.5)],
+    [_p("radius", "Radius", 0.0, 200.0, 4.0, 0.5)],
     _gaussian_blur, lambda p: f"Gaussian Blur {p['radius']:g}px",
 )
 _register(
     "box_blur", "blur", "Box Blur",
-    [_p("radius", "Radius", 0.0, 50.0, 4.0, 0.5)],
+    [_p("radius", "Radius", 0.0, 200.0, 4.0, 0.5)],
     _box_blur, lambda p: f"Box Blur {p['radius']:g}px",
 )
 _register(
     "median", "blur", "Median",
-    [_p("size", "Size", 1, 15, 3, 2, "int")],
+    [_p("size", "Size", 1, 31, 3, 2, "int")],
     _median, lambda p: f"Median {int(p['size'])}",
 )
 _register(
     "unsharp", "blur", "Unsharp Mask",
     [
-        _p("radius", "Radius", 0.0, 50.0, 2.0, 0.5),
+        _p("radius", "Radius", 0.0, 200.0, 2.0, 0.5),
         _p("percent", "Amount", 0, 400, 150, 5, "int"),
         _p("threshold", "Threshold", 0, 255, 3, 1, "int"),
     ],
@@ -1133,41 +1385,73 @@ _register(
 )
 _register(
     "sharpen", "blur", "Sharpen",
-    [_p("factor", "Amount", 0.0, 4.0, 1.5, 0.05)],
+    [
+        _p("factor", "Amount", 0.0, 4.0, 1.5, 0.05),
+        _p("radius", "Radius", 0.0, 20.0, 1.0, 0.5),
+        _p("threshold", "Threshold", 0, 255, 0, 1, "int"),
+    ],
     _sharpen, lambda p: f"Sharpen {p['factor']:g}",
 )
 
 _register(
     "edge_enhance", "stylize", "Edge Enhance",
-    [_p("more", "Stronger", 0, 1, 0, 1, "bool")],
+    [
+        _p("more", "Stronger", 0, 1, 0, 1, "bool"),
+        _p("amount", "Amount", 0, 100, 100, 1, "int"),
+    ],
     _edge_enhance, lambda p: "Edge Enhance (strong)" if p["more"] else "Edge Enhance",
 )
 _register(
-    "emboss", "stylize", "Emboss", [], _emboss, lambda _p: "Emboss",
+    "emboss", "stylize", "Emboss",
+    [
+        _p("angle", "Angle", 0, 180, 135, 1, "int"),
+        _p("strength", "Strength", 0, 200, 100, 1, "int"),
+        _p("mix", "Mix", 0, 100, 100, 1, "int"),
+    ],
+    _emboss, lambda p: f"Emboss {int(p['angle'])}\u00b0",
 )
 _register(
-    "contour", "stylize", "Contour", [], _contour, lambda _p: "Contour",
+    "contour", "stylize", "Contour",
+    [_p("amount", "Amount", 0, 100, 100, 1, "int")],
+    _contour, lambda _p: "Contour",
 )
 _register(
     "smooth", "stylize", "Smooth",
-    [_p("more", "Stronger", 0, 1, 0, 1, "bool")],
+    [
+        _p("more", "Stronger", 0, 1, 0, 1, "bool"),
+        _p("amount", "Amount", 0, 100, 100, 1, "int"),
+    ],
     _smooth, lambda p: "Smooth (strong)" if p["more"] else "Smooth",
 )
 _register(
-    "detail", "stylize", "Detail", [], _detail, lambda _p: "Detail",
+    "detail", "stylize", "Detail",
+    [_p("amount", "Amount", 0, 100, 100, 1, "int")],
+    _detail, lambda _p: "Detail",
 )
 _register(
-    "find_edges", "stylize", "Find Edges", [], _find_edges, lambda _p: "Find Edges",
+    "find_edges", "stylize", "Find Edges",
+    [_p("invert", "Invert", 0, 1, 0, 1, "bool")],
+    _find_edges, lambda _p: "Find Edges",
 )
 
 _register(
     "pixelate", "pixel", "Pixelate",
-    [_p("size", "Block", 1, 64, 8, 1, "int")],
+    [
+        _p("size", "Block", 1, 128, 8, 1, "int"),
+        _choice(
+            "shape", "Shape",
+            [("square", "Square"), ("circle", "Round")],
+            "square",
+        ),
+    ],
     _pixelate, lambda p: f"Pixelate {int(p['size'])}px",
 )
 _register(
     "quantize", "pixel", "Quantize",
-    [_p("colors", "Colors", 2, 256, 16, 1, "int")],
+    [
+        _p("colors", "Colors", 2, 256, 16, 1, "int"),
+        _p("dither", "Dither", 0, 1, 0, 1, "bool"),
+    ],
     _quantize, lambda p: f"Quantize {int(p['colors'])} colors",
 )
 _register(
@@ -1207,7 +1491,14 @@ _register(
 )
 _register(
     "vignette", "pixel", "Vignette",
-    [_p("strength", "Strength", 0, 100, 60, 1, "int")],
+    [
+        _p("strength", "Strength", 0, 100, 60, 1, "int"),
+        _p("radius", "Radius", 0, 100, 0, 1, "int"),
+        _p("feather", "Feather", 0, 100, 100, 1, "int"),
+        _p("center_x", "Center X %", 0, 100, 50, 1, "int"),
+        _p("center_y", "Center Y %", 0, 100, 50, 1, "int"),
+        _c("color", "Color", "#000000"),
+    ],
     _vignette, lambda p: f"Vignette {int(p['strength'])}%",
 )
 
@@ -1224,9 +1515,16 @@ _register(
 _register(
     "color_balance", "adjust", "Color Balance",
     [
+        _choice(
+            "range", "Tonal range",
+            [("all", "All"), ("shadows", "Shadows"),
+             ("midtones", "Midtones"), ("highlights", "Highlights")],
+            "all",
+        ),
         _p("red", "Red", -100, 100, 0, 1, "int"),
         _p("green", "Green", -100, 100, 0, 1, "int"),
         _p("blue", "Blue", -100, 100, 0, 1, "int"),
+        _p("preserve_luminosity", "Preserve luminosity", 0, 1, 0, 1, "bool"),
     ],
     _color_balance,
     lambda p: (f"Balance R{int(p['red'])} G{int(p['green'])} "
@@ -1236,7 +1534,17 @@ _register(
 _register(
     "selective", "color", "Selective Color",
     [
-        _p("target", "Range", 0, 5, 0, 1, "int"),
+        _choice(
+            "target", "Range",
+            [(str(index), name) for index, (_key, name) in
+             enumerate(_SELECTIVE_NAMES)],
+            "0",
+        ),
+        _choice(
+            "mode", "Mode",
+            [("relative", "Relative"), ("absolute", "Absolute")],
+            "relative",
+        ),
         _p("cyan_red", "Cyan \u2013 Red", -100, 100, 0, 1, "int"),
         _p("magenta_green", "Magenta \u2013 Green", -100, 100, 0, 1, "int"),
         _p("yellow_blue", "Yellow \u2013 Blue", -100, 100, 0, 1, "int"),
@@ -1247,48 +1555,79 @@ _register(
 )
 _register(
     "gradient_map", "color", "Gradient Map",
-    [_c("start", "Shadow color", "#000000"), _c("end", "Highlight color", "#ffffff")],
+    [
+        _c("start", "Shadow color", "#000000"),
+        _c("end", "Highlight color", "#ffffff"),
+        _p("mid", "Midpoint", 1, 99, 50, 1, "int"),
+        _p("reverse", "Reverse", 0, 1, 0, 1, "bool"),
+    ],
     _gradient_map, lambda _p: "Gradient Map",
 )
 _register(
     "photo_filter", "color", "Photo Filter",
     [_c("color", "Color", "#ec8a00"),
-     _p("density", "Density", 0, 100, 25, 1, "int")],
+     _p("density", "Density", 0, 100, 25, 1, "int"),
+     _p("preserve_luminosity", "Preserve luminosity", 0, 1, 0, 1, "bool")],
     _photo_filter, lambda p: f"Photo Filter {int(p['density'])}%",
 )
 
 _register(
     "motion_blur", "blur", "Motion Blur",
-    [_p("angle", "Angle", 0, 360, 0, 1, "int"),
-     _p("distance", "Distance", 1, 100, 12, 1, "int")],
+    [
+        _p("angle", "Angle", 0, 360, 0, 1, "int"),
+        _p("distance", "Distance", 1, 250, 12, 1, "int"),
+        _p("taper", "Taper", 0, 100, 0, 1, "int"),
+    ],
     _motion_blur,
     lambda p: f"Motion Blur {int(p['distance'])}px @ {int(p['angle'])}\u00b0",
 )
 _register(
     "radial_blur", "blur", "Radial Blur",
-    [_p("strength", "Strength", 0, 100, 30, 1, "int")],
-    _radial_blur, lambda p: f"Radial Blur {int(p['strength'])}%",
+    [
+        _choice("mode", "Mode", [("zoom", "Zoom"), ("spin", "Spin")], "zoom"),
+        _p("strength", "Strength", 0, 100, 30, 1, "int"),
+        _p("center_x", "Center X %", 0, 100, 50, 1, "int"),
+        _p("center_y", "Center Y %", 0, 100, 50, 1, "int"),
+    ],
+    _radial_blur,
+    lambda p: f"Radial Blur {int(p['strength'])}%",
 )
 _register(
     "lens_blur", "blur", "Lens Blur",
-    [_p("radius", "Radius", 0.0, 50.0, 8.0, 0.5)],
+    [
+        _p("radius", "Radius", 0.0, 200.0, 8.0, 0.5),
+        _p("threshold", "Highlight threshold", 0, 255, 170, 1, "int"),
+        _p("bloom", "Bloom", 0, 100, 60, 1, "int"),
+    ],
     _lens_blur, lambda p: f"Lens Blur {p['radius']:g}px",
 )
 
 _register(
     "glow", "stylize", "Glow",
-    [_p("radius", "Radius", 0.0, 50.0, 6.0, 0.5),
-     _p("strength", "Strength", 0, 100, 60, 1, "int")],
+    [
+        _p("radius", "Radius", 0.0, 200.0, 6.0, 0.5),
+        _p("strength", "Strength", 0, 100, 60, 1, "int"),
+        _p("threshold", "Threshold", 0, 255, 170, 1, "int"),
+        _c("color", "Glow color", "#ffffff"),
+    ],
     _glow, lambda p: f"Glow {int(p['strength'])}%",
 )
 _register(
     "oil_paint", "stylize", "Oil Paint",
-    [_p("size", "Brush size", 3, 9, 5, 2, "int")],
+    [
+        _p("size", "Brush size", 3, 15, 5, 2, "int"),
+        _p("cleanliness", "Cleanliness", 1, 8, 5, 1, "int"),
+        _p("shine", "Shine", 0, 100, 0, 1, "int"),
+    ],
     _oil_paint, lambda p: f"Oil Paint {int(p['size'])}",
 )
 _register(
     "watercolor", "stylize", "Watercolor",
-    [_p("size", "Detail", 3, 9, 5, 2, "int")],
+    [
+        _p("size", "Detail", 3, 15, 5, 2, "int"),
+        _p("diffusion", "Diffusion", 0.0, 20.0, 0.0, 0.5),
+        _p("edges", "Edges", 0, 100, 100, 1, "int"),
+    ],
     _watercolor, lambda p: f"Watercolor {int(p['size'])}",
 )
 
@@ -1302,6 +1641,8 @@ _register(
         ),
         _p("cell", "Cell size", 2, 64, 6, 1, "int"),
         _p("angle", "Angle", 0, 180, 45, 1, "int"),
+        _c("color", "Ink color", "#000000"),
+        _p("opacity", "Opacity", 0, 100, 100, 1, "int"),
     ],
     _halftone,
     lambda p: f"Halftone {int(p['cell'])}px @ {int(p['angle'])}\u00b0",
