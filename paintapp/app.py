@@ -1406,10 +1406,12 @@ class PaintApp:
         source = self.canvases[index]
         self.canvas_counter += 1
         duplicate = source.copy(name=f"{source.name} copy")
-        self.canvases.append(duplicate)
+        insert_at = index + 1
+        self.canvases.insert(insert_at, duplicate)
         self.area.add(duplicate)
+        self.area.reorder(len(self.canvases) - 1, insert_at)
         self._set_modified(True)
-        self._activate_canvas(len(self.canvases) - 1)
+        self._activate_canvas(insert_at)
         self._refresh_gallery_if_visible()
         self.set_result(f"Duplicated canvas '{source.name}'.")
 
