@@ -734,6 +734,7 @@ class LayerPanel(tk.Frame):
             for widgets in self._row_widgets:
                 widgets["row"].pack(fill=tk.X)
         self._reuse_rows = None
+        self._sync_list_extent()
 
         self._layout_dividers()
         self._selection_kind = "layer"
@@ -3444,6 +3445,31 @@ class LayerPanel(tk.Frame):
             self._on_outline(self.outline_var.get())
 
     # ---------------------------------------------------------------- scrolling
+    def _sync_list_extent(self):
+        """Shrink the embedded list window to its rebuilt content.
+
+        A canvas window takes its height from the embedded widget's requested
+        size, but Tk only re-reads that size when the view moves. Rows removed
+        while the list is scrolled (switching to a canvas with fewer layers,
+        deleting a layer) otherwise leave the window at its old height, so the
+        list shows blank space below the remaining rows and the scrollbar still
+        describes the taller content. Re-anchoring the view at the top makes Tk
+        pick up the new height; the previous position is restored afterwards,
+        clamped to the shorter range.
+        """
+        try:
+            self.inner.update_idletasks()
+            content = self.inner.winfo_reqheight()
+            current = self.inner.winfo_height()
+            first, _last = self.canvas.yview()
+        except tk.TclError:
+            return
+        if current <= content:
+            return
+        self.canvas.yview_moveto(0.0)
+        self.canvas.update_idletasks()
+        self.canvas.yview_moveto(first)
+
     def _on_inner_configure(self, _event):
         self.canvas.configure(scrollregion=self.canvas.bbox("all"))
 
