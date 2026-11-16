@@ -220,6 +220,8 @@ class GenerationPanel(tk.Frame):
         # Set while the whole panel is written from a stored per-canvas/layer
         # setting, so those writes are not echoed back into that storage.
         self._loading = False
+        # Why the last get_config() call returned None, for the caller to show.
+        self.config_error = ""
         # The recipe names shown for the selected model, split into the ones the
         # user saved (removable) and the family's read-only built-ins.
         self._saved_recipe_names = set()
@@ -1124,30 +1126,58 @@ class GenerationPanel(tk.Frame):
         self.lora_count.config(text=f"{len(loras)}")
         theme.restyle(self.lora_list)
 
+    @staticmethod
+    def _number(var, label, cast):
+        """Read a numeric tk variable, naming the field if it is mid-edit.
+
+        Tk stores spinbox text verbatim, so an incomplete entry (for example
+        ``"."`` in the denoise box) makes ``get()`` raise ``TclError``. Raising
+        a plain ``ValueError`` with the field's label lets :meth:`get_config`
+        report which value needs finishing.
+        """
+        try:
+            return cast(var.get())
+        except (tk.TclError, ValueError):
+            raise ValueError(label) from None
+
     def get_config(self):
+        """The generation run config, or ``None`` while a field is mid-edit.
+
+        When it returns ``None``, :attr:`config_error` says which field still
+        needs a complete value.
+        """
         family, path, components, loras, _key = self.model_choices.get(
             self.model_var.get(), ("anima", None, {}, [], None)
         )
         components = components or {}
         width, height = self.size.values()
-        config = {
-            "family": family,
-            "width": int(width),
-            "height": int(height),
-            "steps": int(self.steps_var.get()),
-            "seed": int(self.seed_var.get()),
-            "negative": self.negative_var.get(),
-            "cfg": float(self.cfg_var.get()),
-            "denoise": float(self.denoise_var.get()),
-            "sampler": self.sampler_var.get(),
-            "scheduler": self.scheduler_var.get(),
-            **self._sched_param_values(),
-            "feather": self.feather(),
-            "upscale_type": self.upscale_type(),
-            "upscale_by": float(self.upscale_by_var.get()),
-            "upscale_denoise": float(self.upscale_denoise_var.get()),
-            "live_preview": self.live_preview_mode(),
-        }
+        try:
+            config = {
+                "family": family,
+                "width": int(width),
+                "height": int(height),
+                "steps": self._number(self.steps_var, "Steps", int),
+                "seed": self._number(self.seed_var, "Seed", int),
+                "negative": self.negative_var.get(),
+                "cfg": self._number(self.cfg_var, "CFG", float),
+                "denoise": self._number(self.denoise_var, "Denoise", float),
+                "sampler": self.sampler_var.get(),
+                "scheduler": self.scheduler_var.get(),
+                **self._sched_param_values(),
+                "feather": self.feather(),
+                "upscale_type": self.upscale_type(),
+                "upscale_by": self._number(
+                    self.upscale_by_var, "Hires scale", float
+                ),
+                "upscale_denoise": self._number(
+                    self.upscale_denoise_var, "Hires denoise", float
+                ),
+                "live_preview": self.live_preview_mode(),
+            }
+        except ValueError as exc:
+            self.config_error = f"Finish editing the {exc} value first."
+            return None
+        self.config_error = ""
         if family == "stable_diffusion":
             config["checkpoint"] = path
         elif family == "z_image":

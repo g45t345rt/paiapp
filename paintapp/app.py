@@ -9723,6 +9723,12 @@ class PaintApp:
             self.set_result("Enter a prompt first.")
             return
         config = self.gen.get_config()
+        if config is None:
+            self.set_result(
+                self.gen.config_error or "Finish editing the generation settings first.",
+                "warn",
+            )
+            return
         self.references_panel.apply_config(config)
         doc = self.current
         init_image = None
@@ -10002,6 +10008,12 @@ class PaintApp:
         cached.
         """
         config = self.gen.get_config()
+        if config is None:
+            self.set_result(
+                self.gen.config_error or "Finish editing the generation settings first.",
+                "warn",
+            )
+            return
         self.references_panel.apply_config(config)
         control_rows = self.controlnet_panel.settings()
         if control_rows and self.controlnet_panel.enabled():
