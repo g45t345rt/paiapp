@@ -13,6 +13,7 @@ while zooming re-renders the cached thumbnails at the new scale.
 
 import math
 import tkinter as tk
+from tkinter import font as tkfont
 
 from PIL import Image, ImageTk
 
@@ -68,6 +69,13 @@ class GalleryView(tk.Frame):
         self._moved = False
         self._needs_fit = True
         self._last_size = (0, 0)
+        # A copy of the default font the labels are drawn with. Its size is
+        # reset on every render so the name scales with the camera zoom, just
+        # like the thumbnails, instead of staying readable-sized and colliding
+        # with its neighbours when the board is fitted at a small zoom.
+        self._label_font = tkfont.Font(font="TkDefaultFont")
+        self._label_base_px = max(1, self._label_font.metrics("linespace"))
+        self._label_px = None
 
         self._build_toolbar()
         self.canvas = tk.Canvas(self, highlightthickness=0, bg=theme.color("bg"))
@@ -274,12 +282,36 @@ class GalleryView(tk.Frame):
         self._photos[index] = (self.zoom, photo)
         return photo
 
+    def _ellipsize(self, text, limit):
+        """Shorten a canvas name with an ellipsis so it fits ``limit`` pixels."""
+        text = text or ""
+        if self._label_font.measure(text) <= limit:
+            return text
+        low, high = 0, len(text)
+        while low < high:
+            middle = (low + high + 1) // 2
+            if self._label_font.measure(text[:middle] + "\u2026") <= limit:
+                low = middle
+            else:
+                high = middle - 1
+        return text[:low].rstrip() + "\u2026"
+
     def _render(self):
         canvas = self.canvas
         canvas.delete("all")
         text_color = theme.color("text")
         border = theme.color("border")
         accent = theme.color("accent")
+
+        label_px = max(1, round(self._label_base_px * self.zoom))
+        if label_px != self._label_px:
+            self._label_font.configure(size=-label_px)
+            self._label_px = label_px
+        label_offset = LABEL_H * self.zoom / 2
+        # Leave a small screen-space gutter so the measured width (which can be
+        # a pixel or two narrower than the drawn glyphs) never lets adjacent
+        # columns' names touch.
+        label_limit = max(1, round((THUMB + GAP - 8) * self.zoom) - 4)
 
         if not self._items:
             canvas.create_text(
@@ -299,8 +331,9 @@ class GalleryView(tk.Frame):
                 width=3 if selected else 1,
             )
             canvas.create_text(
-                sx + width / 2, sy + height + LABEL_H / 2,
-                text=item["doc"].name, fill=text_color, anchor=tk.CENTER,
+                sx + width / 2, sy + height + label_offset,
+                text=self._ellipsize(item["doc"].name, label_limit),
+                fill=text_color, anchor=tk.CENTER, font=self._label_font,
             )
 
         count = len(self.documents)
