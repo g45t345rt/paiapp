@@ -19,6 +19,8 @@ transform gizmo resamples a layer on every drag event - uploads it once with
 :class:`Texture`.
 """
 
+import threading
+
 import numpy as np
 from PIL import Image
 
@@ -33,10 +35,14 @@ _VERTICES = np.array(
     (-1.0, -1.0, 3.0, -1.0, -1.0, 3.0), dtype="f4",
 )
 
-_CONTEXT = None
-_CONTEXT_TRIED = False
-_PROGRAMS = {}
-_VAOS = {}
+# A standalone GL context is current only in the thread that created it, and
+# moderngl exposes no cross-thread ``make_current``. The tool work is split
+# between the Tk thread and the project/export worker, so each thread gets its
+# own context and its programs/VAOs belong to that context. Sharing one context
+# across threads left the other thread with no current context, and the first
+# GL call there (``glCreateProgram`` for a large brush dab's shader) crashed
+# inside the driver.
+_STATE = threading.local()
 
 
 def available():
@@ -45,30 +51,47 @@ def available():
 
 
 def _context():
-    global _CONTEXT, _CONTEXT_TRIED
-    if _CONTEXT is not None:
-        return _CONTEXT
-    if _CONTEXT_TRIED:
+    ctx = getattr(_STATE, "context", None)
+    if ctx is not None:
+        return ctx
+    if getattr(_STATE, "context_tried", False):
         return None
-    _CONTEXT_TRIED = True
+    _STATE.context_tried = True
     try:
         import moderngl
-        _CONTEXT = moderngl.create_standalone_context(require=330)
+        ctx = moderngl.create_standalone_context(require=330)
     except Exception:
-        _CONTEXT = None
-    return _CONTEXT
+        ctx = None
+    _STATE.context = ctx
+    return ctx
+
+
+def _programs():
+    programs = getattr(_STATE, "programs", None)
+    if programs is None:
+        programs = _STATE.programs = {}
+    return programs
+
+
+def _vaos():
+    vaos = getattr(_STATE, "vaos", None)
+    if vaos is None:
+        vaos = _STATE.vaos = {}
+    return vaos
 
 
 def _program(fragment):
-    program = _PROGRAMS.get(fragment)
+    programs = _programs()
+    program = programs.get(fragment)
     if program is None:
         program = _context().program(vertex_shader=_VERTEX, fragment_shader=fragment)
-        _PROGRAMS[fragment] = program
+        programs[fragment] = program
     return program
 
 
 def _vao(fragment):
-    cached = _VAOS.get(fragment)
+    vaos = _vaos()
+    cached = vaos.get(fragment)
     if cached is None:
         import moderngl
         ctx = _context()
@@ -76,7 +99,7 @@ def _vao(fragment):
         vbo = ctx.buffer(_VERTICES.tobytes())
         vertex_array = ctx.vertex_array(program, [(vbo, "2f", "in_pos")])
         cached = (vertex_array, vbo)
-        _VAOS[fragment] = cached
+        vaos[fragment] = cached
     return cached[0]
 
 

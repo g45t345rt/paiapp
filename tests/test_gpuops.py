@@ -140,6 +140,42 @@ def test_large_dab_uses_the_gpu():
     check("small dab size", small.size, (16, 16))
 
 
+def test_context_created_on_another_thread_still_works():
+    # Project save/export can touch the GPU on its worker thread first. A later
+    # large-brush dab on the Tk thread used to share that thread's context,
+    # leaving no current context and crashing inside glCreateProgram. Run the
+    # sequence in a subprocess: on the old code it is a native access violation,
+    # not a catchable exception.
+    import subprocess
+    import textwrap
+    script = textwrap.dedent(
+        f"""
+        import sys, threading
+        sys.path.insert(0, {ROOT!r})
+        from PIL import Image
+        from paintapp import gpuops
+
+        def work():
+            if gpuops.gpuimage.available():
+                gpuops.erode(Image.new("L", (32, 32), 255), 1)
+
+        thread = threading.Thread(target=work)
+        thread.start()
+        thread.join()
+        dab = gpuops.brush_dab(500, 100, True, "round")
+        print("dab", dab is not None)
+        """
+    )
+    proc = subprocess.run(
+        [sys.executable, "-c", script],
+        capture_output=True, text=True, timeout=180,
+    )
+    check("worker GL context then main-thread dab", proc.returncode, 0)
+    if proc.returncode != 0:
+        print(proc.stdout)
+        print(proc.stderr)
+
+
 def main():
     for name, fn in sorted(globals().items()):
         if name.startswith("test_") and callable(fn):
