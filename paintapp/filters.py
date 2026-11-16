@@ -390,13 +390,134 @@ def _quantize(image, params):
     return _rejoin(out, alpha)
 
 
+def _noise_plane(size, sigma, seed, scale):
+    """A signed noise field of shape ``(h, w)``.
+
+    ``scale`` is the feature size in pixels: 1 is per-pixel grain, larger values
+    generate at a reduced resolution and upsample, giving clumpier noise.
+    """
+    width, height = size
+    rng = np.random.default_rng(int(seed))
+    if scale <= 1:
+        return rng.normal(0.0, sigma, (height, width)).astype(np.float32)
+    cells = max(2, int(math.ceil(width / scale)) + 2)
+    rows = max(2, int(math.ceil(height / scale)) + 2)
+    small = rng.normal(0.0, sigma, (rows, cells)).astype(np.float32)
+    plane = Image.fromarray(small, "F").resize((width, height), Image.BILINEAR)
+    return np.asarray(plane, dtype=np.float32)
+
+
 def _noise(image, params):
     sigma = float(params["amount"])
     if sigma <= 0:
         return image
     rgb, alpha = _rgb_parts(image)
-    noise = Image.effect_noise(rgb.size, sigma).convert("RGB")
-    out = ImageChops.add(rgb, noise, scale=1.0, offset=-128)
+    seed = int(params.get("seed", 0))
+    scale = max(1.0, float(params.get("scale", 1.0)))
+    source = np.asarray(rgb, dtype=np.float32)
+    if params.get("monochrome", True):
+        field = _noise_plane(rgb.size, sigma, seed, scale)[..., None]
+    else:
+        field = np.stack(
+            [_noise_plane(rgb.size, sigma, seed + 101 * (index + 1), scale)
+             for index in range(3)],
+            axis=-1,
+        )
+    out = np.clip(source + field, 0.0, 255.0).astype(np.uint8)
+    return _rejoin(Image.fromarray(out, "RGB"), alpha)
+
+
+def _fractal_plane(width, height, cell, octaves, persistence, rng):
+    """One channel of fractal (value) noise normalised to ``0..1``."""
+    total = np.zeros((height, width), dtype=np.float32)
+    amplitude = 1.0
+    amplitude_sum = 0.0
+    for _ in range(max(1, int(octaves))):
+        cells = max(2, min(width + 2, int(math.ceil(width / cell)) + 2))
+        rows = max(2, min(height + 2, int(math.ceil(height / cell)) + 2))
+        lattice = rng.random((rows, cells), dtype=np.float32)
+        plane = Image.fromarray(lattice, "F").resize(
+            (width, height), Image.BICUBIC
+        )
+        total += np.asarray(plane, dtype=np.float32) * amplitude
+        amplitude_sum += amplitude
+        amplitude *= persistence
+        cell *= 0.5
+        if cell < 1.0 or amplitude <= 1e-4:
+            break
+    if amplitude_sum <= 0.0:
+        return total
+    return total / amplitude_sum
+
+
+def _clouds_field(rgb, params):
+    """A cloudy fractal-noise RGB image the size of ``rgb``."""
+    width, height = rgb.size
+    # Clouds are smooth, so evaluate at a bounded working resolution and
+    # upsample; this keeps very large canvases responsive without visible loss.
+    ratio = min(1.0, 1600.0 / max(width, height))
+    work_w = max(1, int(round(width * ratio)))
+    work_h = max(1, int(round(height * ratio)))
+    cell = max(1.0, float(params["scale"]) * ratio)
+    octaves = int(params["octaves"])
+    persistence = max(0.0, min(1.0, params["roughness"] / 100.0))
+    seed = int(params["seed"])
+    rng = np.random.default_rng(seed)
+
+    if params.get("monochrome", True):
+        plane = _fractal_plane(
+            work_w, work_h, cell, octaves, persistence, rng
+        )
+        field = plane[..., None]
+    else:
+        field = np.stack(
+            [_fractal_plane(work_w, work_h, cell, octaves, persistence, rng)
+             for _ in range(3)],
+            axis=-1,
+        )
+
+    contrast = max(-100, min(100, int(params["contrast"]))) / 100.0
+    factor = 1.0 + (2.0 * contrast if contrast >= 0.0 else contrast)
+    if factor != 1.0:
+        field = 0.5 + (field - 0.5) * factor
+    field = np.clip(field, 0.0, 1.0)
+
+    tone = curve_lut(params.get("tone", default_curve()))
+    if tone != list(range(256)):
+        table = np.asarray(tone, dtype=np.float32) / 255.0
+        index = np.clip(field * 255.0 + 0.5, 0, 255).astype(np.uint8)
+        field = table[index]
+
+    if field.shape[-1] == 1:
+        gray = np.clip(field[..., 0] * 255.0 + 0.5, 0, 255).astype(np.uint8)
+        out = Image.fromarray(gray, "L").convert("RGB")
+    else:
+        out = Image.fromarray(
+            np.clip(field * 255.0 + 0.5, 0, 255).astype(np.uint8), "RGB"
+        )
+    if out.size != rgb.size:
+        out = out.resize(rgb.size, Image.BICUBIC)
+    return out
+
+
+_CLOUD_BLENDS = {
+    "replace": lambda base, cloud: cloud,
+    "overlay": ImageChops.overlay,
+    "soft_light": ImageChops.soft_light,
+    "multiply": ImageChops.multiply,
+    "add": ImageChops.add,
+}
+
+
+def _clouds(image, params):
+    rgb, alpha = _rgb_parts(image)
+    cloud = _clouds_field(rgb, params)
+    blend = _CLOUD_BLENDS.get(str(params.get("blend", "replace")),
+                              _CLOUD_BLENDS["replace"])
+    out = blend(rgb, cloud)
+    opacity = max(0, min(100, int(params["opacity"]))) / 100.0
+    if opacity < 1.0:
+        out = Image.blend(rgb, out, opacity)
     return _rejoin(out, alpha)
 
 
@@ -1051,8 +1172,38 @@ _register(
 )
 _register(
     "noise", "pixel", "Noise",
-    [_p("amount", "Amount", 0.0, 128.0, 24.0, 1.0)],
-    _noise, lambda p: f"Noise {int(p['amount'])}",
+    [
+        _p("amount", "Amount", 0.0, 128.0, 24.0, 1.0),
+        _p("scale", "Grain size", 1.0, 64.0, 1.0, 1.0),
+        _p("seed", "Seed", 0, 999, 0, 1, "int"),
+        _p("monochrome", "Monochrome", 0, 1, 1, 1, "bool"),
+    ],
+    _noise,
+    lambda p: f"Noise {int(p['amount'])}"
+              + ("" if int(p.get("scale", 1)) <= 1
+                 else f" ({int(p['scale'])}px)"),
+)
+_register(
+    "clouds", "pixel", "Clouds",
+    [
+        _p("scale", "Scale", 4, 1024, 128, 4, "int"),
+        _p("octaves", "Detail", 1, 8, 5, 1, "int"),
+        _p("roughness", "Roughness", 0, 100, 50, 1, "int"),
+        _p("seed", "Seed", 0, 999, 0, 1, "int"),
+        _p("contrast", "Contrast", -100, 100, 0, 1, "int"),
+        _curve_p("tone", "Tone curve", default_curve()),
+        _p("monochrome", "Monochrome", 0, 1, 1, 1, "bool"),
+        _choice(
+            "blend", "Blend",
+            [("replace", "Replace"), ("overlay", "Overlay"),
+             ("soft_light", "Soft Light"), ("multiply", "Multiply"),
+             ("add", "Add")],
+            "replace",
+        ),
+        _p("opacity", "Opacity", 0, 100, 100, 1, "int"),
+    ],
+    _clouds,
+    lambda p: f"Clouds {int(p['scale'])}px / {int(p['octaves'])} oct",
 )
 _register(
     "vignette", "pixel", "Vignette",
