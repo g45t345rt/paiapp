@@ -25,6 +25,9 @@ TAB_MAX_W = 220
 ADD_TAB_W = 28
 
 SCROLL_STEP = 60      # pixels moved by one wheel notch or chevron press
+ARROW_REPEAT_DELAY = 300     # ms a chevron must be held before auto-repeat
+ARROW_REPEAT_INTERVAL = 45   # ms between auto-repeat steps
+ARROW_REPEAT_STEP = 22       # pixels moved per auto-repeat step
 DRAG_SLOP = 6         # pointer travel before a press becomes a drag
 MAX_MENU_LABEL = 48   # longest canvas name shown in the overflow list
 
@@ -63,6 +66,11 @@ class TabStrip(tk.Frame):
         self._drag_start = None
         self._drag_pos = None
         self._drag_moved = False
+        self._pan_start = None
+        self._pan_origin = 0
+        self._repeat_after = None
+        self._repeat_dir = 0
+        self._cursor = ""
         self._pending_reveal = None
         self._last_size = (0, 0)
         self._font = tkfont.nametofont("TkDefaultFont")
@@ -75,6 +83,14 @@ class TabStrip(tk.Frame):
                                   command=self._post_overflow)
         self.canvas = tk.Canvas(self, height=TAB_HEIGHT, bd=0,
                                 highlightthickness=0, takefocus=0)
+
+        for button, direction in ((self.left, -1), (self.right, 1)):
+            button.bind(
+                "<ButtonPress-1>",
+                lambda _event, b=button, d=direction: self._press_arrow(b, d),
+            )
+            button.bind("<ButtonRelease-1>", self._release_arrow)
+            button.bind("<Leave>", self._release_arrow)
 
         self.left.pack(side=tk.LEFT, fill=tk.Y)
         self.canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
@@ -94,6 +110,9 @@ class TabStrip(tk.Frame):
         # reaching the global (sidebar) wheel handler.
         self.canvas.bind("<MouseWheel>", self._on_wheel)
         self.canvas.bind("<Shift-MouseWheel>", self._on_wheel)
+        self.canvas.bind("<ButtonPress-2>", self._on_pan_press)
+        self.canvas.bind("<B2-Motion>", self._on_pan_motion)
+        self.canvas.bind("<ButtonRelease-2>", self._on_pan_release)
 
         self._apply_theme()
         theme.subscribe(self._apply_theme)
@@ -131,18 +150,69 @@ class TabStrip(tk.Frame):
         if notify and self._on_select is not None:
             self._on_select(index)
 
-    def scroll(self, direction):
+    def scroll(self, direction, step=SCROLL_STEP):
         """Scroll the row one step to the left (``-1``) or right (``1``)."""
         limit = self._max_offset()
         if limit <= 0:
             self._sync_arrows()
             return
-        target = max(0, min(limit, self._offset + direction * SCROLL_STEP))
+        target = max(0, min(limit, self._offset + direction * step))
         if target == self._offset:
             return
         self._offset = target
         self._render()
         self._sync_arrows()
+
+    def _press_arrow(self, button, direction):
+        self._stop_arrow_repeat()
+        limit = self._max_offset()
+        if direction < 0:
+            if self._offset <= 0:
+                return "break"
+        elif self._offset >= limit:
+            return "break"
+        button.config(relief=tk.SUNKEN)
+        self.scroll(direction)
+        self._repeat_dir = direction
+        self._repeat_after = self.after(ARROW_REPEAT_DELAY,
+                                        self._repeat_arrow)
+        return "break"
+
+    def _repeat_arrow(self):
+        self._repeat_after = None
+        if not self._repeat_dir:
+            return
+        try:
+            exists = bool(self.winfo_exists())
+        except tk.TclError:
+            return
+        if not exists:
+            return
+        before = self._offset
+        self.scroll(self._repeat_dir, ARROW_REPEAT_STEP)
+        if self._offset == before:
+            self._repeat_dir = 0
+            return
+        self._repeat_after = self.after(ARROW_REPEAT_INTERVAL,
+                                        self._repeat_arrow)
+
+    def _release_arrow(self, event=None):
+        self._stop_arrow_repeat()
+        if event is not None:
+            try:
+                event.widget.config(relief=tk.RAISED)
+            except tk.TclError:
+                pass
+        return "break"
+
+    def _stop_arrow_repeat(self):
+        self._repeat_dir = 0
+        if self._repeat_after is not None:
+            try:
+                self.after_cancel(self._repeat_after)
+            except tk.TclError:
+                pass
+            self._repeat_after = None
 
     # ----------------------------------------------------------------- metrics
     def _measure(self):
@@ -239,13 +309,21 @@ class TabStrip(tk.Frame):
         return len(self._slots) - 1
 
     def _on_press(self, event):
-        self._drag_start = (event.x, event.y)
         self._drag_moved = False
         hit = self._hit(event.x)
-        self._drag_from = hit[1] if hit is not None and hit[0] == "tab" else None
+        if hit is None:
+            self._drag_from = None
+            self._drag_start = None
+            self._begin_pan(event.x)
+            return
+        self._drag_start = (event.x, event.y)
+        self._drag_from = hit[1] if hit[0] == "tab" else None
         self._drag_pos = (event.x, event.y)
 
     def _on_motion(self, event):
+        if self._pan_start is not None:
+            self._pan_to(event.x)
+            return
         if self._drag_start is None:
             return
         self._drag_pos = (event.x, event.y)
@@ -267,6 +345,10 @@ class TabStrip(tk.Frame):
         self._render()
 
     def _on_release(self, event):
+        if self._pan_start is not None:
+            self._pan_start = None
+            self._drag_pos = None
+            return
         moved = self._drag_moved
         self._drag_from = None
         self._drag_start = None
@@ -318,11 +400,19 @@ class TabStrip(tk.Frame):
         target = None
         if hit is not None:
             target = hit[1] if hit[0] == "tab" else "add"
+        cursor = ("sb_h_double_arrow"
+                  if hit is None and self._max_offset() > 0 else "")
+        if cursor != self._cursor:
+            self._cursor = cursor
+            self.canvas.configure(cursor=cursor)
         if target != self._hover:
             self._hover = target
             self._render()
 
     def _on_leave(self, _event):
+        if self._cursor:
+            self._cursor = ""
+            self.canvas.configure(cursor="")
         if self._hover is not None:
             self._hover = None
             self._render()
@@ -331,6 +421,35 @@ class TabStrip(tk.Frame):
         if event.delta == 0:
             return None
         self.scroll(-1 if event.delta > 0 else 1)
+        return "break"
+
+    def _begin_pan(self, x):
+        self._pan_start = x
+        self._pan_origin = self._offset
+
+    def _pan_to(self, x):
+        limit = self._max_offset()
+        if limit <= 0:
+            return
+        target = max(0, min(limit, self._pan_origin - (x - self._pan_start)))
+        if target == self._offset:
+            return
+        self._offset = target
+        self._render()
+        self._sync_arrows()
+
+    def _on_pan_press(self, event):
+        self._drag_from = None
+        self._drag_start = None
+        self._begin_pan(event.x)
+
+    def _on_pan_motion(self, event):
+        if self._pan_start is not None:
+            self._pan_to(event.x)
+        return "break"
+
+    def _on_pan_release(self, _event):
+        self._pan_start = None
         return "break"
 
     def _on_configure(self, event):
