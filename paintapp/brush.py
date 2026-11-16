@@ -533,8 +533,16 @@ def composite_color(base, color, coverage, mode="normal"):
         # Bare pixels have no colour to blend against, so blend modes fall back
         # to the raw paint colour wherever the layer is transparent.
         blended = Image.composite(blended, solid, base.getchannel("A"))
+    # ``Image.paste`` with a mask blends every band by the mask, so a
+    # partially-covered pixel over a transparent (black) base takes on a darkened
+    # RGB as well as partial alpha. Compositing the layer over a backdrop then
+    # shows that as a dark fringe along every dab's edge - the contour artifact
+    # seen once a stroke overlaps other content. ``alpha_composite`` is a true
+    # source-over pass: the paint keeps its own colour and only the alpha ramps.
+    patch = blended.convert("RGBA")
+    patch.putalpha(coverage)
     result = base.copy()
-    result.paste(blended, (0, 0), coverage)
+    result.alpha_composite(patch)
     return result
 
 
@@ -577,7 +585,17 @@ def composite_image(base, overlay_rgb, coverage, mode="normal"):
         blended = _blend(mode, base.convert("RGB"), overlay)
         blended = Image.composite(blended, overlay, base.getchannel("A"))
     result = base.copy()
-    result.paste(blended, (0, 0), coverage)
+    if "A" in blended.getbands():
+        # An RGBA overlay deliberately blends its own alpha into the base (see
+        # above), so it keeps the paste path that every band follows.
+        result.paste(blended, (0, 0), coverage)
+        return result
+    # An opaque overlay must composite as source-over, not paste: paste would
+    # blend its RGB toward a transparent base's black and leave the same dark
+    # contour fringe :func:`composite_color` avoids.
+    patch = blended.convert("RGBA")
+    patch.putalpha(coverage)
+    result.alpha_composite(patch)
     return result
 
 

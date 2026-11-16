@@ -99,6 +99,17 @@ def test_composite_color_uses_the_mode():
           multiply.getpixel((0, 0))[0] < 40, True)
 
 
+def test_composite_color_keeps_paint_colour_at_soft_edges():
+    """A partially covered pixel over a transparent base must keep the paint's
+    own RGB. ``Image.paste`` blended it toward the base's transparent black, so
+    every soft dab edge became a dark fringe that read as a contour once the
+    layer was composited over other content."""
+    base = Image.new("RGBA", (1, 1), (0, 0, 0, 0))
+    coverage = Image.new("L", (1, 1), 128)
+    out = brush.composite_color(base, (230, 20, 20), coverage, "normal")
+    check("soft edge keeps its colour", out.getpixel((0, 0)), (230, 20, 20, 128))
+
+
 def main():
     for name, fn in sorted(globals().items()):
         if name.startswith("test_") and callable(fn):
