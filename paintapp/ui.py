@@ -1407,7 +1407,7 @@ def build_menus(app, parent):
     menus = []
 
     file_menu = PopupMenu(parent)
-    file_menu.add_command(label="New", accelerator=accel("file_new"), command=app.new_document)
+    file_menu.add_command(label="New Project", accelerator=accel("file_new"), command=app.new_document)
     file_menu.add_command(label="Open Project...", accelerator=accel("file_open_project"), command=app.open_project)
     file_menu.add_command(label="Open Image...", accelerator=accel("file_open_image"), command=app.open_image)
     file_menu.add_command(label="Close Project", command=app.close_project)
