@@ -3,10 +3,12 @@
 import math
 import tkinter as tk
 from tkinter import font as tkfont, ttk
+from typing import NamedTuple
 
 from PIL import Image, ImageDraw, ImageTk
 
 from . import colormanagement, shape, symmetry, theme
+from .aspect import aspect_ratio_label, megapixels_label
 from .constants import CANVAS_W, CANVAS_H, MAX_CANVAS_SIZE
 from .dialogs import ask_color, center_window
 from .sizeinput import SizeInput
@@ -346,11 +348,24 @@ def prompt_resize_canvas(root, initial=(CANVAS_W, CANVAS_H),
     frame = tk.Frame(dialog, padx=12, pady=12)
     frame.pack(fill=tk.BOTH, expand=True)
 
-    size_input = SizeInput(frame, initial[0], initial[1], field_width=10)
-    size_input.grid(row=0, column=0, sticky="w", pady=2)
+    size_holder = tk.Frame(frame)
+    size_holder.grid(row=0, column=0, sticky="w", pady=2)
+    size_input = SizeInput(
+        size_holder, initial[0], initial[1], field_width=10,
+        on_change=lambda *_a: _update_size_summary(),
+    )
+    size_input.pack(side=tk.LEFT)
+
+    size_summary_var = tk.StringVar(value="")
+    size_summary = tk.Label(
+        frame, textvariable=size_summary_var, anchor="w", justify="left",
+        wraplength=300,
+    )
+    size_summary.grid(row=1, column=0, sticky="w", pady=(0, 4))
+    theme.register(size_summary, fg="muted")
 
     anchor_frame = tk.LabelFrame(frame, text="Keep content", padx=4, pady=4)
-    anchor_frame.grid(row=1, column=0, sticky="w", pady=(8, 0))
+    anchor_frame.grid(row=2, column=0, sticky="w", pady=(8, 0))
     anchor_var = tk.StringVar(value="c")
     for index, (value, _fx, _fy, label) in enumerate(CANVAS_ANCHORS):
         row, column = divmod(index, 3)
@@ -362,14 +377,24 @@ def prompt_resize_canvas(root, initial=(CANVAS_W, CANVAS_H),
     tk.Label(
         frame, text="Shrinking crops content outside the new canvas.",
         anchor="w",
-    ).grid(row=2, column=0, sticky="w", pady=(2, 0))
+    ).grid(row=3, column=0, sticky="w", pady=(2, 0))
 
     error_var = tk.StringVar(value="")
     tk.Label(frame, textvariable=error_var, fg="red", anchor="w").grid(
-        row=3, column=0, sticky="w", pady=(2, 0)
+        row=4, column=0, sticky="w", pady=(2, 0)
     )
 
     result = {"value": None}
+
+    def _update_size_summary():
+        width, height = size_input.values()
+        if width is None or height is None or width < 1 or height < 1:
+            size_summary_var.set("")
+            return
+        size_summary_var.set(
+            f"{width} × {height} px · {aspect_ratio_label(width, height)} · "
+            f"{megapixels_label(width, height)}"
+        )
 
     def on_ok(_event=None):
         width, height = size_input.values()
@@ -389,7 +414,7 @@ def prompt_resize_canvas(root, initial=(CANVAS_W, CANVAS_H),
         dialog.destroy()
 
     buttons = tk.Frame(frame)
-    buttons.grid(row=4, column=0, sticky="e", pady=(8, 0))
+    buttons.grid(row=5, column=0, sticky="e", pady=(8, 0))
     tk.Button(buttons, text="OK", width=8, command=on_ok).pack(side=tk.RIGHT)
     tk.Button(buttons, text="Cancel", width=8, command=on_cancel).pack(
         side=tk.RIGHT, padx=(0, 6)
@@ -400,6 +425,7 @@ def prompt_resize_canvas(root, initial=(CANVAS_W, CANVAS_H),
     dialog.protocol("WM_DELETE_WINDOW", on_cancel)
 
     theme.restyle(dialog)
+    _update_size_summary()
     center_window(root, dialog)
     size_input.width_field.focus_set()
     size_input.width_field.selection_range(0, tk.END)
@@ -409,34 +435,286 @@ def prompt_resize_canvas(root, initial=(CANVAS_W, CANVAS_H),
     return result["value"]
 
 
-# Preset canvas sizes offered by the New Canvas dialog, as ``(label, (w, h))``.
-# "Custom" is always available; the caller's current default is inserted as a
-# labelled preset at build time when it is not already in the list.
-CANVAS_PRESETS = (
-    ("800 x 640", (800, 640)),
-    ("1024 x 768", (1024, 768)),
-    ("768 x 768", (768, 768)),
-    ("1024 x 1024", (1024, 1024)),
-    ("896 x 1152", (896, 1152)),
-    ("1152 x 896", (1152, 896)),
-    ("1280 x 720", (1280, 720)),
-    ("1920 x 1080", (1920, 1080)),
-    ("1080 x 1080", (1080, 1080)),
-    ("1080 x 1920", (1080, 1920)),
-    ("2048 x 2048", (2048, 2048)),
-    # Print pages at 300 dpi (a millimetre size multiplied by 300 / 25.4), so a
-    # canvas lines up with the matching export page preset. Portrait first.
-    ("1748 x 2480 (A5 300dpi)", (1748, 2480)),
-    ("2480 x 1748 (A5 300dpi landscape)", (2480, 1748)),
-    ("2150 x 3035 (B5 300dpi)", (2150, 3035)),
-    ("3035 x 2150 (B5 300dpi landscape)", (3035, 2150)),
-    ("2480 x 3508 (A4 300dpi)", (2480, 3508)),
-    ("3508 x 2480 (A4 300dpi landscape)", (3508, 2480)),
-    ("3035 x 4299 (B4 300dpi)", (3035, 4299)),
-    ("4299 x 3035 (B4 300dpi landscape)", (4299, 3035)),
-    ("2550 x 3300 (Letter 300dpi)", (2550, 3300)),
-    ("3300 x 2550 (Letter 300dpi landscape)", (3300, 2550)),
+class CanvasPreset(NamedTuple):
+    """One New Canvas preset: its label, pixel size, ratio and help text."""
+
+    label: str
+    size: tuple[int, int]
+    ratio: str
+    note: str
+
+
+# Presets offered by the New Canvas dialog, as
+# ``(category, name, (width, height), aspect ratio, note)``. Rows are grouped by
+# category and the label is built as ``"<category> · <name>"``. Categories group
+# a project by medium (Manga holds both print trims and web pages) so a size
+# never appears in more than one category. Screen and AI sizes are exact pixels;
+# print/photo sizes are the pixel count at 300 dpi (``mm * 300 / 25.4`` or
+# ``inches * 300``), matching the export page presets.
+_PRESET_ROWS = (
+    # ------------------------------------------------------------- default
+    ("Default", "800×640 · 5:4", (800, 640), "5:4",
+     "The app's starting canvas. Good for quick tests and small sketches."),
+
+    # -------------------------------------------------------------- screen
+    ("Screen", "VGA · 640×480 · 4:3", (640, 480), "4:3",
+     "Low-res 4:3 screen; useful for pixel art and retro work."),
+    ("Screen", "SVGA · 800×600 · 4:3", (800, 600), "4:3",
+     "Legacy 4:3 screen and projector size."),
+    ("Screen", "XGA · 1024×768 · 4:3", (1024, 768), "4:3",
+     "4:3 screen and projector size; also useful for retro-style art."),
+    ("Screen", "SXGA · 1280×1024 · 5:4", (1280, 1024), "5:4",
+     "5:4 monitor size; common on older business displays."),
+    ("Screen", "HD · 1280×720 · 16:9", (1280, 720), "16:9",
+     "720p video and small web images."),
+    ("Screen", "WXGA · 1280×800 · 16:10", (1280, 800), "16:10",
+     "Common 13-inch laptop panel; 16:10."),
+    ("Screen", "Laptop · 1366×768 · 16:9", (1366, 768), "16:9",
+     "Very common budget laptop resolution."),
+    ("Screen", "HD+ · 1600×900 · 16:9", (1600, 900), "16:9",
+     "HD+-class laptop panels and 900p video."),
+    ("Screen", "UXGA · 1600×1200 · 4:3", (1600, 1200), "4:3",
+     "Large 4:3 desktop display."),
+    ("Screen", "WSXGA+ · 1680×1050 · 16:10", (1680, 1050), "16:10",
+     "16:10 desktop monitor; common with older 22-inch panels."),
+    ("Screen", "Full HD · 1920×1080 · 16:9", (1920, 1080), "16:9",
+     "1080p video, desktop wallpaper and a common web export."),
+    ("Screen", "WUXGA · 1920×1200 · 16:10", (1920, 1200), "16:10",
+     "16:10 monitor and laptop size; common for UI and desktop art."),
+    ("Screen", "DCI 2K · 2048×1080 · 1.90:1", (2048, 1080), "1.90:1",
+     "Cinema 2K frame; wider than 16:9."),
+    ("Screen", "QHD · 2560×1440 · 16:9", (2560, 1440), "16:9",
+     "1440p video and high-DPI desktop output."),
+    ("Screen", "WQXGA · 2560×1600 · 16:10", (2560, 1600), "16:10",
+     "High-res 16:10 monitor and laptop panel."),
+    ("Screen", "Retina · 2880×1800 · 16:10", (2880, 1800), "16:10",
+     "15-inch Retina laptop panel; 16:10 high-DPI."),
+    ("Screen", "Ultrawide · 3440×1440 · 21:9", (3440, 1440), "21:9",
+     "21:9 ultrawide monitor wallpaper."),
+    ("Screen", "4K UHD · 3840×2160 · 16:9", (3840, 2160), "16:9",
+     "2160p video and high-DPI screen output; 8.3 MP."),
+    ("Screen", "DCI 4K · 4096×2160 · 1.90:1", (4096, 2160), "1.90:1",
+     "Cinema 4K frame; wider than UHD."),
+    ("Screen", "5K · 5120×2880 · 16:9", (5120, 2880), "16:9",
+     "5K desktop output; 14.7 MP."),
+    ("Screen", "8K UHD · 7680×4320 · 16:9", (7680, 4320), "16:9",
+     "8K video and high-DPI screen output; 33 MP and heavy to paint."),
+    ("Screen", "Phone · 1080×1920 · 9:16", (1080, 1920), "9:16",
+     "Phone/tablet wallpaper or a 9:16 story image."),
+    ("Screen", "Phone QHD · 1440×2560 · 9:16", (1440, 2560), "9:16",
+     "1440p phone/tablet portrait; also a 2.5K wallpaper."),
+    ("Screen", "Phone 4K · 2160×3840 · 9:16", (2160, 3840), "9:16",
+     "4K phone/tablet portrait; 8.3 MP."),
+    ("Screen", "Tablet 4:3 · 2048×2732 · 4:3", (2048, 2732), "4:3",
+     "iPad Pro 12.9 portrait resolution; 4:3."),
+    ("Screen", "Tablet 3:2 · 2400×1600 · 3:2", (2400, 1600), "3:2",
+     "Surface-style 3:2 tablet or camera aspect."),
+    ("Screen", "Tablet 3:2 portrait · 1600×2400 · 2:3", (1600, 2400), "2:3",
+     "Portrait 3:2 tablet and camera aspect."),
+
+    # -------------------------------------------------------------- social
+    ("Social", "Portrait · 1080×1350 · 4:5", (1080, 1350), "4:5",
+     "Instagram-style portrait post; 4:5."),
+    ("Social", "Landscape · 1080×566 · 1.91:1", (1080, 566), "1.91:1",
+     "Instagram/Facebook landscape post; 1.91:1."),
+    ("Social", "Open Graph · 1200×630 · 1.91:1", (1200, 630), "1.91:1",
+     "Link-preview image for websites and chat apps."),
+    ("Social", "Pinterest · 1000×1500 · 2:3", (1000, 1500), "2:3",
+     "Pinterest pin and tall social image."),
+    ("Social", "Facebook cover · 820×312 · 2.63:1", (820, 312), "2.63:1",
+     "Facebook page cover; very wide."),
+    ("Social", "LinkedIn banner · 1584×396 · 4:1", (1584, 396), "4:1",
+     "LinkedIn profile banner; 4:1."),
+    ("Social", "Square · 1080×1080 · 1:1", (1080, 1080), "1:1",
+     "Square social post, icon and thumbnail."),
+
+    # --------------------------------------------------------------- photo
+    ("Photo", "4×6 in · 1200×1800 · 2:3", (1200, 1800), "2:3",
+     "Standard 4 × 6 in photo print at 300 dpi."),
+    ("Photo", "5×7 in · 1500×2100 · 5:7", (1500, 2100), "5:7",
+     "Standard 5 × 7 in photo print at 300 dpi."),
+    ("Photo", "6×8 in · 1800×2400 · 3:4", (1800, 2400), "3:4",
+     "6 × 8 in photo print at 300 dpi."),
+    ("Photo", "8×10 in · 2400×3000 · 4:5", (2400, 3000), "4:5",
+     "Standard 8 × 10 in photo print at 300 dpi."),
+    ("Photo", "11×14 in · 3300×4200 · 11:14", (3300, 4200), "11:14",
+     "11 × 14 in photo print at 300 dpi."),
+    ("Photo", "16×20 in · 4800×6000 · 4:5", (4800, 6000), "4:5",
+     "Large 16 × 20 in photo print at 300 dpi."),
+    ("Photo", "18×24 in · 5400×7200 · 3:4", (5400, 7200), "3:4",
+     "Poster-size 18 × 24 in print at 300 dpi; 38.9 MP."),
+    ("Photo", "8×8 in · 2400×2400 · 1:1", (2400, 2400), "1:1",
+     "Square 8 × 8 in print at 300 dpi."),
+    ("Photo", "12×12 in · 3600×3600 · 1:1", (3600, 3600), "1:1",
+     "Square 12 × 12 in print at 300 dpi."),
+
+    # ------------------------------------------------------------------ AI
+    ("AI", "512×512 · 1:1", (512, 512), "1:1",
+     "SD 1.x square generation size."),
+    ("AI", "512×768 · 2:3", (512, 768), "2:3",
+     "SD 1.x portrait generation size."),
+    ("AI", "768×512 · 3:2", (768, 512), "3:2",
+     "SD 1.x landscape generation size."),
+    ("AI", "768×768 · 1:1", (768, 768), "1:1",
+     "The small square generation size used by the Generate panel."),
+    ("AI", "832×1216 · 13:19", (832, 1216), "13:19",
+     "SDXL portrait generation size."),
+    ("AI", "1216×832 · 19:13", (1216, 832), "19:13",
+     "SDXL landscape generation size."),
+    ("AI", "896×1152 · 7:9", (896, 1152), "7:9",
+     "A portrait generation size used by the Generate panel."),
+    ("AI", "1152×896 · 9:7", (1152, 896), "9:7",
+     "A landscape generation size used by the Generate panel."),
+    ("AI", "1024×1024 · 1:1", (1024, 1024), "1:1",
+     "Matches common generation output, so generated art pastes 1:1."),
+    ("AI", "1024×1536 · 2:3", (1024, 1536), "2:3",
+     "Portrait 2:3 generation size."),
+    ("AI", "1536×1024 · 3:2", (1536, 1024), "3:2",
+     "Landscape 3:2 generation size."),
+    ("AI", "1344×768 · 7:4", (1344, 768), "7:4",
+     "Wide landscape generation size used by several models."),
+    ("AI", "768×1344 · 4:7", (768, 1344), "4:7",
+     "Tall portrait generation size."),
+    ("AI", "1536×640 · 12:5", (1536, 640), "12:5",
+     "Cinematic-wide generation size."),
+    ("AI", "640×1536 · 5:12", (640, 1536), "5:12",
+     "Very tall generation size for banners."),
+    ("AI", "1280×768 · 5:3", (1280, 768), "5:3",
+     "Wide landscape generation size."),
+    ("AI", "768×1280 · 3:5", (768, 1280), "3:5",
+     "Tall portrait generation size."),
+    ("AI", "2048×2048 · 1:1", (2048, 2048), "1:1",
+     "High-res square for AI art and textures; 4.2 MP."),
+
+    # ---------------------------------------------------------------- manga
+    # Print trims and screen pages live together: a manga project picks the
+    # same category for web and print instead of bouncing between Print/Web.
+    ("Manga", "B6 print · 1476×2079 · 1:1.41 · 300 dpi", (1476, 2079), "1:1.41",
+     "B6 print at 300 dpi (125 × 176 mm). The common Japanese tankobon trim."),
+    ("Manga", "B5 print · 2150×3035 · 1:1.41 · 300 dpi", (2150, 3035), "1:1.41",
+     "B5 print at 300 dpi (182 × 257 mm). The standard Japanese manga trim."),
+    ("Manga", "B5 print landscape · 3035×2150 · 1:1.41 · 300 dpi",
+     (3035, 2150), "1:1.41",
+     "B5 print at 300 dpi, landscape orientation (257 × 182 mm)."),
+    ("Manga", "B5 print · 4299×6071 · 1:1.41 · 600 dpi", (4299, 6071), "1:1.41",
+     "B5 at 600 dpi for B/W line art and screentone. About 26 MP, so brushes "
+     "and filters are slower."),
+    ("Manga", "Web page 1200 · 850×1200 · 1:1.41", (850, 1200), "1:1.41",
+     "Compact screen-manga page at the B5 ratio; light and fast."),
+    ("Manga", "Web page 1400 · 991×1400 · 1:1.41", (991, 1400), "1:1.41",
+     "Mid-size screen-manga page at the B5 ratio."),
+    ("Manga", "Web page 1600 · 1133×1600 · 1:1.41", (1133, 1600), "1:1.41",
+     "Typical screen-manga page: about 1130 px wide, close to a 3× phone screen."),
+    ("Manga", "Web page 1800 · 1275×1800 · 1:1.41", (1275, 1800), "1:1.41",
+     "Larger screen-manga page with extra zoom headroom."),
+    ("Manga", "Web page 2000 · 1416×2000 · 1:1.41", (1416, 2000), "1:1.41",
+     "Higher-res web manga page with pinch-zoom headroom; far lighter than print."),
+
+    # ------------------------------------------------------------- webtoon
+    ("Webtoon", "Panel 690 · 690×1280 · 1:1.85", (690, 1280), "1:1.85",
+     "One vertical-scroll panel at the 690 px Lezhin width."),
+    ("Webtoon", "Panel 720 · 720×1280 · 9:16", (720, 1280), "9:16",
+     "One vertical-scroll panel at the 720 px 9:16 width."),
+    ("Webtoon", "Panel 800 · 800×1280 · 1:1.6", (800, 1280), "1:1.6",
+     "One vertical-scroll panel at the common 800 px webtoon width."),
+    ("Webtoon", "Panel 940 · 940×1280 · 1:1.36", (940, 1280), "1:1.36",
+     "One vertical-scroll panel at the 940 px Tapas width."),
+    ("Webtoon", "Strip 690 · 690×8000 · 1:11.6", (690, 8000), "1:11.6",
+     "Vertical-scroll chunk at 690 px width. Split longer episodes at 8192 px."),
+    ("Webtoon", "Strip 720 · 720×8000 · 1:11.1", (720, 8000), "1:11.1",
+     "Vertical-scroll chunk at 720 px width. Split longer episodes at 8192 px."),
+    ("Webtoon", "Strip 800 · 800×8000 · 1:10", (800, 8000), "1:10",
+     "Vertical-scroll chunk at 800 px width. Split longer episodes at 8192 px."),
+    ("Webtoon", "Strip 940 · 940×8000 · 1:8.51", (940, 8000), "1:8.51",
+     "Vertical-scroll chunk at 940 px width. Split longer episodes at 8192 px."),
+    ("Webtoon", "Strip 1080 · 1080×8000 · 1:7.41", (1080, 8000), "1:7.41",
+     "Vertical-scroll chunk at 1080 px width. Split longer episodes at 8192 px."),
+    ("Webtoon", "Strip 1600 · 1600×8000 · 1:5", (1600, 8000), "1:5",
+     "High-res vertical-scroll chunk at 1600 px width."),
+
+    # --------------------------------------------------------------- print
+    ("Print", "A6 portrait · 1:1.41 · 300 dpi", (1240, 1748), "1:1.41",
+     "A6 print at 300 dpi (105 × 148 mm). Postcard size; A5 folded in half."),
+    ("Print", "A5 portrait · 1:1.41 · 300 dpi", (1748, 2480), "1:1.41",
+     "A5 print at 300 dpi (148 × 210 mm). Half of A4; common for small manga."),
+    ("Print", "A5 landscape · 1:1.41 · 300 dpi", (2480, 1748), "1:1.41",
+     "A5 print at 300 dpi, landscape orientation (210 × 148 mm)."),
+    ("Print", "A4 portrait · 1:1.41 · 300 dpi", (2480, 3508), "1:1.41",
+     "A4 print at 300 dpi (210 × 297 mm). Larger than manga trim; common for "
+     "one-shots and submissions."),
+    ("Print", "A4 landscape · 1:1.41 · 300 dpi", (3508, 2480), "1:1.41",
+     "A4 print at 300 dpi, landscape orientation (297 × 210 mm)."),
+    ("Print", "B4 portrait · 1:1.41 · 300 dpi", (3035, 4299), "1:1.41",
+     "B4 print at 300 dpi (257 × 364 mm). Large magazine page."),
+    ("Print", "B4 landscape · 1:1.41 · 300 dpi", (4299, 3035), "1:1.41",
+     "B4 print at 300 dpi, landscape orientation (364 × 257 mm)."),
+    ("Print", "B3 portrait · 1:1.41 · 300 dpi", (4169, 5906), "1:1.41",
+     "B3 print at 300 dpi (353 × 500 mm). Large poster; 24.6 MP."),
+    ("Print", "B3 landscape · 1:1.41 · 300 dpi", (5906, 4169), "1:1.41",
+     "B3 print at 300 dpi, landscape orientation (500 × 353 mm)."),
+    ("Print", "A3 portrait · 1:1.41 · 300 dpi", (3508, 4961), "1:1.41",
+     "A3 print at 300 dpi (297 × 420 mm). Poster size; about 17 MP."),
+    ("Print", "A3 landscape · 1:1.41 · 300 dpi", (4961, 3508), "1:1.41",
+     "A3 print at 300 dpi, landscape orientation (420 × 297 mm)."),
+    ("Print", "A2 portrait · 1:1.41 · 300 dpi", (4961, 7016), "1:1.41",
+     "A2 print at 300 dpi (420 × 594 mm). Poster size; about 35 MP."),
+    ("Print", "A2 landscape · 1:1.41 · 300 dpi", (7016, 4961), "1:1.41",
+     "A2 print at 300 dpi, landscape orientation (594 × 420 mm)."),
+    ("Print", "Letter portrait · 1:1.29 · 300 dpi", (2550, 3300), "1:1.29",
+     "US Letter at 300 dpi (8.5 × 11 in). Use for US printing instead of A4."),
+    ("Print", "Letter landscape · 1:1.29 · 300 dpi", (3300, 2550), "1:1.29",
+     "US Letter at 300 dpi, landscape orientation (11 × 8.5 in)."),
+    ("Print", "Legal portrait · 1:1.65 · 300 dpi", (2550, 4200), "1:1.65",
+     "US Legal at 300 dpi (8.5 × 14 in). Taller than Letter."),
+    ("Print", "Legal landscape · 1:1.65 · 300 dpi", (4200, 2550), "1:1.65",
+     "US Legal at 300 dpi, landscape orientation (14 × 8.5 in)."),
+    ("Print", "Tabloid portrait · 1:1.55 · 300 dpi", (3300, 5100), "1:1.55",
+     "US Tabloid at 300 dpi (11 × 17 in). Newspaper/poster size; about 17 MP."),
+    ("Print", "Tabloid landscape · 1:1.55 · 300 dpi", (5100, 3300), "1:1.55",
+     "US Tabloid at 300 dpi, landscape orientation (17 × 11 in)."),
+    ("Print", "Executive · 1:1.45 · 300 dpi", (2175, 3150), "1:1.45",
+     "US Executive at 300 dpi (7.25 × 10.5 in)."),
+    ("Print", "Junior Legal · 1:1.6 · 300 dpi", (1500, 2400), "1:1.6",
+     "US Junior Legal at 300 dpi (5 × 8 in)."),
+    ("Print", "ANSI C portrait · 1:1.29 · 300 dpi", (5100, 6600), "1:1.29",
+     "ANSI C at 300 dpi (17 × 22 in). Large US drawing sheet; 33.7 MP."),
+    ("Print", "ANSI C landscape · 1:1.29 · 300 dpi", (6600, 5100), "1:1.29",
+     "ANSI C at 300 dpi, landscape orientation (22 × 17 in)."),
+    ("Print", "Business card · 1:1.75 · 300 dpi", (1050, 600), "1:1.75",
+     "US business card at 300 dpi (3.5 × 2 in), landscape."),
+
+    # --------------------------------------------------------------- comic
+    ("Comic", "US trim · 1:1.54 · 300 dpi", (1988, 3056), "1:1.54",
+     "Standard US comic-book trim at 300 dpi (6.625 × 10.187 in)."),
+    ("Comic", "Digest · 1:1.55 · 300 dpi", (1650, 2550), "1:1.55",
+     "Digest comic trim at 300 dpi (5.5 × 8.5 in); the same sheet as US "
+     "Half Letter."),
+    ("Comic", "Magazine · 1:1.31 · 300 dpi", (2400, 3150), "1:1.31",
+     "Comic magazine trim at 300 dpi (8 × 10.5 in)."),
 )
+
+_CANVAS_PRESET_TABLE = tuple(
+    CanvasPreset(f"{category} · {name}", size, ratio, note)
+    for category, name, size, ratio, note in _PRESET_ROWS
+)
+
+# Public ``(label, (w, h))`` list kept for callers that only need the sizes;
+# the dialog uses ``CANVAS_PRESET_DETAILS`` for the ratio and explanation.
+CANVAS_PRESETS = tuple((preset.label, preset.size) for preset in _CANVAS_PRESET_TABLE)
+CANVAS_PRESET_DETAILS = {preset.label: preset for preset in _CANVAS_PRESET_TABLE}
+# The categories are the label prefixes, in table order. The New Canvas dialog
+# filters the preset list by one of these (plus "All").
+CANVAS_PRESET_CATEGORIES = tuple(dict.fromkeys(
+    preset.label.split(" · ", 1)[0] for preset in _CANVAS_PRESET_TABLE
+))
+# The New Canvas dialog starts on "All" so every preset is reachable at once.
+DEFAULT_CANVAS_CATEGORY = "All"
+
+
+def preset_category(label):
+    """The category prefix of a preset label, or ``"Custom"`` for free sizes."""
+    return label.split(" · ", 1)[0] if label in CANVAS_PRESET_DETAILS else "Custom"
+
 
 # Background fill choices for a new canvas: ``label -> rgba``. ``None`` is the
 # Custom entry, whose color comes from the dialog's color picker.
@@ -510,9 +788,24 @@ def prompt_new_canvas(root, initial=(CANVAS_W, CANVAS_H), default_name="Canvas",
     default_label = next(
         (label for label, size in CANVAS_PRESETS if size == initial_size), None
     )
+    custom_initial = None
     if default_label is None:
-        default_label = f"{initial_size[0]} x {initial_size[1]}"
+        custom_initial = f"{initial_size[0]} x {initial_size[1]}"
+        default_label = custom_initial
         preset_map[default_label] = initial_size
+    default_category = DEFAULT_CANVAS_CATEGORY
+
+    def _preset_values(category):
+        """Preset labels in ``category`` (or all), plus the free-size entry."""
+        labels = [
+            preset.label for preset in _CANVAS_PRESET_TABLE
+            if category == "All"
+            or preset.label.split(" · ", 1)[0] == category
+        ]
+        if custom_initial is not None and category == "All":
+            labels.append(custom_initial)
+        labels.append("Custom")
+        return labels
 
     row = 0
 
@@ -525,27 +818,54 @@ def prompt_new_canvas(root, initial=(CANVAS_W, CANVAS_H), default_name="Canvas",
     name_entry.grid(row=row, column=1, sticky="we", pady=2)
     row += 1
 
+    # ------------------------------------------------------------- category
+    tk.Label(frame, text="Category", anchor="w").grid(
+        row=row, column=0, sticky="w", pady=2,
+    )
+    category_var = tk.StringVar(value=default_category)
+    category_combo = ttk.Combobox(
+        frame, textvariable=category_var, state="readonly", width=20,
+        values=("All",) + CANVAS_PRESET_CATEGORIES,
+    )
+    category_combo.grid(row=row, column=1, sticky="w", pady=2)
+    row += 1
+
     # --------------------------------------------------------------- preset
     tk.Label(frame, text="Preset", anchor="w").grid(
         row=row, column=0, sticky="w", pady=2,
     )
     preset_var = tk.StringVar(value=default_label)
     preset_combo = ttk.Combobox(
-        frame, textvariable=preset_var, state="readonly", width=26,
-        values=list(preset_map.keys()),
+        frame, textvariable=preset_var, state="readonly", width=48,
+        values=_preset_values(default_category),
     )
     preset_combo.grid(row=row, column=1, sticky="we", pady=2)
+    row += 1
+
+    preset_hint_var = tk.StringVar(value="")
+    preset_hint = tk.Label(
+        frame, textvariable=preset_hint_var, anchor="w", justify="left",
+        wraplength=470,
+    )
+    preset_hint.grid(row=row, column=0, columnspan=2, sticky="we", pady=(0, 4))
+    theme.register(preset_hint, fg="muted")
     row += 1
 
     # ----------------------------------------------------------------- size
     tk.Label(frame, text="Size", anchor="w").grid(
         row=row, column=0, sticky="w", pady=2,
     )
+    size_holder = tk.Frame(frame)
+    size_holder.grid(row=row, column=1, sticky="w", pady=2)
     size_input = SizeInput(
-        frame, initial_size[0], initial_size[1], field_width=8,
+        size_holder, initial_size[0], initial_size[1], field_width=8,
         on_change=lambda *_a: _on_size_change(),
     )
-    size_input.grid(row=row, column=1, sticky="w", pady=2)
+    size_input.pack(side=tk.LEFT)
+    ratio_var = tk.StringVar(value="")
+    ratio_label = tk.Label(size_holder, textvariable=ratio_var, anchor="w")
+    ratio_label.pack(side=tk.LEFT, padx=(10, 0))
+    theme.register(ratio_label, fg="muted")
     row += 1
 
     # ---------------------------------------------------------- orientation
@@ -651,19 +971,49 @@ def prompt_new_canvas(root, initial=(CANVAS_W, CANVAS_H), default_name="Canvas",
             return
         orient_var.set("landscape" if width > height else "portrait")
 
+    def _update_size_hint():
+        """Show the current size, ratio and what the selected preset is for."""
+        width, height = size_input.values()
+        if width is None or height is None or width < 1 or height < 1:
+            ratio_var.set("—")
+            preset_hint_var.set("Enter a custom width and height.")
+            return
+        detail = CANVAS_PRESET_DETAILS.get(preset_var.get())
+        if detail is not None and detail.size == (width, height):
+            ratio_var.set(detail.ratio)
+            preset_hint_var.set(
+                f"{width} × {height} px · {detail.ratio} · "
+                f"{megapixels_label(width, height)}\n{detail.note}"
+            )
+        else:
+            ratio_var.set(aspect_ratio_label(width, height))
+            preset_hint_var.set(
+                f"Custom size · {width} × {height} px · "
+                f"{aspect_ratio_label(width, height)} · "
+                f"{megapixels_label(width, height)}"
+            )
+
     def _on_size_change():
         if not syncing["size"]:
             preset_var.set("Custom")
         _refresh_orientation()
+        _update_size_hint()
+
+    def _on_category_change():
+        values = _preset_values(category_var.get())
+        preset_combo.configure(values=values)
+        if preset_var.get() not in values:
+            preset_var.set("Custom")
+        _update_size_hint()
 
     def _apply_preset():
         size = preset_map.get(preset_var.get())
-        if size is None:
-            return
-        syncing["size"] = True
-        size_input.set_values(*size)
-        syncing["size"] = False
-        error_var.set("")
+        if size is not None:
+            syncing["size"] = True
+            size_input.set_values(*size)
+            syncing["size"] = False
+            error_var.set("")
+        _update_size_hint()
 
     def _set_orientation():
         """Portrait/Landscape: swap the dimensions when the orientation differs."""
@@ -678,6 +1028,7 @@ def prompt_new_canvas(root, initial=(CANVAS_W, CANVAS_H), default_name="Canvas",
         size_input.set_values(width, height)
         syncing["size"] = False
         preset_var.set("Custom")
+        _update_size_hint()
 
     def _apply_swatch():
         try:
@@ -724,6 +1075,7 @@ def prompt_new_canvas(root, initial=(CANVAS_W, CANVAS_H), default_name="Canvas",
         syncing["size"] = False
         preset_var.set("Custom")
         error_var.set("")
+        _update_size_hint()
 
     def _current_fill():
         value = None
@@ -773,9 +1125,11 @@ def prompt_new_canvas(root, initial=(CANVAS_W, CANVAS_H), default_name="Canvas",
     )
 
     preset_combo.bind("<<ComboboxSelected>>", lambda _e: _apply_preset())
+    category_combo.bind("<<ComboboxSelected>>", lambda _e: _on_category_change())
     bg_combo.bind("<<ComboboxSelected>>", lambda _e: _update_swatch_visibility())
     _apply_swatch()
     _update_swatch_visibility()
+    _update_size_hint()
 
     dialog.bind("<Return>", on_ok)
     dialog.bind("<Escape>", on_cancel)

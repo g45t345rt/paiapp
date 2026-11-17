@@ -11,6 +11,7 @@ from tkinter import filedialog, font as tkfont, ttk
 import webbrowser
 
 from . import colormanagement, fonts, theme
+from .aspect import aspect_ratio_label
 from .scrollbar import ArrowScrollbar, AutoScrollbar
 
 
@@ -1067,8 +1068,16 @@ def ask_export(root, multiple_canvases=False, title="Export Images", action="Exp
     )
     page_menu.grid(row=0, column=1, sticky="w", pady=2)
 
+    page_info_var = tk.StringVar(value="")
+    page_info = tk.Label(
+        print_frame, textvariable=page_info_var, anchor="w",
+        justify="left", wraplength=_EXPORT_HINT_WRAP,
+    )
+    page_info.grid(row=1, column=0, columnspan=2, sticky="w", pady=(0, 4))
+    theme.register(page_info, fg="muted")
+
     custom_row = tk.Frame(print_frame)
-    custom_row.grid(row=1, column=0, columnspan=2, sticky="w", pady=2)
+    custom_row.grid(row=2, column=0, columnspan=2, sticky="w", pady=2)
     tk.Label(custom_row, text="Custom (mm):", anchor="w").pack(side=tk.LEFT)
     page_w_entry = tk.Entry(
         custom_row, textvariable=page_w_var, width=6, justify="right"
@@ -1081,25 +1090,25 @@ def ask_export(root, multiple_canvases=False, title="Export Images", action="Exp
     page_h_entry.pack(side=tk.LEFT, padx=(2, 0))
 
     tk.Label(print_frame, text="Bleed (mm):", anchor="w").grid(
-        row=2, column=0, sticky="w", padx=(0, 8), pady=2
+        row=3, column=0, sticky="w", padx=(0, 8), pady=2
     )
     tk.Entry(print_frame, textvariable=bleed_var, width=8).grid(
-        row=2, column=1, sticky="w", pady=2
+        row=3, column=1, sticky="w", pady=2
     )
     tk.Checkbutton(
         print_frame, text="Crop marks", variable=crop_var, anchor="w",
-    ).grid(row=3, column=0, sticky="w")
+    ).grid(row=4, column=0, sticky="w")
     cmyk_check = tk.Checkbutton(
         print_frame, text="CMYK (JPEG/TIFF)", variable=cmyk_var, anchor="w",
     )
-    cmyk_check.grid(row=3, column=1, sticky="w")
+    cmyk_check.grid(row=4, column=1, sticky="w")
     print_hint = tk.Label(
         print_frame,
         text="A page sizes the output at the DPI above (300 when blank); the "
              "Scale/Size fields are then ignored.",
         anchor="w", justify="left", wraplength=_EXPORT_HINT_WRAP,
     )
-    print_hint.grid(row=4, column=0, columnspan=2, sticky="w", pady=(2, 0))
+    print_hint.grid(row=5, column=0, columnspan=2, sticky="w", pady=(2, 0))
     theme.register(print_hint, fg="muted")
 
     # ---- Footer ---------------------------------------------------------
@@ -1219,6 +1228,40 @@ def ask_export(root, multiple_canvases=False, title="Export Images", action="Exp
 
     bg_button.config(command=choose_bg)
     apply_bg()
+
+    def _page_mm():
+        """The selected page in millimetres, or ``None`` for no/custom invalid."""
+        page = _EXPORT_PAGE_BY_LABEL.get(page_var.get(), "none")
+        if page == "custom":
+            try:
+                return (max(10.0, float(page_w_var.get())),
+                        max(10.0, float(page_h_var.get())))
+            except ValueError:
+                return None
+        return _EXPORT_PAGE_MM.get(page)
+
+    def update_page_info(*_args):
+        """Show the page ratio and the pixel size it exports at."""
+        page_mm = _page_mm()
+        page = _EXPORT_PAGE_BY_LABEL.get(page_var.get(), "none")
+        if page_mm is None:
+            page_info_var.set(
+                "Enter a custom page width and height." if page == "custom"
+                else "No page: the export uses the Scale/Size fields."
+            )
+            return
+        try:
+            dpi = max(1, int(round(float(dpi_var.get() or 300))))
+        except ValueError:
+            dpi = 300
+        width_mm, height_mm = page_mm
+        width_px = max(1, int(round(width_mm * dpi / 25.4)))
+        height_px = max(1, int(round(height_mm * dpi / 25.4)))
+        page_info_var.set(
+            f"{width_mm:g} × {height_mm:g} mm · "
+            f"{aspect_ratio_label(width_mm, height_mm)} · "
+            f"{width_px} × {height_px} px at {dpi} dpi"
+        )
 
     def sync(*_args):
         if syncing["on"]:
@@ -1377,9 +1420,12 @@ def ask_export(root, multiple_canvases=False, title="Export Images", action="Exp
     scale_var.trace_add("write", refresh_size)
     width_var.trace_add("write", on_width)
     height_var.trace_add("write", on_height)
+    for variable in (page_var, page_w_var, page_h_var, dpi_var):
+        variable.trace_add("write", update_page_info)
 
     refresh_size()
     sync()
+    update_page_info()
 
     window.bind("<Return>", on_ok)
     _run(root, window, window.destroy, focus=format_menu)

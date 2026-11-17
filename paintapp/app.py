@@ -32,6 +32,7 @@ from .canvasarea import (
     CanvasArea, DEFAULT_GRID_SIZE, DEFAULT_OFFCANVAS_BG,
     CANVAS_ANCHOR_FRACTIONS, prompt_new_canvas, prompt_resize_canvas,
 )
+from .aspect import aspect_ratio_label
 from .assets import AssetsPanel
 from .brushes import BrushLibraryPanel
 from .colorpicker import ColorPicker
@@ -8788,7 +8789,8 @@ class PaintApp:
     def _canvas_size_text(self):
         if self.current is None:
             return "-- x --"
-        return f"{self.current.width} x {self.current.height}"
+        width, height = self.current.width, self.current.height
+        return f"{width} x {height} · {aspect_ratio_label(width, height)}"
 
     def _update_title(self):
         name = os.path.basename(self.project_path) if self.project_path else "Untitled"

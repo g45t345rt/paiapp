@@ -8,6 +8,7 @@ from tkinter import font as tkfont, ttk
 from engine import paths as engine_paths
 
 from . import dialogs, theme
+from .aspect import aspect_ratio_label
 from .constants import MAX_CANVAS_SIZE
 from .scrollbar import AutoScrollbar
 from .sizeinput import SizeInput
@@ -356,6 +357,15 @@ class GenerationPanel(tk.Frame):
             size_field, text="Canvas", command=self._set_canvas_size
         )
         self.use_canvas_btn.pack(side=tk.LEFT, padx=(6, 0))
+        self.size_ratio_var = tk.StringVar(value="")
+        self.size_ratio_label = tk.Label(
+            size_field, textvariable=self.size_ratio_var, anchor="w",
+        )
+        self.size_ratio_label.pack(side=tk.LEFT, padx=(8, 0))
+        theme.register(self.size_ratio_label, fg="muted")
+        self.size.width_var.trace_add("write", self._update_size_ratio)
+        self.size.height_var.trace_add("write", self._update_size_ratio)
+        self._update_size_ratio()
 
         self.cfg_var = tk.DoubleVar(value=1.0)
         self.cfg_spin = tk.Spinbox(
@@ -1283,6 +1293,14 @@ class GenerationPanel(tk.Frame):
             return
         width, height = self._get_canvas_size()
         self.size.set_values(int(width), int(height))
+
+    def _update_size_ratio(self, *_args):
+        """Keep the compact aspect-ratio label in step with the size fields."""
+        width, height = self.size.values()
+        if width is None or height is None or width < 1 or height < 1:
+            self.size_ratio_var.set("—")
+            return
+        self.size_ratio_var.set(aspect_ratio_label(width, height))
 
     def _on_size_change(self, *_):
         """Drop a selected recipe name once the size no longer matches it.

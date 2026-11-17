@@ -31,6 +31,7 @@ from tkinter import ttk
 from engine import tuning as engine_tuning
 
 from . import brushes, dialogs, theme
+from .aspect import aspect_ratio_label
 from .canvasarea import DEFAULT_GRID_SIZE, DEFAULT_OFFCANVAS_BG
 from .constants import CANVAS_W, CANVAS_H, MAX_BRUSH_SIZE, MAX_CANVAS_SIZE
 from .scrollbar import AutoScrollbar
@@ -395,6 +396,29 @@ class AppSettingsDialog:
             textvariable=self.height_var,
         ).grid(row=row, column=1, sticky="w", padx=(6, 0), pady=2)
         row += 1
+
+        tk.Label(inner, text="Aspect ratio", anchor="w").grid(
+            row=row, column=0, sticky="w", pady=2,
+        )
+        self.canvas_ratio_var = tk.StringVar(value="")
+        tk.Label(
+            inner, textvariable=self.canvas_ratio_var, anchor="w",
+            fg=theme.color("muted"),
+        ).grid(row=row, column=1, sticky="w", padx=(6, 0), pady=2)
+        row += 1
+
+        def update_canvas_ratio(*_args):
+            try:
+                width = int(float(self.width_var.get()))
+                height = int(float(self.height_var.get()))
+            except ValueError:
+                self.canvas_ratio_var.set("—")
+                return
+            self.canvas_ratio_var.set(aspect_ratio_label(width, height))
+
+        self.width_var.trace_add("write", update_canvas_ratio)
+        self.height_var.trace_add("write", update_canvas_ratio)
+        update_canvas_ratio()
 
         row = self._section(inner, "Tools", row)
         tk.Label(inner, text="Default brush size", anchor="w").grid(
