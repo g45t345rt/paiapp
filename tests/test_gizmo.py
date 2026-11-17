@@ -429,6 +429,32 @@ def test_interpolation_selects_the_kernel():
     check("bilinear still commits a scaled buffer", layer.image.size, (480, 360))
 
 
+def test_shrink_averages_fine_detail():
+    # A fixed-size kernel skips source pixels when shrinking, so a one-pixel
+    # checkerboard aliases instead of averaging to grey. The commit must run the
+    # scale-adaptive prefilter (see ``antialias.affine_resample``).
+    width, height = 200, 160
+    pixels = np.zeros((height, width, 4), dtype=np.uint8)
+    pixels[..., 3] = 255
+    pixels[::2, ::2, :3] = 255
+    pixels[1::2, 1::2, :3] = 255
+    layer = Layer("checker", (width, height))
+    layer.set_image(Image.fromarray(pixels))
+    instance = gizmo.TransformGizmo()
+    check("shrink session starts",
+          instance.begin(FakeApp(layer, layer.size), None), True)
+    instance.start("se", float(width), float(height))
+    instance.update(width * 0.5, height * 0.5)
+    instance.finish()
+    alpha = np.asarray(layer.image)[:, :, 3]
+    ys, xs = np.where(alpha > 8)
+    interior = np.asarray(layer.image)[
+        ys.min() + 10:ys.max() - 10, xs.min() + 10:xs.max() - 10, 0]
+    check("a 2x shrink averages the checkerboard",
+          (round(float(interior.std())), 126 < float(interior.mean()) < 129),
+          (0, True))
+
+
 def test_selection_gizmo_touches_no_pixels():
     from paintapp import selection
     mask = Image.new("L", (40, 30), 0)

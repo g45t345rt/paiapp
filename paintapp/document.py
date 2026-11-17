@@ -7,7 +7,7 @@ import uuid
 
 from PIL import Image, ImageChops, ImageDraw
 
-from . import brush, filters, gradient, path, poses, textrender, vector
+from . import antialias, brush, filters, gradient, path, poses, textrender, vector
 from .history import History
 
 # Largest content area (in pixels) for which the below/above backdrop cache is
@@ -315,8 +315,8 @@ def _paste_preview(base, layer, preview, left, top, clip, scale, ax, ay):
     inverse = _affine_invert(_affine_mul(_affine_translate(-l, -t), to_base))
     data = (inverse[0], inverse[2], inverse[4],
             inverse[1], inverse[3], inverse[5])
-    sub = image.transform((r - l, b - t), Image.AFFINE, data,
-                          resample=Image.BILINEAR)
+    sub = antialias.affine_resample(
+        image, (r - l, b - t), data, resample=Image.BICUBIC)
     _composite_sub(base, layer, sub, (l, t), clip)
 
 
@@ -1252,9 +1252,8 @@ class Layer:
                     inverse[0], inverse[2], inverse[4],
                     inverse[1], inverse[3], inverse[5],
                 )
-                part = sub.transform(
-                    (sr - sl, sb - st), Image.AFFINE, data, resample=resample
-                )
+                part = antialias.affine_resample(
+                    sub, (sr - sl, sb - st), data, resample)
                 result.paste(part, (sl, st))
             self._transform_cache = result
             self._transform_key = key
@@ -1271,7 +1270,7 @@ class Layer:
             inverse[0], inverse[2], inverse[4],
             inverse[1], inverse[3], inverse[5],
         )
-        result = base.transform(size, Image.AFFINE, data, resample=resample)
+        result = antialias.affine_resample(base, size, data, resample)
         self._transform_cache = result
         self._transform_key = key
         return result

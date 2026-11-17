@@ -21,8 +21,7 @@ That re-sample is the whole cost of a drag, and it grows with the buffer the
 dragged content is rendered into - hundreds of milliseconds per event on a large
 layer, growing as the frame does, which is what made the tool lag. So the drag
 resamples through the GPU (:data:`_AFFINE_FRAGMENT`) and *that* result is the
-transformed layer: nothing is re-done on release, so the drag stays interactive
-and what you see is what is committed.
+transformed layer while the drag is live, so the tool stays interactive.
 
 The shader is Catmull-Rom bicubic with Pillow's ``BICUBIC`` kernel and Pillow's
 pixel-centre mapping, minified through a mip chain. On smooth content it lands
@@ -31,6 +30,12 @@ couple of counts either way, since Pillow accumulates its weights in 22-bit
 fixed point and widens its filter when scaling down where the shader reads a mip
 level. A machine with no GL context falls back to the Pillow resample of old
 (see :meth:`TransformGizmo._apply_pixels`).
+
+A mip-averaged fixed kernel is still a crude filter when *shrinking*, so a
+shrink's release lands one exact pass through :func:`antialias.affine_resample`
+(a scale-adaptive prefilter, the way an image editor's NoHalo downscale works);
+the live frames before it stay on the cheap shader path. See
+:meth:`TransformGizmo.finish`.
 """
 
 import math
@@ -38,6 +43,7 @@ import math
 import numpy as np
 from PIL import Image
 
+from . import antialias
 from . import gpuimage
 from . import path
 from . import poses
@@ -867,9 +873,11 @@ class TransformGizmo:
         # have produced.
         if self._handle == "move" and self.active and not self._is_link:
             self._bake_move()
-        elif self.active and (self._pending_apply or self._draft_used):
-            # A throttled drag skipped its last resample, or painted a draft
-            # (non-antialiased overlays): land the exact, full-quality frame.
+        elif self.active and (
+                self._pending_apply or self._draft_used or self._shrinking()):
+            # A throttled drag skipped its last resample, painted a draft, or
+            # shrank the content (whose live frames use the fast fixed-kernel
+            # GPU path): land the exact, scale-adaptive frame.
             self._apply_pixels(draft=False)
         self._end_drag()
 
@@ -933,8 +941,8 @@ class TransformGizmo:
                     # A pure move keeps the same buffer frame: nothing to redo.
                     return
                 self._link_mask_frame = frame_key
-                self.layer.mask = self._link_mask.transform(
-                    self.layer.size, Image.AFFINE,
+                self.layer.mask = antialias.affine_resample(
+                    self._link_mask, self.layer.size,
                     (frame[0], frame[2], frame[4], frame[1], frame[3], frame[5]),
                     resample=RESAMPLE.get(self.interpolation, Image.BICUBIC),
                 )
@@ -983,25 +991,37 @@ class TransformGizmo:
         resample = RESAMPLE.get(self.interpolation, Image.BICUBIC)
         # The GPU shader is bicubic only; any other kernel keeps the Pillow path.
         textures = self._gpu_textures() if resample == Image.BICUBIC else None
+        # A shrink with a fixed-size kernel skips source pixels, so the exact
+        # (release) frame goes through the scale-adaptive CPU resample instead
+        # of the shader's mip approximation (see ``antialias.affine_resample``).
+        # The live drag keeps the GPU frame, which is what keeps it interactive.
+        exact = not draft and self._shrinking()
         result = None
-        if textures is not None:
+        if textures is not None and not exact:
             result = self._resample_gpu(textures[0], self.source, size, data)
         if result is None:
-            result = self.source.transform(
-                size, Image.AFFINE, data, resample=resample
-            )
+            result = antialias.affine_resample(
+                self.source, size, data, resample)
         self.layer.set_image(result)
         if self.source_mask is not None:
             mask = None
-            if textures is not None:
+            if textures is not None and not exact:
                 mask = self._resample_gpu(
                     textures[1], self.source_mask, size, data)
             if mask is None:
-                mask = self.source_mask.transform(
-                    size, Image.AFFINE, data, resample=resample
-                )
+                mask = antialias.affine_resample(
+                    self.source_mask, size, data, resample)
             self.layer.mask = mask
         self.layer.offset = (left, top)
+
+    def _shrinking(self):
+        """Whether :attr:`matrix` reduces the content on either axis.
+
+        Rotations and moves keep both axis lengths at 1; any shorter one means
+        a fixed-size resample kernel would skip source pixels.
+        """
+        a, b, c, d, _e, _f = self.matrix
+        return min(math.hypot(a, b), math.hypot(c, d)) < 1.0 - 1e-6
 
 
 class SelectionGizmo(TransformGizmo):
