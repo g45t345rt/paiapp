@@ -462,6 +462,33 @@ def test_verify_rejects_bad_checksum():
     check("verification catches a bad checksum", raised, True)
 
 
+def test_unchanged_layers_reuse_encoded_png():
+    """A second save skips PNG encoding for layers whose content token is unchanged."""
+    layer = fake_layer("A", (1, 2, 3, 255))
+    layer.pixels_token = ("cache-test", object())
+    app = fake_app([layer])
+    real_encode = project._encode_png
+    calls = []
+
+    def counting_encode(image):
+        calls.append(image)
+        return real_encode(image)
+
+    project._encode_png = counting_encode
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "sample.pai")
+            project.save(app, path)
+            check("first save encodes the layer", len(calls), 1)
+            project.save(app, path)
+            check("unchanged save reuses the encoded PNG", len(calls), 1)
+            layer.pixels_token = ("cache-test", "changed")
+            project.save(app, path)
+            check("edited layer is encoded again", len(calls), 2)
+    finally:
+        project._encode_png = real_encode
+
+
 def main():
     for name, fn in sorted(globals().items()):
         if name.startswith("test_") and callable(fn):

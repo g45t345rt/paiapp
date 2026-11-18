@@ -9226,8 +9226,9 @@ class PaintApp:
         """Queue a project save on the project worker.
 
         The snapshot is taken here, on the Tk thread (it reads the tkinter
-        variables and copies the layer images); ``project.write`` then encodes
-        it off-thread, with the queue driving the status-bar progress.
+        variables and detaches the changed layer images, reusing cached PNGs
+        for unchanged ones); ``project.write`` then encodes it off-thread, with
+        the queue driving the status-bar progress.
         """
         name = os.path.basename(path)
         payload = project.snapshot(self)

@@ -34,7 +34,9 @@ import json
 import math
 import os
 import shutil
+import threading
 import zipfile
+from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
 
 from PIL import Image
@@ -87,6 +89,75 @@ def _encode_png(image):
     buf = io.BytesIO()
     image.save(buf, format="PNG")
     return buf.getvalue()
+
+
+# Layers are usually unchanged between saves, and PNG encoding is by far the
+# most expensive part of a save. Keep the encoded bytes of recently saved
+# layers, keyed by their content token, so the next save can reuse them instead
+# of re-encoding (and re-copying) every layer. The cache is bounded and lives
+# for the process, so a project with thousands of layers cannot grow it without
+# limit. Tokens are process-unique, so a hit always describes the same pixels.
+_ENCODE_CACHE_BYTES = 512 * 1024 * 1024
+_encode_cache = OrderedDict()
+_encode_cache_size = 0
+_encode_cache_lock = threading.Lock()
+
+
+def _cache_key(layer, kind):
+    """A key for ``layer``'s cached PNG, or ``None`` when it cannot be cached.
+
+    ``pixels_token`` changes whenever the layer's visible content does, and is
+    the same value the layer panel's preview cache relies on. ``kind`` keeps a
+    layer's image and its mask from sharing an entry.
+    """
+    try:
+        token = getattr(layer, "pixels_token", None)
+    except Exception:
+        return None
+    return None if token is None else (kind, token)
+
+
+def _cache_get(key):
+    if key is None:
+        return None
+    with _encode_cache_lock:
+        data = _encode_cache.get(key)
+        if data is not None:
+            _encode_cache.move_to_end(key)
+        return data
+
+
+def _cache_put(key, data):
+    global _encode_cache_size
+    if key is None:
+        return
+    size = len(data)
+    if size > _ENCODE_CACHE_BYTES:
+        return
+    with _encode_cache_lock:
+        old = _encode_cache.pop(key, None)
+        if old is not None:
+            _encode_cache_size -= len(old)
+        _encode_cache[key] = data
+        _encode_cache_size += size
+        while _encode_cache_size > _ENCODE_CACHE_BYTES and _encode_cache:
+            _, evicted = _encode_cache.popitem(last=False)
+            _encode_cache_size -= len(evicted)
+
+
+def _snapshot_image(layer, kind, build):
+    """Return ``(saved_image, cache_key)`` for one layer image.
+
+    On a cache hit the already-encoded bytes are returned and ``build`` is never
+    called, which skips both the pixel copy and the later PNG encoding. On a
+    miss the image is detached with ``build().copy()`` and its key is handed to
+    :func:`write` so it can fill the cache after encoding.
+    """
+    key = _cache_key(layer, kind)
+    cached = _cache_get(key)
+    if cached is not None:
+        return cached, None
+    return build().copy(), key
 
 
 def _decode_png(data, mode):
@@ -287,11 +358,13 @@ def _migrate_generation_state(state):
 
 
 def snapshot(app):
-    """Collect a manifest and detached copies of every layer/mask image.
+    """Collect a manifest and the data for every layer/mask image.
 
     Runs on the Tk thread, because it reads the app's tkinter variables (the
-    generation state) and copies each layer image. The returned payload holds
-    plain data and standalone :class:`~PIL.Image.Image` objects, so
+    generation state) and detaches each layer image. A layer whose content is
+    unchanged since the last save is represented by its cached PNG bytes (see
+    :func:`_snapshot_image`); every other image is copied. The returned payload
+    holds plain data and standalone :class:`~PIL.Image.Image` objects, so
     :func:`write` can encode it on a worker thread without touching widgets.
     """
     manifest = {
@@ -321,6 +394,7 @@ def snapshot(app):
     }
 
     images = {}
+    cache_keys = {}
     library = _app_library(app)
     manifest["asset_counter"] = int(library.asset_counter)
     manifest["asset_group_counter"] = int(getattr(library, "group_counter", 0))
@@ -395,18 +469,27 @@ def snapshot(app):
             # own per-instance mask is stored beside it (below), so it is left
             # out here rather than baked into the pixels twice.
             if getattr(layer, "is_link", False):
-                images[filename] = layer.composited_image(
-                    include_link_mask=False
-                ).copy()
+                images[filename], key = _snapshot_image(
+                    layer, "layer",
+                    lambda: layer.composited_image(include_link_mask=False),
+                )
             else:
-                images[filename] = layer.image.copy()
+                images[filename], key = _snapshot_image(
+                    layer, "layer", lambda: layer.image
+                )
+            if key is not None:
+                cache_keys[filename] = key
             mask_file = None
             if layer.mask is not None:
                 mask_file = (
                     f"canvases/{canvas_index:04d}/layers/"
                     f"{layer_index:04d}_{_safe_name(layer.name)}_mask.png"
                 )
-                images[mask_file] = layer.mask.copy()
+                images[mask_file], key = _snapshot_image(
+                    layer, "mask", lambda: layer.mask
+                )
+                if key is not None:
+                    cache_keys[mask_file] = key
             entry["layers"].append({
                 "name": layer.name,
                 "visible": bool(layer.visible),
@@ -485,7 +568,7 @@ def snapshot(app):
                 ),
             })
         manifest["canvases"].append(entry)
-    return {"manifest": manifest, "images": images}
+    return {"manifest": manifest, "images": images, "cache_keys": cache_keys}
 
 
 def _app_library(app):
@@ -559,16 +642,20 @@ def _replace_durably(source, destination):
     _sync_directory(destination)
 
 
-def _verify_archive(path, members):
+def _verify_archive(path, members, verify_checksums=True):
     """Reopen a freshly written archive and check it before using it.
 
     ``members`` are the files the manifest refers to; every one must be present
-    or the archive would fail to load.
+    or the archive would fail to load. ``verify_checksums`` also reads every
+    member back and checks its CRC, which is thorough but re-reads the whole
+    archive; the save path skips it because :func:`_flush_file` has already
+    forced the data to disk and the central directory is still validated here.
     """
     with zipfile.ZipFile(path) as archive:
-        broken = archive.testzip()
-        if broken is not None:
-            raise OSError(f"archive member {broken!r} failed its checksum")
+        if verify_checksums:
+            broken = archive.testzip()
+            if broken is not None:
+                raise OSError(f"archive member {broken!r} failed its checksum")
         names = set(archive.namelist())
         if MANIFEST not in names:
             raise OSError("archive is missing its project manifest")
@@ -592,6 +679,10 @@ def _backup_project(path):
 
     The newest backup is always ``path + ".bak"``; older generations move up a
     suffix so a corrupt intermediate save cannot overwrite the last good copy.
+    The newest backup is a hard link to the current file when the filesystem
+    supports it, so rotating a multi-gigabyte project costs no data copy; the
+    old contents stay reachable through the link after the save replaces
+    ``path``. Filesystems without hard links fall back to copying.
     """
     if not os.path.exists(path):
         return None
@@ -601,8 +692,17 @@ def _backup_project(path):
         if os.path.exists(newer):
             os.replace(newer, older)
     backup = path + ".bak"
-    shutil.copyfile(path, backup)
-    _flush_file(backup)
+    try:
+        # os.link needs the destination to be absent; replace the previous
+        # backup first. The data is already durable, so no flush is needed.
+        if os.path.exists(backup):
+            os.remove(backup)
+        os.link(path, backup)
+    except OSError:
+        # FAT/exFAT, network shares and some Windows configurations reject
+        # hard links; keep the old copy-based behaviour there.
+        shutil.copyfile(path, backup)
+        _flush_file(backup)
     return backup
 
 
@@ -620,10 +720,20 @@ def write(payload, path, progress=None, cancel=None):
     """
     manifest = payload["manifest"]
     images = payload["images"]
+    cache_keys = payload.get("cache_keys") or {}
     total = len(images)
     done = 0
     if progress is not None:
         progress(0.0)
+
+    def encode(name, data):
+        # ``snapshot`` hands over the already-encoded bytes for unchanged
+        # layers, so only changed ones reach the encoder here.
+        if isinstance(data, (bytes, bytearray)):
+            return data
+        png = _encode_png(data)
+        _cache_put(cache_keys.get(name), png)
+        return png
 
     tmp = path + ".tmp"
     try:
@@ -658,11 +768,12 @@ def write(payload, path, progress=None, cancel=None):
                 if progress is not None:
                     progress(done / total if total else 1.0)
 
-            _run_parallel(
-                lambda _name, image: _encode_png(image), jobs, store, cancel
-            )
+            _run_parallel(encode, jobs, store, cancel)
         _flush_file(tmp)
-        _verify_archive(tmp, members)
+        # The data was just flushed, so re-reading every member to check its
+        # CRC only doubles the save's I/O. The central directory and member
+        # names are still validated, which catches a truncated archive.
+        _verify_archive(tmp, members, verify_checksums=False)
         _backup_project(path)
         _replace_durably(tmp, path)
     except BaseException:
