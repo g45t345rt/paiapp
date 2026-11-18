@@ -896,6 +896,110 @@ def _lens_blur(image, params):
     return _rejoin(ImageChops.screen(blurred, bloom), alpha)
 
 
+def _focus_distance(dx, dy, shape):
+    """Signed-ish distance from the focus centre for a focus-blur shape."""
+    if shape == "square":
+        return np.maximum(np.abs(dx), np.abs(dy))
+    if shape == "diamond":
+        return np.abs(dx) + np.abs(dy)
+    if shape == "horizontal":
+        return np.hypot(dx * 0.5, dy)
+    if shape == "vertical":
+        return np.hypot(dx, dy * 0.5)
+    return np.hypot(dx, dy)
+
+
+def _focus_mask(size, params):
+    """A 0 (sharp) to 1 (fully blurred) mask mirroring GIMP's focus geometry.
+
+    ``focus radius`` and ``sharpness`` are percentages of the image's shorter
+    side, ``midpoint`` warps the transition so the 50% blur point can be moved,
+    and ``aspect``/``rotation`` shape the focus region. Beyond the outer focus
+    radius the weight stays at 1, so the rest of the image is fully blurred.
+    """
+    width, height = size
+    arr = np.zeros((height, width), dtype=np.float32)
+    outer = float(params.get("focus_radius", 40)) / 100.0 * min(width, height)
+    if outer <= 0.0:
+        arr.fill(1.0)
+        return arr
+    inner = float(params.get("sharpness", 15)) / 100.0 * min(width, height)
+    inner = max(0.0, min(inner, outer))
+    midpoint = max(0.001, min(0.999, float(params.get("midpoint", 50)) / 100.0))
+    cx = float(params.get("center_x", 50)) / 100.0 * (width - 1)
+    cy = float(params.get("center_y", 50)) / 100.0 * (height - 1)
+    ys, xs = np.mgrid[0:height, 0:width].astype(np.float32)
+    dx = xs - cx
+    dy = ys - cy
+    angle = math.radians(float(params.get("rotation", 0)))
+    if angle:
+        cos, sin = math.cos(angle), math.sin(angle)
+        dx, dy = dx * cos + dy * sin, -dx * sin + dy * cos
+    aspect = max(0.05, float(params.get("aspect", 1.0)))
+    if aspect != 1.0:
+        dx = dx / aspect
+    distance = _focus_distance(dx, dy, str(params.get("shape", "circle")))
+    span = max(1e-6, outer - inner)
+    t = np.clip((distance - inner) / span, 0.0, 1.0)
+    u = np.where(t < midpoint, 0.5 * t / midpoint,
+                 1.0 - 0.5 * (1.0 - t) / (1.0 - midpoint))
+    return (u * u * (3.0 - 2.0 * u)).astype(np.float32)
+
+
+def _focus_gaussian(image, radius, quality):
+    """Gaussian blur that, at high quality, works on premultiplied alpha."""
+    if not quality or image.mode != "RGBA":
+        return image.filter(ImageFilter.GaussianBlur(radius))
+    arr = np.asarray(image).astype(np.float32)
+    alpha = arr[..., 3:4] / 255.0
+    prem = Image.fromarray(
+        np.clip(arr[..., :3] * alpha, 0, 255).astype(np.uint8), "RGB")
+    blurred = np.asarray(
+        prem.filter(ImageFilter.GaussianBlur(radius)), dtype=np.float32)
+    alpha_blur = np.asarray(
+        image.getchannel("A").filter(ImageFilter.GaussianBlur(radius)),
+        dtype=np.float32)
+    scale = np.maximum(alpha_blur / 255.0, 1e-6)[..., None]
+    rgb = np.clip(blurred / scale, 0, 255).astype(np.uint8)
+    out = np.dstack([rgb, np.clip(alpha_blur, 0, 255).astype(np.uint8)])
+    return Image.fromarray(out, "RGBA")
+
+
+def _focus_lens(image, radius, factor, threshold):
+    """Gaussian defocus plus a thresholded highlight bloom like ``_lens_blur``."""
+    rgb, alpha = _rgb_parts(image)
+    blurred = rgb.filter(ImageFilter.GaussianBlur(radius))
+    highlights = rgb.point(lambda v: 255 if v > threshold else 0)
+    bloom = highlights.filter(ImageFilter.GaussianBlur(radius * 1.5))
+    bloom = bloom.point(lambda v: int(v * factor))
+    out = ImageChops.screen(blurred, bloom)
+    if alpha is not None:
+        alpha = alpha.filter(ImageFilter.GaussianBlur(radius))
+        out = _rejoin(out, alpha)
+    return out
+
+
+def _focus_blur(image, params):
+    """Blur outside an in-focus region, following GIMP's Focus Blur filter."""
+    radius = max(0.0, float(params.get("radius", 8.0)))
+    if radius <= 0.0:
+        return image
+    if str(params.get("blur_type", "gaussian")) == "lens":
+        blurred = _focus_lens(
+            image,
+            radius,
+            _clamp01(float(params.get("highlight_factor", 100)) / 100.0),
+            max(0, min(255, int(params.get("highlight_threshold", 170)))),
+        )
+    else:
+        blurred = _focus_gaussian(image, radius, bool(params.get("quality", 1)))
+    mask = _focus_mask(image.size, params)[..., None]
+    base = np.asarray(image, dtype=np.float32)
+    soft = np.asarray(blurred.convert(image.mode), dtype=np.float32)
+    out = base * (1.0 - mask) + soft * mask
+    return Image.fromarray(np.clip(out, 0, 255).astype(np.uint8), image.mode)
+
+
 def _glow(image, params):
     """Screen a blurred, thresholded highlight layer in ``color``."""
     strength = max(0.0, min(1.0, params["strength"] / 100.0))
@@ -1600,6 +1704,36 @@ _register(
         _p("bloom", "Bloom", 0, 100, 60, 1, "int"),
     ],
     _lens_blur, lambda p: f"Lens Blur {p['radius']:g}px",
+)
+_register(
+    "focus_blur", "blur", "Focus Blur",
+    [
+        _choice(
+            "shape", "Shape",
+            [("circle", "Circle"), ("square", "Square"), ("diamond", "Diamond"),
+             ("horizontal", "Horizontal"), ("vertical", "Vertical")],
+            "circle",
+        ),
+        _choice(
+            "blur_type", "Blur type",
+            [("gaussian", "Gaussian Blur"), ("lens", "Lens Blur")],
+            "gaussian",
+        ),
+        _p("radius", "Blur radius", 0.0, 200.0, 8.0, 0.5),
+        _p("quality", "High quality", 0, 1, 1, 1, "bool"),
+        _p("highlight_factor", "Highlight factor", 0, 200, 100, 1, "int"),
+        _p("highlight_threshold", "Highlight threshold", 0, 255, 170, 1, "int"),
+        _p("center_x", "Center X %", 0, 100, 50, 1, "int"),
+        _p("center_y", "Center Y %", 0, 100, 50, 1, "int"),
+        _p("focus_radius", "Focus radius %", 0, 100, 40, 1, "int"),
+        _p("sharpness", "Sharpness %", 0, 100, 20, 1, "int"),
+        _p("midpoint", "Midpoint %", 0, 100, 50, 1, "int"),
+        _p("aspect", "Aspect ratio", 0.1, 10.0, 1.0, 0.05),
+        _p("rotation", "Rotation", 0, 360, 0, 1, "int"),
+    ],
+    _focus_blur,
+    lambda p: (f"Focus Blur {p['radius']:g}px "
+               f"({'Lens' if p.get('blur_type') == 'lens' else 'Gaussian'})"),
 )
 
 _register(

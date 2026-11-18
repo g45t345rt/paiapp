@@ -224,6 +224,53 @@ def test_lens_and_motion_blur():
     check("motion keeps alpha", int(uniform[0, 0, 3]), 200)
 
 
+def test_focus_blur():
+    source = Image.new("RGBA", (60, 60), (0, 0, 0, 200))
+    for x in range(60):
+        for y in range(60):
+            source.putpixel((x, y), (x * 4 % 256, y * 4 % 256, 128, 200))
+
+    params = defaults("focus_blur")
+    check("focus shape default", params["shape"], "circle")
+    check("focus blur type default", params["blur_type"], "gaussian")
+    check("focus radius default", params["radius"], 8.0)
+    check("focus region default", params["focus_radius"], 40)
+    check("focus sharpness default", params["sharpness"], 20)
+    check("focus midpoint default", params["midpoint"], 50)
+    check("focus aspect default", params["aspect"], 1.0)
+
+    spec = filters.new_spec("focus_blur")
+    out = apply(spec, source)
+    original = np.asarray(source, dtype=np.int16)
+    check("focus keeps centre sharp",
+          np.array_equal(out[30, 30], original[30, 30]), True)
+    check("focus blurs the corners",
+          np.array_equal(out[0, 0, :3], original[0, 0, :3]), False)
+    check("focus keeps alpha", int(out[0, 0, 3]), 200)
+
+    spec["params"]["radius"] = 0.0
+    check("focus zero radius is a no-op", np.array_equal(
+        apply(spec, source), np.asarray(source, dtype=np.int16)), True)
+
+    spec = filters.new_spec("focus_blur")
+    gaussian = apply(spec, source)
+    spec["params"]["blur_type"] = "lens"
+    check("focus blur type matters",
+          np.array_equal(gaussian, apply(spec, source)), False)
+
+    spec = filters.new_spec("focus_blur")
+    spec["params"]["shape"] = "square"
+    check("focus shape matters",
+          np.array_equal(gaussian, apply(spec, source)), False)
+
+    spec = filters.new_spec("focus_blur")
+    spec["params"]["focus_radius"] = 10
+    narrow = apply(spec, source)
+    spec["params"]["focus_radius"] = 80
+    wide = apply(spec, source)
+    check("focus radius matters", np.array_equal(narrow, wide), False)
+
+
 def test_stylize_amounts():
     source = solid((120, 90, 60))
     for x in range(32):
