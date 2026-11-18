@@ -330,6 +330,7 @@ class LayerPanel(tk.Frame):
                  on_link_create=None, on_unlink=None, on_select_master=None,
                  on_link_reset_transform=None, on_link_canvas=None,
                  get_master_choices=None, on_move_to_canvas=None,
+                 on_copy_to_canvas=None,
                  get_canvas_choices=None, on_group_duplicate=None,
                  on_text_duplicate=None, on_text_toggle=None,
                  on_path_duplicate=None, on_path_toggle=None,
@@ -433,6 +434,7 @@ class LayerPanel(tk.Frame):
         self._on_link_canvas = on_link_canvas
         self._get_master_choices = get_master_choices
         self._on_move_to_canvas = on_move_to_canvas
+        self._on_copy_to_canvas = on_copy_to_canvas
         self._get_canvas_choices = get_canvas_choices
         self._rows = []
         self._row_widgets = []
@@ -2551,6 +2553,10 @@ class LayerPanel(tk.Frame):
         if self._on_move_to_canvas is not None:
             self._on_move_to_canvas(target_index)
 
+    def _handle_copy_to_canvas(self, target_index):
+        if self._on_copy_to_canvas is not None:
+            self._on_copy_to_canvas(target_index)
+
     def _handle_toggle(self):
         if self._group_filter_active():
             if self._on_group_filter_toggle is not None:
@@ -2921,6 +2927,13 @@ class LayerPanel(tk.Frame):
                 command=lambda i=index: self._handle_move_to_canvas(i),
             )
         menu.add_cascade("Move to Canvas", move_canvas_menu, enabled=bool(choices))
+        copy_canvas_menu = PopupMenu(menu)
+        for label, index in choices:
+            copy_canvas_menu.add_command(
+                label,
+                command=lambda i=index: self._handle_copy_to_canvas(i),
+            )
+        menu.add_cascade("Copy to Canvas", copy_canvas_menu, enabled=bool(choices))
         menu.add_separator()
         # Group actions
         menu.add_command("Add Group", command=self._on_group_add)

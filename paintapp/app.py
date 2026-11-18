@@ -521,6 +521,10 @@ class PaintApp:
         self.asset_library = AssetLibrary()
         self.active_canvas = 0
         self._clipboard = None
+        # Copied layers (independent templates) for the layer-aware Ctrl+C/V
+        # path; ``_clipboard`` keeps their pixels for the legacy paste
+        # destinations (selected layer / asset).
+        self._layer_clipboard = None
         # Fingerprint of the OS clipboard at the time ``_clipboard`` was filled,
         # so Paste can tell the in-app copy apart from a newer external image.
         self._clipboard_mark = None
@@ -1078,6 +1082,7 @@ class PaintApp:
             on_link_canvas=self.link_layer_to_canvas,
             get_master_choices=self.master_choices,
             on_move_to_canvas=self.move_layer_to_canvas,
+            on_copy_to_canvas=self.copy_layer_to_canvas,
             get_canvas_choices=self.canvas_move_choices,
             on_group_duplicate=self.duplicate_selected_group,
             on_text_duplicate=self.duplicate_selected_text,
@@ -4562,6 +4567,73 @@ class PaintApp:
             else f"Moved {len(moved)} layers to '{target.name}'."
         )
 
+    def copy_layer_to_canvas(self, target_index):
+        """Copy the selected layer(s) from the active canvas to another canvas.
+
+        Each copy is an independent duplicate (pixels, masks, filters and
+        editable objects) inserted above the target's active layer. The source
+        layers stay where they are, and the copies start ungrouped because
+        groups are canvas-local. The copy is a single undo step recorded on
+        both canvases' histories, so undoing from either tab removes the copies.
+        """
+        source = self.current
+        if source is None:
+            self.set_result("There is no canvas to copy a layer from.")
+            return
+        if not (0 <= target_index < len(self.canvases)):
+            self.set_result("That canvas no longer exists.")
+            return
+        target = self.canvases[target_index]
+        if target is source:
+            self.set_result("The layer is already on this canvas.")
+            return
+
+        indices = self.layer_panel.selected_indices(len(source.layers))
+        if not indices:
+            indices = [source.active]
+        indices = sorted({i for i in indices if 0 <= i < len(source.layers)})
+        if not indices:
+            self.set_result("There is no layer to copy.")
+            return
+        layers = [source.layers[i] for i in indices]
+
+        # Insert above the target's active layer, preserving the selection
+        # order so the copies stack the same way as their sources.
+        base = target.active + 1 if target.layers else 0
+        base = max(0, min(base, len(target.layers)))
+        copies = [layer.copy(name=f"{layer.name} copy") for layer in layers]
+
+        def _undo_copy():
+            for layer in reversed(copies):
+                if layer in target.layers:
+                    target.remove_layer(layer)
+
+        def _redo_copy():
+            for offset, layer in enumerate(copies):
+                if layer not in target.layers:
+                    target.insert_layer(layer, base + offset)
+
+        label = (
+            f"Copy layer to canvas '{target.name}'"
+            if len(copies) == 1
+            else f"Copy {len(copies)} layers to canvas '{target.name}'"
+        )
+        # Record on both canvases so undo works from either tab. The callbacks
+        # are idempotent, so replaying an entry whose change already happened is
+        # a no-op rather than a double copy.
+        source.history.push_action(label, _undo_copy, _redo_copy)
+        target.history.push_action(label, _undo_copy, _redo_copy)
+
+        _redo_copy()
+        self._set_modified(True)
+        self.active_canvas = target_index
+        self._after_history_change()
+        self.set_result(
+            f"Copied layer '{layers[0].name}' to '{target.name}'."
+            if len(copies) == 1
+            else f"Copied {len(copies)} layers to '{target.name}'."
+        )
+
     def toggle_visible(self):
         if not self.layers:
             self.set_result("There is no layer to show or hide.")
@@ -6715,6 +6787,14 @@ class PaintApp:
         image.putalpha(ImageChops.multiply(image.getchannel("A"), inverse))
 
     def copy(self):
+        """Copy the current selection, or whole layer(s), to the clipboard.
+
+        With a pixel selection the selection is copied as before. Without one,
+        every selected layer (not just the active one) is also captured as
+        independent layer templates, so Ctrl+V can insert full layers with
+        their masks, filters and editable objects intact - on this canvas or
+        after switching to another one.
+        """
         selection = self.selection
         layer = self.active_layer()
         if layer is None:
@@ -6728,17 +6808,34 @@ class PaintApp:
             self.copy_vector_svg()
             return
         if selection is not None and not selection.is_empty():
+            self._layer_clipboard = None
             self._clipboard = self._masked_pixels(selection)
             left, top, right, bottom = selection.bbox
             self.set_result(f"Copied {right - left} x {bottom - top} selection.")
         else:
+            indices = self.layer_panel.selected_indices(len(self.layers))
+            if not indices:
+                indices = [self.active]
+            indices = sorted({i for i in indices if 0 <= i < len(self.layers)})
+            copied = [self.layers[i] for i in indices]
+            if not copied:
+                self.set_result("There is no layer to copy.")
+                return
+            self._layer_clipboard = [source.copy() for source in copied]
+            # Keep the active layer's pixels too, so "Paste in selected layer"
+            # and "Paste into assets" still work after a layer copy.
             self._clipboard = layer.image.copy()
-            self.set_result(f"Copied layer '{layer.name}'.")
+            self.set_result(
+                f"Copied layer '{layer.name}'."
+                if len(copied) == 1
+                else f"Copied {len(copied)} layers."
+            )
         self._remember_clipboard_origin()
 
     def cut(self):
         if self._active_layer_locked():
             return
+        self._layer_clipboard = None
         self._push_undo("Cut")
         self.current.bake_offsets()
         layer = self.active_layer()
@@ -6779,17 +6876,32 @@ class PaintApp:
         if self.current is None:
             self.set_result("There is no canvas. Add a canvas first.")
             return
-        choice = self._paste_choice()
-        if choice is None:
-            return
-        dest, fit = choice
         # Prefer the app's own clipboard (regions/layers copied inside the app);
         # fall back to an image sitting on the OS clipboard. The in-app copy is
         # only reused while the OS clipboard still holds what it did at copy
         # time, so a freshly copied external image is not shadowed forever.
         external = self._grab_clipboard_image()
+        external_mark = self._clipboard_fingerprint(external)
+        if (self._layer_clipboard is not None
+                and self._clipboard_mark != external_mark):
+            self._layer_clipboard = None
+        if self._layer_clipboard:
+            # A layer copy already carries its full structure, so there is
+            # nothing to ask: it pastes above the active layer. The stored
+            # destination still selects the legacy pixel behavior for "selected
+            # layer" and "asset", without prompting again.
+            dest = self.tools.paste_dest
+            fit = self.tools.paste_fit_canvas
+            if dest == "new_layer" and not fit:
+                self._paste_layer_clipboard()
+                return
+        else:
+            choice = self._paste_choice()
+            if choice is None:
+                return
+            dest, fit = choice
         if (self._clipboard is not None
-                and self._clipboard_mark != self._clipboard_fingerprint(external)):
+                and self._clipboard_mark != external_mark):
             self._clipboard = None
         if dest == "asset":
             self._paste_into_assets(external)
@@ -6840,6 +6952,38 @@ class PaintApp:
         layer.set_image(Image.alpha_composite(layer.image, buf))
         self.render()
         self.set_result(f"Pasted into layer '{layer.name}'.")
+
+    def _paste_layer_clipboard(self):
+        """Insert the copied layers above the active layer as new layers.
+
+        The clipboard holds independent templates, so each paste makes fresh
+        copies and can be repeated. This is the layer-aware Ctrl+V path; the
+        legacy "selected layer" and "asset" destinations still paste pixels.
+        """
+        canvas = self.current
+        if canvas is None or not self._layer_clipboard:
+            self.set_result("Clipboard is empty.")
+            return
+        base = canvas.active + 1 if canvas.layers else 0
+        base = max(0, min(base, len(canvas.layers)))
+        self._push_undo("Paste layers")
+        copies = [
+            template.copy(name=f"{template.name} copy")
+            for template in self._layer_clipboard
+        ]
+        for offset, layer in enumerate(copies):
+            # insert_layer keeps the group only when it belongs to this canvas,
+            # so a same-canvas paste stays grouped while a cross-canvas paste
+            # starts ungrouped (groups are canvas-local).
+            canvas.insert_layer(layer, base + offset, group=layer.group)
+        self.active = canvas.layers.index(copies[-1])
+        self._refresh_layer_list()
+        self.render()
+        self.set_result(
+            f"Pasted layer '{self._layer_clipboard[0].name}'."
+            if len(copies) == 1
+            else f"Pasted {len(copies)} layers."
+        )
 
     def _paste_into_assets(self, data=None):
         """Add the clipboard image to the project's assets.
@@ -7892,8 +8036,9 @@ class PaintApp:
             size=self.current.size)
         self.root.clipboard_clear()
         self.root.clipboard_append(text)
-        # Drop any in-app pixel copy so a following Paste uses this text.
+        # Drop any in-app copies so a following Paste uses this text.
         self._clipboard = None
+        self._layer_clipboard = None
         count = len(layer.strokes) + len(getattr(layer, "fills", []))
         self.set_result(
             f"Copied {count} vector shape"
