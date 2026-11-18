@@ -857,6 +857,10 @@ def read(app, path, progress=None, cancel=None):
         images = {}
         masks = {}
         assets = {}
+        # The archive's encoded bytes for each layer/mask, kept so the first
+        # save after opening this project can reuse them (see
+        # :func:`_prime_encode_cache`).
+        encoded = {}
         # (target dict, key, archive member, mode, progress label) per image,
         # in the same order the progress steps were always reported.
         jobs = []
@@ -879,17 +883,25 @@ def read(app, path, progress=None, cancel=None):
 
         done = 0
 
-        def install(index, image):
+        def install(index, result):
             nonlocal done
-            target, key, _member, _mode, label = jobs[index]
+            image, data = result
+            target, key, member, _mode, label = jobs[index]
             target[key] = image
+            if target is not assets:
+                # Keep each layer/mask PNG so the next save can reuse it
+                # instead of re-encoding the decoded pixels.
+                encoded[member] = data
             done += 1
             if progress is not None:
                 share = _DECODE_SHARE if layer_entries else 1.0
                 progress(share * done / total, f"{label} {done}/{total}")
 
+        def decode(data, mode):
+            return _decode_png(data, mode), data
+
         _run_parallel(
-            _decode_png, [read_job(i) for i in range(len(jobs))], install, cancel
+            decode, [read_job(i) for i in range(len(jobs))], install, cancel
         )
 
     if progress is not None and not total:
@@ -908,6 +920,9 @@ def read(app, path, progress=None, cancel=None):
     # so the Tk thread only has to install them (see :func:`apply`).
     payload["canvases"] = _build_canvases(payload, cancel=cancel)
     _warm_caches(payload["canvases"], cancel=cancel, progress=progress)
+    _prime_encode_cache(
+        payload["canvases"], canvas_entries, encoded, payload["verbatim"]
+    )
     return payload
 
 
@@ -962,6 +977,37 @@ def _warm_caches(canvases, cancel=None, progress=None):
             progress(frac, f"preparing layer {index}/{len(layers)}")
 
 
+def _prime_encode_cache(canvases, canvas_entries, encoded, verbatim):
+    """Seed the encode cache with the PNGs a project was loaded from.
+
+    :func:`read` already holds every archive member's bytes. Registering them
+    under the loaded layer's content token lets the first save after opening a
+    project reuse them instead of paying the full PNG encode once before the
+    per-process cache is warm.
+
+    Only images the loader used verbatim are primed: when ``_place_layer`` or
+    ``_place_layer_mask`` had to repackage the pixels, the archive bytes no
+    longer describe the layer's buffer and must not be written back in their
+    place.
+    """
+    if not encoded:
+        return
+    for canvas_index, (canvas, entry) in enumerate(
+        zip(canvases, canvas_entries)
+    ):
+        for layer_index, (layer, layer_entry) in enumerate(
+            zip(canvas.layers, entry.get("layers", []) or [])
+        ):
+            if (canvas_index, layer_index, "layer") in verbatim:
+                data = encoded.get(layer_entry.get("file"))
+                if data is not None:
+                    _cache_put(_cache_key(layer, "layer"), data)
+            if (canvas_index, layer_index, "mask") in verbatim:
+                data = encoded.get(layer_entry.get("mask"))
+                if data is not None:
+                    _cache_put(_cache_key(layer, "mask"), data)
+
+
 def _build_canvases(payload, cancel=None):
     """Build detached :class:`Canvas` objects from a decoded payload.
 
@@ -971,6 +1017,9 @@ def _build_canvases(payload, cancel=None):
     images = payload["images"]
     masks = payload["masks"]
     fallback = payload["fallback"]
+    # (canvas, layer, "layer"/"mask") entries whose archive pixels survived
+    # loading unchanged, so their encoded bytes can seed the save cache.
+    verbatim = payload["verbatim"] = set()
     library = _build_library(payload)
     payload["library"] = library
 
@@ -1024,6 +1073,8 @@ def _build_canvases(payload, cancel=None):
             if image is not None and not is_link:
                 placed, placed_offset = _place_layer(image, doc.size, offset)
                 layer.set_image(placed)
+                if placed is image:
+                    verbatim.add((canvas_index, layer_index, "layer"))
             else:
                 if image is not None:
                     layer.set_image(image)
@@ -1035,8 +1086,14 @@ def _build_canvases(payload, cancel=None):
                     # A link's mask is stored in its own buffer frame, which is
                     # what it is composited in; placing it would shift it.
                     layer.mask = mask
+                    verbatim.add((canvas_index, layer_index, "mask"))
                 else:
-                    layer.mask = _place_layer_mask(mask, layer.image.size, offset)
+                    placed_mask = _place_layer_mask(
+                        mask, layer.image.size, offset
+                    )
+                    if placed_mask is mask:
+                        verbatim.add((canvas_index, layer_index, "mask"))
+                    layer.mask = placed_mask
             layer.visible = bool(layer_entry.get("visible", True))
             layer.collapsed = bool(layer_entry.get("collapsed", False))
             layer.locked = bool(layer_entry.get("locked", False))

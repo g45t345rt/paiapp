@@ -489,6 +489,35 @@ def test_unchanged_layers_reuse_encoded_png():
         project._encode_png = real_encode
 
 
+def test_loaded_project_primes_encode_cache():
+    """Opening a project seeds the save cache with the archive's PNGs."""
+    app = fake_app([
+        fake_layer("A", (1, 2, 3, 255)),
+        fake_layer("B", (4, 5, 6, 255), mask=True),
+    ])
+    with tempfile.TemporaryDirectory() as tmp:
+        path = os.path.join(tmp, "sample.pai")
+        project.save(app, path)
+        with project._encode_cache_lock:
+            project._encode_cache.clear()
+            project._encode_cache_size = 0
+        payload = project.read(SimpleNamespace(canvases=[]), path)
+        canvases = payload["canvases"]
+        keys = [
+            project._cache_key(canvases[0].layers[0], "layer"),
+            project._cache_key(canvases[0].layers[1], "layer"),
+            project._cache_key(canvases[0].layers[1], "mask"),
+        ]
+        with zipfile.ZipFile(path) as archive:
+            expected = [
+                archive.read("canvases/0000/layers/0000_A.png"),
+                archive.read("canvases/0000/layers/0001_B.png"),
+                archive.read("canvases/0000/layers/0001_B_mask.png"),
+            ]
+    for index, (key, want) in enumerate(zip(keys, expected)):
+        check(f"loaded image {index} primed", project._cache_get(key), want)
+
+
 def main():
     for name, fn in sorted(globals().items()):
         if name.startswith("test_") and callable(fn):
