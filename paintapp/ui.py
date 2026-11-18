@@ -1741,7 +1741,11 @@ def build_menus(app, parent):
         label="Rename Canvas...", command=app.rename_canvas, enabled=has_canvas,
     )
     canvas_menu.add_command(
-        label="Resize / Expand Canvas\u2026", command=app.resize_canvas,
+        label="Resize Canvas\u2026", command=app.resize_canvas,
+        enabled=has_canvas,
+    )
+    canvas_menu.add_command(
+        label="Expand Canvas\u2026", command=app.expand_canvas,
         enabled=has_canvas,
     )
     canvas_menu.add_command(

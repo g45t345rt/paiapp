@@ -331,13 +331,14 @@ CANVAS_ANCHOR_FRACTIONS = {
 }
 
 
-def prompt_resize_canvas(root, initial=(CANVAS_W, CANVAS_H),
-                         title="Resize / Expand Canvas"):
+def prompt_expand_canvas(root, initial=(CANVAS_W, CANVAS_H),
+                         title="Expand Canvas"):
     """Ask for a canvas size and where the existing content sits.
 
     Returns ``(width, height, anchor)`` or ``None``. ``anchor`` is one of
     :data:`CANVAS_ANCHORS` and decides where the old canvas sits inside the
-    new one. The size may grow or shrink the canvas; no generation is implied.
+    new one. The size may grow or shrink the canvas; layer pixels keep their
+    size and no generation is implied.
     """
     dialog = tk.Toplevel(root)
     dialog.title(title)
@@ -415,6 +416,105 @@ def prompt_resize_canvas(root, initial=(CANVAS_W, CANVAS_H),
 
     buttons = tk.Frame(frame)
     buttons.grid(row=5, column=0, sticky="e", pady=(8, 0))
+    tk.Button(buttons, text="OK", width=8, command=on_ok).pack(side=tk.RIGHT)
+    tk.Button(buttons, text="Cancel", width=8, command=on_cancel).pack(
+        side=tk.RIGHT, padx=(0, 6)
+    )
+
+    dialog.bind("<Return>", on_ok)
+    dialog.bind("<Escape>", on_cancel)
+    dialog.protocol("WM_DELETE_WINDOW", on_cancel)
+
+    theme.restyle(dialog)
+    _update_size_summary()
+    center_window(root, dialog)
+    size_input.width_field.focus_set()
+    size_input.width_field.selection_range(0, tk.END)
+
+    dialog.grab_set()
+    root.wait_window(dialog)
+    return result["value"]
+
+
+def prompt_resize_canvas(root, initial=(CANVAS_W, CANVAS_H),
+                         title="Resize Canvas"):
+    """Ask for a new canvas size that every layer is scaled to fit.
+
+    Returns ``(width, height)`` or ``None``. Unlike :func:`prompt_expand_canvas`
+    this does not add or crop canvas space around the existing content: the
+    whole document is resampled from its current size to the new one.
+    """
+    dialog = tk.Toplevel(root)
+    dialog.title(title)
+    dialog.transient(root)
+    dialog.resizable(False, False)
+    dialog.withdraw()
+
+    frame = tk.Frame(dialog, padx=12, pady=12)
+    frame.pack(fill=tk.BOTH, expand=True)
+
+    size_holder = tk.Frame(frame)
+    size_holder.grid(row=0, column=0, sticky="w", pady=2)
+    size_input = SizeInput(
+        size_holder, initial[0], initial[1], field_width=10,
+        on_change=lambda *_a: _update_size_summary(),
+    )
+    size_input.pack(side=tk.LEFT)
+
+    size_summary_var = tk.StringVar(value="")
+    size_summary = tk.Label(
+        frame, textvariable=size_summary_var, anchor="w", justify="left",
+        wraplength=300,
+    )
+    size_summary.grid(row=1, column=0, sticky="w", pady=(0, 4))
+    theme.register(size_summary, fg="muted")
+
+    tk.Label(
+        frame,
+        text="All layers are resampled to the new canvas size.",
+        anchor="w", justify="left", wraplength=300,
+    ).grid(row=2, column=0, sticky="w", pady=(2, 0))
+
+    error_var = tk.StringVar(value="")
+    tk.Label(frame, textvariable=error_var, fg="red", anchor="w").grid(
+        row=3, column=0, sticky="w", pady=(2, 0)
+    )
+
+    result = {"value": None}
+
+    def _update_size_summary():
+        width, height = size_input.values()
+        if width is None or height is None or width < 1 or height < 1:
+            size_summary_var.set("")
+            return
+        old_w, old_h = initial
+        scale_x = width / old_w if old_w else 1.0
+        scale_y = height / old_h if old_h else 1.0
+        size_summary_var.set(
+            f"{width} × {height} px · {aspect_ratio_label(width, height)} · "
+            f"{megapixels_label(width, height)} · "
+            f"scale {scale_x:.0%} × {scale_y:.0%}"
+        )
+
+    def on_ok(_event=None):
+        width, height = size_input.values()
+        if width is None or height is None:
+            error_var.set("Enter whole numbers.")
+            return
+        if width < 1 or height < 1:
+            error_var.set("Width and height must be at least 1.")
+            return
+        if width > MAX_CANVAS_SIZE or height > MAX_CANVAS_SIZE:
+            error_var.set(f"Maximum size is {MAX_CANVAS_SIZE}.")
+            return
+        result["value"] = (width, height)
+        dialog.destroy()
+
+    def on_cancel(_event=None):
+        dialog.destroy()
+
+    buttons = tk.Frame(frame)
+    buttons.grid(row=4, column=0, sticky="e", pady=(8, 0))
     tk.Button(buttons, text="OK", width=8, command=on_ok).pack(side=tk.RIGHT)
     tk.Button(buttons, text="Cancel", width=8, command=on_cancel).pack(
         side=tk.RIGHT, padx=(0, 6)

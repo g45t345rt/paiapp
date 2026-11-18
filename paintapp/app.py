@@ -23,6 +23,7 @@ from . import gradient
 from . import fonts
 from . import modelsettings
 from . import path
+from . import poses
 from . import settingsdialog
 from . import svgimport
 from . import textrender
@@ -30,7 +31,8 @@ from . import theme
 from . import vector
 from .canvasarea import (
     CanvasArea, DEFAULT_GRID_SIZE, DEFAULT_OFFCANVAS_BG,
-    CANVAS_ANCHOR_FRACTIONS, prompt_new_canvas, prompt_resize_canvas,
+    CANVAS_ANCHOR_FRACTIONS, prompt_expand_canvas, prompt_new_canvas,
+    prompt_resize_canvas,
 )
 from .aspect import aspect_ratio_label
 from .assets import AssetsPanel
@@ -1536,15 +1538,15 @@ class PaintApp:
                 shifted.append((orient, pos))
         doc.guides = shifted
 
-    def resize_canvas(self):
-        """Resize or expand the canvas, keeping content at the chosen anchor."""
+    def expand_canvas(self):
+        """Expand or crop the canvas, keeping content at the chosen anchor."""
         if self.current is None:
-            self.set_result("There is no canvas to resize.")
+            self.set_result("There is no canvas to expand.")
             return
         width, height = self.current.size
-        choice = prompt_resize_canvas(
+        choice = prompt_expand_canvas(
             self.root, initial=(width, height),
-            title="Resize / Expand Canvas",
+            title="Expand Canvas",
         )
         if choice is None:
             return
@@ -1554,7 +1556,7 @@ class PaintApp:
         fx, fy = CANVAS_ANCHOR_FRACTIONS.get(anchor, (0.5, 0.5))
         dx = int(round((new_w - width) * fx))
         dy = int(round((new_h - height) * fy))
-        self._push_undo("Resize canvas")
+        self._push_undo("Expand canvas")
         doc = self.current
         for layer in doc.layers:
             ox, oy = layer.offset
@@ -1569,7 +1571,174 @@ class PaintApp:
         self._sync_gen_size()
         self._update_title()
         self.render()
+        self.set_result(f"Expanded canvas to {new_w} x {new_h}.")
+
+    def resize_canvas(self):
+        """Resize the canvas and resample every layer to the new size.
+
+        Unlike :meth:`expand_canvas`, which only moves the canvas bounds around
+        unchanged pixels, this scales the document itself: layer pixels, masks,
+        offsets, guides, the inpaint mask and every editable object (text,
+        paths, vectors, gradients and poses) are mapped to the new dimensions.
+        """
+        if self.current is None:
+            self.set_result("There is no canvas to resize.")
+            return
+        width, height = self.current.size
+        choice = prompt_resize_canvas(
+            self.root, initial=(width, height), title="Resize Canvas",
+        )
+        if choice is None:
+            return
+        new_w, new_h = choice
+        if (new_w, new_h) == (width, height):
+            return
+        scale_x = new_w / width
+        scale_y = new_h / height
+        matrix = (scale_x, 0.0, 0.0, scale_y, 0.0, 0.0)
+        self._push_undo("Resize canvas")
+        doc = self.current
+        # Scale the layers that own their pixels first: a link to a layer on
+        # this canvas then resamples its master's already-scaled content.
+        for layer in doc.layers:
+            if not layer.is_link:
+                self._scale_layer(layer, scale_x, scale_y, matrix)
+        for layer in doc.layers:
+            if layer.is_link:
+                self._scale_layer(layer, scale_x, scale_y, matrix)
+        if doc.inpaint_mask is not None:
+            doc.inpaint_mask = doc.inpaint_mask.resize(
+                (new_w, new_h), Image.LANCZOS
+            )
+            doc._inpaint_mask_shared = False
+        if not self.guides_shared:
+            scaled = []
+            for orient, pos in doc.guides:
+                factor = scale_x if orient == "v" else scale_y
+                limit = new_w if orient == "v" else new_h
+                pos = int(round(pos * factor))
+                if 0 <= pos <= limit:
+                    scaled.append((orient, pos))
+            doc.guides = scaled
+        doc.width, doc.height = new_w, new_h
+        view = self.area.current_view()
+        if view is not None:
+            view.set_selection(None)
+        self._sync_gen_size()
+        self._update_title()
+        self.render()
         self.set_result(f"Resized canvas to {new_w} x {new_h}.")
+
+    def _scale_layer(self, layer, scale_x, scale_y, matrix):
+        """Map one layer's pixels, mask, offset and objects through ``matrix``."""
+        if layer.is_link:
+            self._scale_link(layer, scale_x, scale_y)
+            if layer.mask is not None:
+                layer.mask = layer.mask.resize(
+                    self._scaled_size(layer.mask.size, scale_x, scale_y),
+                    Image.LANCZOS,
+                )
+            return
+
+        image = layer.image
+        layer.set_image(image.resize(
+            self._scaled_size(image.size, scale_x, scale_y), Image.LANCZOS
+        ))
+        ox, oy = layer.offset
+        layer.offset = (
+            int(round(ox * scale_x)), int(round(oy * scale_y)),
+        )
+        if layer.mask is not None:
+            layer.mask = layer.mask.resize(
+                self._scaled_size(layer.mask.size, scale_x, scale_y),
+                Image.LANCZOS,
+            )
+
+        if layer.texts:
+            for spec in layer.texts:
+                textrender.transform(spec, matrix)
+            layer.invalidate_texts()
+        if layer.paths:
+            for spec in layer.paths:
+                path.transform(spec, matrix)
+            layer.invalidate_paths()
+        if layer.strokes:
+            for spec in layer.strokes:
+                vector.transform(spec, matrix)
+            layer.invalidate_vectors()
+        if layer.fills:
+            for spec in layer.fills:
+                vector.transform_fill(spec, matrix)
+            layer.invalidate_fills()
+        if layer.gradients:
+            for spec in layer.gradients:
+                self._scale_gradient(spec, scale_x, scale_y, matrix)
+            layer.invalidate_gradients()
+        if layer.poses:
+            poses.transform_scene(layer.pose_scene, matrix)
+            layer.invalidate_poses()
+
+    def _scale_link(self, layer, scale_x, scale_y):
+        """Scale a link layer's placement (and canvas-link content) to the new doc.
+
+        A link owns no pixels. A *layer* link renders its master, which was just
+        resampled on this canvas, so only its document placement is scaled:
+        ``S * T * S^-1`` keeps a rotated or scaled instance aligned without
+        applying the document scale to the already-scaled master twice. A
+        *canvas* link renders a different canvas that is not part of this resize,
+        so its content has to scale here too (``S * T``).
+        """
+        transform = layer.transform
+        if layer.link_canvas_id is not None:
+            if transform is None:
+                ox, oy = layer.offset
+                a, b, c, d, e, f = 1.0, 0.0, 0.0, 1.0, float(ox), float(oy)
+            else:
+                a, b, c, d, e, f = transform
+            layer.set_transform((
+                a * scale_x, b * scale_y,
+                c * scale_x, d * scale_y,
+                e * scale_x, f * scale_y,
+            ))
+            return
+        if transform is None:
+            ox, oy = layer.offset
+            layer.offset = (
+                int(round(ox * scale_x)), int(round(oy * scale_y)),
+            )
+            return
+        a, b, c, d, e, f = transform
+        layer.set_transform((
+            a, b * scale_y / scale_x,
+            c * scale_x / scale_y, d,
+            e * scale_x, f * scale_y,
+        ))
+
+    @staticmethod
+    def _scaled_size(size, scale_x, scale_y):
+        """A positive pixel size after scaling ``size``."""
+        return (
+            max(1, int(round(size[0] * scale_x))),
+            max(1, int(round(size[1] * scale_y))),
+        )
+
+    @staticmethod
+    def _scale_gradient(spec, scale_x, scale_y, matrix):
+        """Scale a gradient object's document-space axis and its mask."""
+        a, b, c, d, e, f = matrix
+        for key in ("start", "end"):
+            point = spec.get(key)
+            if point:
+                x, y = point[0], point[1]
+                point[0] = a * x + c * y + e
+                point[1] = b * x + d * y + f
+        mask = spec.get("mask")
+        if mask is not None:
+            spec["mask"] = mask.resize(
+                (max(1, int(round(mask.width * scale_x))),
+                 max(1, int(round(mask.height * scale_y)))),
+                Image.LANCZOS,
+            )
 
     def crop_canvas(self, box):
         """Crop the current canvas to ``box`` ``(left, top, right, bottom)``.
@@ -1869,7 +2038,10 @@ class PaintApp:
             "Rename Canvas...", command=lambda: self._prompt_rename(index)
         )
         menu.add_command(
-            "Resize / Expand Canvas\u2026", command=self.resize_canvas,
+            "Resize Canvas\u2026", command=self.resize_canvas,
+        )
+        menu.add_command(
+            "Expand Canvas\u2026", command=self.expand_canvas,
         )
         menu.add_separator()
         menu.add_command(

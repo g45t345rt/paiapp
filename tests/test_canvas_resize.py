@@ -18,6 +18,7 @@ sys.path.insert(0, ROOT)
 
 from paintapp import path, textrender  # noqa: E402
 from paintapp.app import PaintApp  # noqa: E402
+from paintapp.document import Layer  # noqa: E402
 
 FAILED = []
 
@@ -101,12 +102,75 @@ def test_shift_guides():
     check("shared guides untouched", doc.guides, [("v", 10)])
 
 
+def test_scale_layer_maps_pixels_and_objects():
+    layer = Layer("test", (100, 50))
+    layer.offset = (10, 20)
+    layer.mask = Image.new("L", (100, 50), 255)
+    layer.texts = [textrender.new_spec("hi", x=5, y=6)]
+    layer.paths = [path.new_spec(
+        [[1, 0], [3, 0]], [[1, 0], [3, 0]], [[1, 0], [3, 0]]
+    )]
+    fake = SimpleNamespace(
+        _scaled_size=PaintApp._scaled_size,
+        _scale_gradient=PaintApp._scale_gradient,
+    )
+
+    PaintApp._scale_layer(fake, layer, 2.0, 1.0, (2.0, 0.0, 0.0, 1.0, 0.0, 0.0))
+
+    check("layer image scaled", layer.image.size, (200, 50))
+    check("layer offset scaled", layer.offset, (20, 20))
+    check("layer mask scaled", layer.mask.size, (200, 50))
+    check("text anchor scaled", (layer.texts[0]["x"], layer.texts[0]["y"]),
+          (10.0, 6.0))
+    check("path anchor scaled", layer.paths[0]["anchors"][0], [2.0, 0.0])
+
+
+def test_scaled_size_never_zero():
+    check("tiny width stays positive", PaintApp._scaled_size((10, 10), 0.01, 1.0),
+          (1, 10))
+    check("rounded size", PaintApp._scaled_size((101, 51), 0.5, 2.0), (50, 102))
+
+
+class _FakeLink:
+    def __init__(self, link_id=None, link_canvas_id=None, transform=None,
+                 offset=(0, 0)):
+        self.link_id = link_id
+        self.link_canvas_id = link_canvas_id
+        self.transform = transform
+        self.offset = offset
+
+    def set_transform(self, matrix):
+        self.transform = matrix
+
+
+def test_scale_link_scales_canvas_link_content():
+    link = _FakeLink(link_canvas_id="canvas", offset=(10, 20))
+    PaintApp._scale_link(SimpleNamespace(), link, 2.0, 3.0)
+    check("canvas link content scaled", link.transform,
+          (2.0, 0.0, 0.0, 3.0, 20.0, 60.0))
+
+
+def test_scale_link_does_not_double_scale_layer_link():
+    link = _FakeLink(link_id="master", transform=(2, 0, 0, 2, 10, 20))
+    PaintApp._scale_link(SimpleNamespace(), link, 2.0, 3.0)
+    check("layer link keeps content scale", link.transform,
+          (2, 0.0, 0.0, 2, 20.0, 60.0))
+
+    plain = _FakeLink(link_id="master", offset=(10, 20))
+    PaintApp._scale_link(SimpleNamespace(), plain, 2.0, 3.0)
+    check("layer link offset scaled", plain.offset, (20, 60))
+
+
 if __name__ == "__main__":
     test_remap_keeps_existing_mask()
     test_remap_clears_empty_mask()
     test_shift_layer_objects()
     test_shift_layer_objects_skips_links()
     test_shift_guides()
+    test_scale_layer_maps_pixels_and_objects()
+    test_scaled_size_never_zero()
+    test_scale_link_scales_canvas_link_content()
+    test_scale_link_does_not_double_scale_layer_link()
     if FAILED:
         print("\nFAILED:")
         for line in FAILED:
