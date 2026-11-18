@@ -24,11 +24,12 @@ def _spec(mode="fill", **overrides):
     anchor.add(10, 10)
     anchor.add(110, 10)
     anchor.add(110, 110)
-    return path.from_path(
-        anchor, mode=mode, fill_color="#ff0000", stroke_color="#0000ff",
-        width=6, outline=0, feather=0, opacity=100, antialias=True,
-        cap="round", join="round", **overrides,
+    style = dict(
+        fill_color="#ff0000", stroke_color="#0000ff", width=6, outline=0,
+        feather=0, opacity=100, antialias=True, cap="round", join="round",
     )
+    style.update(overrides)
+    return path.from_path(anchor, mode=mode, **style)
 
 
 def test_normalize_rejects_short_paths():
@@ -43,10 +44,49 @@ def test_normalize_fills_defaults():
     check("mode default", spec["mode"], "fill")
     check("cap default", spec["cap"], "round")
     check("join default", spec["join"], "round")
+    check("dash default", spec["dash"], "solid")
     check("closed default", spec["closed"], False)
     check("opacity default", spec["opacity"], 100)
     check("handles padded", len(spec["handles_in"]), 2)
     check("handle matches anchor", spec["handles_in"][0], [0.0, 0.0])
+
+
+def test_dash_presets_and_rendering():
+    check("unknown dash falls back", path.normalize({
+        "anchors": [[0, 0], [10, 0]], "dash": "bogus"})["dash"], "solid")
+    check("dashed pattern", path.dash_pattern("dashed", 4), [16.0, 8.0])
+    check("solid pattern", path.dash_pattern("solid", 4), [])
+    check("custom pattern", path.dash_pattern("custom", 4, 30, 10),
+          [30.0, 10.0])
+    check("custom fallback", path.dash_pattern("custom", 4), [16.0, 8.0])
+    check("dash length normalized", path.normalize({
+        "anchors": [[0, 0], [10, 0]], "dash": "custom",
+        "dash_length": 99999, "dash_gap": -2,
+    })["dash_length"], path.MAX_DASH)
+    check("dash gap floored", path.normalize({
+        "anchors": [[0, 0], [10, 0]], "dash": "custom",
+        "dash_length": 12, "dash_gap": -2,
+    })["dash_gap"], 0)
+
+    def ink(spec):
+        layer = Layer("p", (140, 140), (0, 0, 0, 0))
+        path.paste(layer.image, spec, (0, 0))
+        return sum(layer.image.getchannel("A").point(
+            lambda value: 1 if value else 0).getdata())
+
+    solid = _spec(mode="stroke", antialias=False)
+    dashed = _spec(mode="stroke", antialias=False, dash="dashed")
+    check("dashed stroke leaves gaps", ink(dashed) < ink(solid), True)
+
+    solid_border = _spec(mode="fill", outline=6, antialias=False)
+    dashed_border = _spec(
+        mode="fill", outline=6, antialias=False, dash="dotted")
+    check("dashed border leaves gaps",
+          ink(dashed_border) < ink(solid_border), True)
+
+    custom = _spec(mode="stroke", antialias=False, dash="custom",
+                   dash_length=12, dash_gap=12)
+    check("custom dash renders", ink(custom) < ink(solid), True)
 
 
 def test_normalize_clamps_fields():

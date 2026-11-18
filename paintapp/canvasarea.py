@@ -11,6 +11,7 @@ from . import colormanagement, shape, symmetry, theme
 from .aspect import aspect_ratio_label, megapixels_label
 from .constants import CANVAS_W, CANVAS_H, MAX_CANVAS_SIZE
 from .dialogs import ask_color, center_window
+from .path import dash_pattern
 from .sizeinput import SizeInput
 from .tabstrip import TabStrip
 
@@ -3676,6 +3677,9 @@ class CanvasView(tk.Canvas):
         cap = {"butt": "butt", "square": "projecting"}.get(
             data.get("cap", "round"), "round")
         join = data.get("join", "round")
+        dash = data.get("dash", "solid")
+        dash_length = float(data.get("dash_length", 0) or 0)
+        dash_gap = float(data.get("dash_gap", 0) or 0)
         opacity = max(1, min(100, int(data.get("opacity", 100))))
         stipple = opacity_stipple(opacity)
 
@@ -3686,11 +3690,21 @@ class CanvasView(tk.Canvas):
                 coords.extend((vx, vy))
             return coords
 
-        def stroke_options(color, thickness):
+        def dash_lengths(thickness):
+            return tuple(
+                max(1, int(round(length * self.zoom)))
+                for length in dash_pattern(dash, thickness,
+                                           dash_length, dash_gap)
+            )
+
+        def stroke_options(color, thickness, doc_thickness):
             options = {
                 "fill": color, "width": thickness,
                 "capstyle": cap, "joinstyle": join, "tags": "path",
             }
+            pattern = dash_lengths(doc_thickness)
+            if pattern:
+                options["dash"] = pattern
             if stipple is not None:
                 options["stipple"] = stipple
             return options
@@ -3708,14 +3722,18 @@ class CanvasView(tk.Canvas):
                 if mode == "fill" and outline > 0:
                     self.create_line(
                         *coords, coords[0], coords[1],
-                        **stroke_options(fill_color, outline))
+                        **stroke_options(fill_color, outline,
+                                         float(data.get("outline", 0))))
         if mode in ("stroke", "both"):
             line = data.get("line") or []
             if len(line) >= 2:
                 coords = to_view(line)
                 if data.get("closed"):
                     coords = coords + coords[:2]
-                self.create_line(*coords, **stroke_options(stroke_color, width))
+                self.create_line(
+                    *coords,
+                    **stroke_options(stroke_color, width,
+                                     float(data.get("width", 1))))
 
         # The pending segment from the last anchor to the cursor, as a guide.
         rubber = data.get("rubber")

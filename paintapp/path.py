@@ -24,13 +24,37 @@ from .constants import PATH_OUTLINE_MAX, rgba
 
 STEPS = 16
 
-# Fill/stroke output modes and the cap/join spellings a saved path may carry.
+# Fill/stroke output modes, the cap/join spellings and the dash presets a saved
+# path may carry.
 MODES = ("fill", "stroke", "both")
 CAPS = ("round", "butt", "square")
 JOINS = ("round", "miter")
+DASHES = ("solid", "dashed", "dotted", "dashdot", "custom")
 
 MAX_WIDTH = 2000
+MAX_DASH = 2000
 
+
+def dash_pattern(preset, width, length=0, gap=0):
+    """The dash lengths (document pixels) for a preset, scaled to ``width``.
+
+    An empty list means a solid line. The pattern follows the vector tool's
+    presets so a dashed path border reads the same as a dashed vector stroke.
+    ``custom`` uses the explicit ``length``/``gap`` in document pixels, falling
+    back to the dashed preset when either is not positive.
+    """
+    if preset == "custom":
+        if length > 0 and gap > 0:
+            return [float(length), float(gap)]
+        preset = "dashed"
+    size = max(1.0, float(width))
+    if preset == "dashed":
+        return [size * 4.0, size * 2.0]
+    if preset == "dotted":
+        return [max(1.0, size * 0.5), size * 2.0]
+    if preset == "dashdot":
+        return [size * 4.0, size * 2.0, max(1.0, size * 0.5), size * 2.0]
+    return []
 
 
 def _cubic(p0, p1, p2, p3, steps=STEPS):
@@ -186,6 +210,17 @@ def normalize(spec):
     mode = spec.get("mode") if spec.get("mode") in MODES else "fill"
     cap = spec.get("cap") if spec.get("cap") in CAPS else "round"
     join = spec.get("join") if spec.get("join") in JOINS else "round"
+    dash = spec.get("dash") if spec.get("dash") in DASHES else "solid"
+    try:
+        dash_length = int(round(float(spec.get("dash_length", 0) or 0)))
+    except (TypeError, ValueError):
+        dash_length = 0
+    dash_length = max(0, min(MAX_DASH, dash_length))
+    try:
+        dash_gap = int(round(float(spec.get("dash_gap", 0) or 0)))
+    except (TypeError, ValueError):
+        dash_gap = 0
+    dash_gap = max(0, min(MAX_DASH, dash_gap))
     try:
         width = int(round(float(spec.get("width", 1))))
     except (TypeError, ValueError):
@@ -221,6 +256,9 @@ def normalize(spec):
         "antialias": bool(spec.get("antialias", True)),
         "cap": cap,
         "join": join,
+        "dash": dash,
+        "dash_length": dash_length,
+        "dash_gap": dash_gap,
     }
     # Hidden paths stay on their layer but are skipped when drawn; the key is
     # only written when set so visible specs keep their original shape.
@@ -242,14 +280,16 @@ def clone(spec):
 
 def new_spec(anchors, handles_in, handles_out, closed=False, mode="fill",
              fill_color="#000000", stroke_color="#000000", width=1, outline=0,
-             feather=0, opacity=100, antialias=True, cap="round", join="round"):
+             feather=0, opacity=100, antialias=True, cap="round", join="round",
+             dash="solid", dash_length=0, dash_gap=0):
     """Build a normalised path object from its geometry and style."""
     return normalize({
         "anchors": anchors, "handles_in": handles_in, "handles_out": handles_out,
         "closed": closed, "mode": mode, "fill_color": fill_color,
         "stroke_color": stroke_color, "width": width, "outline": outline,
         "feather": feather, "opacity": opacity, "antialias": antialias,
-        "cap": cap, "join": join,
+        "cap": cap, "join": join, "dash": dash, "dash_length": dash_length,
+        "dash_gap": dash_gap,
     })
 
 
@@ -645,6 +685,57 @@ def stroke_polyline(draw, points, fill, width, cap="round", join="round"):
             )
 
 
+def _dash_runs(points, pattern):
+    """Split a polyline into the drawn ("on") runs of a dash pattern.
+
+    Distances are measured along the polyline, so dashes keep their length
+    through corners instead of restarting on every flattened bezier sample.
+    """
+    if not pattern or len(points) < 2:
+        return [points]
+    period = sum(pattern)
+    if period <= 1e-9:
+        return [points]
+    index = 0
+    remaining = pattern[0]
+    drawing = True
+    runs = []
+    current = []
+    for (ax, ay), (bx, by) in zip(points, points[1:]):
+        dx = bx - ax
+        dy = by - ay
+        length = math.hypot(dx, dy)
+        if length <= 1e-9:
+            continue
+        consumed = 0.0
+        while consumed < length - 1e-9:
+            step = min(remaining, length - consumed)
+            start_t = consumed / length
+            end_t = (consumed + step) / length
+            if drawing:
+                if not current:
+                    current.append((ax + dx * start_t, ay + dy * start_t))
+                current.append((ax + dx * end_t, ay + dy * end_t))
+            consumed += step
+            remaining -= step
+            if remaining <= 1e-9:
+                if drawing and len(current) >= 2:
+                    runs.append(current)
+                current = []
+                index = (index + 1) % len(pattern)
+                remaining = pattern[index]
+                drawing = index % 2 == 0
+    if drawing and len(current) >= 2:
+        runs.append(current)
+    return runs
+
+
+def _stroke_dashed(draw, points, fill, width, cap, join, pattern):
+    """Rasterise ``points`` as dashed runs, sharing one cap/join treatment."""
+    for run in _dash_runs(points, pattern):
+        stroke_polyline(draw, run, fill, width, cap, join)
+
+
 def _paint(target, spec, origin, scale):
     """Paint ``spec`` onto a draw surface at ``origin`` with ``scale``."""
     mode = spec.get("mode", "fill")
@@ -656,25 +747,37 @@ def _paint(target, spec, origin, scale):
     outline = spec.get("outline", 0)
     cap = spec.get("cap", "round")
     join = spec.get("join", "round")
+    dash = spec.get("dash", "solid")
+    dash_length = spec.get("dash_length", 0)
+    dash_gap = spec.get("dash_gap", 0)
 
     def tx(px, py):
         return ((px - origin[0]) * scale, (py - origin[1]) * scale)
+
+    def dash_lengths(thickness):
+        return [
+            length * scale for length in dash_pattern(
+                dash, thickness, dash_length, dash_gap)
+        ]
 
     if fill:
         points = [tx(px, py) for px, py in flatten(spec, closed=True)]
         if len(points) >= 3:
             target.polygon(points, fill=fill_color)
             if mode == "fill" and outline > 0:
-                stroke_polyline(
+                _stroke_dashed(
                     target, points + [points[0]], fill_color, outline * scale,
-                    cap, join,
+                    cap, join, dash_lengths(outline),
                 )
     if stroke:
         points = [tx(px, py) for px, py in flatten(spec)]
         if spec.get("closed") and len(points) >= 2:
             points = points + [points[0]]
         if len(points) >= 2:
-            stroke_polyline(target, points, stroke_color, width * scale, cap, join)
+            _stroke_dashed(
+                target, points, stroke_color, width * scale, cap, join,
+                dash_lengths(width),
+            )
 
 
 def paste(image, spec, offset=(0, 0)):
@@ -771,6 +874,7 @@ def _sprite_key(spec, left, top):
         spec.get("width"), spec.get("outline"), spec.get("feather"),
         spec.get("opacity"), bool(spec.get("antialias", True)),
         spec.get("cap"), spec.get("join"), bool(spec.get("closed")),
+        spec.get("dash"), spec.get("dash_length"), spec.get("dash_gap"),
         rel(spec.get("anchors")), rel(spec.get("handles_in")),
         rel(spec.get("handles_out")),
     )

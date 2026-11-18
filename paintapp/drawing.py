@@ -561,6 +561,9 @@ class ToolsPanel(tk.Frame):
         self.path_mode = "fill"
         self.path_cap = "round"
         self.path_join = "round"
+        self.path_dash = "solid"
+        self.path_dash_length = 0
+        self.path_dash_gap = 0
         self.path_outline = 0
         self.path_feather = 0
         self.path_opacity = 100
@@ -2724,6 +2727,13 @@ class ToolsPanel(tk.Frame):
         self._path_mode_var = tk.StringVar(value=self.path_mode)
         self._path_cap_var = tk.StringVar(value=self.path_cap)
         self._path_join_var = tk.StringVar(value=self.path_join)
+        self._path_dash_var = tk.StringVar(value=self.path_dash)
+        self._path_dash_length_var = tk.IntVar(
+            value=max(0, min(int(self.path_dash_length), pathspec.MAX_DASH))
+        )
+        self._path_dash_gap_var = tk.IntVar(
+            value=max(0, min(int(self.path_dash_gap), pathspec.MAX_DASH))
+        )
         self._path_outline_var = tk.IntVar(
             value=max(0, min(int(self.path_outline), PATH_OUTLINE_MAX))
         )
@@ -2772,6 +2782,20 @@ class ToolsPanel(tk.Frame):
         self._menu_row(self._path_join_row, "Join", self._path_join_var,
                        [("round", "Round"), ("bevel", "Bevel")],
                        self._sync_path)
+        self._path_dash_row = tk.Frame(self.settings)
+        self._menu_row(self._path_dash_row, "Dash", self._path_dash_var,
+                       [("solid", "Solid"), ("dashed", "Dashed"),
+                        ("dotted", "Dotted"), ("dashdot", "Dash-dot"),
+                        ("custom", "Custom")],
+                       self._on_path_dash)
+        self._path_dash_length_row = tk.Frame(self.settings)
+        self._slider_row(self._path_dash_length_row, "Length",
+                          self._path_dash_length_var, 1, pathspec.MAX_DASH,
+                          self._sync_path)
+        self._path_dash_gap_row = tk.Frame(self.settings)
+        self._slider_row(self._path_dash_gap_row, "Gap",
+                         self._path_dash_gap_var, 1, pathspec.MAX_DASH,
+                         self._sync_path)
 
         # A zero-height marker the conditional rows are packed in front of, so
         # re-showing them keeps them above the fixed controls below.
@@ -3722,7 +3746,8 @@ class ToolsPanel(tk.Frame):
         movable = (
             self._path_swatch_row, self._path_size_label,
             self._path_size_row, self._path_outline_row,
-            self._path_cap_row, self._path_join_row,
+            self._path_cap_row, self._path_join_row, self._path_dash_row,
+            self._path_dash_length_row, self._path_dash_gap_row,
         )
         for widget in movable:
             widget.pack_forget()
@@ -3746,6 +3771,28 @@ class ToolsPanel(tk.Frame):
         if stroked or mode == "fill":
             show(self._path_cap_row)
             show(self._path_join_row)
+            show(self._path_dash_row)
+            if self.path_dash == "custom":
+                show(self._path_dash_length_row)
+                show(self._path_dash_gap_row)
+
+    def _path_dash_thickness(self):
+        """The line width a new custom dash pattern should be sized against."""
+        if self.path_mode in ("stroke", "both"):
+            return max(1, int(self.brush_size))
+        return max(1, int(self.path_outline or self.brush_size))
+
+    def _on_path_dash(self):
+        self.path_dash = self._path_dash_var.get()
+        if self.path_dash == "custom" and (
+                self.path_dash_length <= 0 or self.path_dash_gap <= 0):
+            thickness = self._path_dash_thickness()
+            self.path_dash_length = max(1, int(round(thickness * 4)))
+            self.path_dash_gap = max(1, int(round(thickness * 2)))
+            self._path_dash_length_var.set(self.path_dash_length)
+            self._path_dash_gap_var.set(self.path_dash_gap)
+        self._path_apply_rows()
+        self._refresh_path()
 
     def _on_path_mode(self):
         self.path_mode = self._path_mode_var.get()
@@ -4241,10 +4288,22 @@ class ToolsPanel(tk.Frame):
         self._path_aa_var.set(bool(spec.get("antialias", True)))
         cap = spec.get("cap", "round")
         join = spec.get("join", "round")
+        dash = spec.get("dash", "solid")
+        dash_length = max(
+            0, min(pathspec.MAX_DASH, int(spec.get("dash_length", 0) or 0)))
+        dash_gap = max(
+            0, min(pathspec.MAX_DASH, int(spec.get("dash_gap", 0) or 0)))
         self._path_cap_var.set(cap if cap in pathspec.CAPS else "round")
         self._path_join_var.set(join if join in pathspec.JOINS else "round")
+        self._path_dash_var.set(
+            dash if dash in pathspec.DASHES else "solid")
+        self._path_dash_length_var.set(dash_length)
+        self._path_dash_gap_var.set(dash_gap)
         self.path_cap = self._path_cap_var.get()
         self.path_join = self._path_join_var.get()
+        self.path_dash = self._path_dash_var.get()
+        self.path_dash_length = dash_length
+        self.path_dash_gap = dash_gap
         self.path_outline = outline
         self.path_feather = feather
         self.path_opacity = opacity
@@ -4265,6 +4324,11 @@ class ToolsPanel(tk.Frame):
             "antialias": bool(tools.path_antialias),
             "cap": tools.path_cap,
             "join": tools.path_join,
+            "dash": tools.path_dash,
+            "dash_length": max(
+                0, min(pathspec.MAX_DASH, int(tools.path_dash_length))),
+            "dash_gap": max(
+                0, min(pathspec.MAX_DASH, int(tools.path_dash_gap))),
         }
 
     # ------------------------------------------------------------------ size
@@ -4272,10 +4336,18 @@ class ToolsPanel(tk.Frame):
         # The values the on-canvas preview draws with. A change to any of them
         # repaints the pending path; Feather and Anti-alias are pixel effects
         # that the vector overlay cannot show, so they need no repaint.
-        before = (self.path_cap, self.path_join, self.path_outline,
-                  self.path_opacity)
+        before = (self.path_cap, self.path_join, self.path_dash,
+                  self.path_dash_length, self.path_dash_gap,
+                  self.path_outline, self.path_opacity)
         self.path_cap = self._path_cap_var.get()
         self.path_join = self._path_join_var.get()
+        self.path_dash = self._path_dash_var.get()
+        self.path_dash_length = max(
+            0, min(pathspec.MAX_DASH,
+                   self._int_var(self._path_dash_length_var, 0)))
+        self.path_dash_gap = max(
+            0, min(pathspec.MAX_DASH,
+                   self._int_var(self._path_dash_gap_var, 0)))
         # The Outline slider tops out at PATH_OUTLINE_MAX, but its entry box
         # accepts any typed number, so clamp here and echo the clamped value
         # back into the box.
@@ -4291,8 +4363,9 @@ class ToolsPanel(tk.Frame):
             1, min(100, self._int_var(self._path_opacity_var, 100))
         )
         self.path_antialias = bool(self._path_aa_var.get())
-        after = (self.path_cap, self.path_join, self.path_outline,
-                 self.path_opacity)
+        after = (self.path_cap, self.path_join, self.path_dash,
+                 self.path_dash_length, self.path_dash_gap,
+                 self.path_outline, self.path_opacity)
         if before != after:
             self._refresh_path()
 
@@ -4388,7 +4461,8 @@ class ToolsPanel(tk.Frame):
         "select_transform",
         "wand_tolerance", "wand_contiguous", "wand_sample",
         "segment_model", "segment_sample",
-        "path_mode", "path_cap", "path_join", "path_outline", "path_feather",
+        "path_mode", "path_cap", "path_join", "path_dash", "path_dash_length",
+        "path_dash_gap", "path_outline", "path_feather",
         "path_opacity", "path_antialias", "path_show_handles", "path_new_layer",
         "path_fill_color", "path_stroke_color",
         "vector_mode", "vector_show_anchors", "vector_color", "vector_opacity",
@@ -7025,6 +7099,9 @@ class DrawingController:
         data["outline"] = tools.path_outline
         data["cap"] = tools.path_cap
         data["join"] = tools.path_join
+        data["dash"] = tools.path_dash
+        data["dash_length"] = tools.path_dash_length
+        data["dash_gap"] = tools.path_dash_gap
         data["opacity"] = tools.path_opacity
         view.set_path(data)
 
