@@ -6682,6 +6682,56 @@ class PaintApp:
         self.render()
         self.set_result(f"Feathered the inpaint mask by {radius}px.")
 
+    def flatten_canvas(self):
+        """Merge every visible layer of the active canvas into one layer.
+
+        The result is composited exactly as the canvas shows it - groups,
+        clipping, masks, blend modes, filters and link sources folded in - and
+        starts at the canvas origin. Hidden layers and groups are discarded, as
+        with any flatten, and undo restores the whole stack.
+        """
+        doc = self.current
+        if doc is None:
+            self.set_result("There is no canvas to flatten.")
+            return
+        if not doc.layers:
+            self.set_result("There is no layer to flatten.")
+            return
+        for layer in doc.layers:
+            if layer.visible and layer.locked:
+                self.set_result(
+                    f"Cannot flatten canvas: layer '{layer.name}' is locked."
+                )
+                return
+        if not dialogs.ask_yes_no(
+            self.root,
+            "Flatten Canvas",
+            "Flatten the canvas into one layer?\n\n"
+            "Hidden layers and groups will be discarded.",
+        ):
+            return
+        self.drawing.commit_text()
+        self.drawing.finish_path()
+        # Links to a master baked away by the flatten must become local copies
+        # instead of dangling (matching a layer delete).
+        masters = {
+            layer.master_id: layer
+            for layer in doc.layers
+            if layer.is_master and layer.master_id is not None
+        }
+        count = len(doc.layers)
+        self._push_undo("Flatten canvas")
+        doc.flatten()
+        for master_id, master in masters.items():
+            self._unlink_links_to(master_id, master)
+        self.active = 0
+        self._group_sel = None
+        self._refresh_layer_list()
+        self.render()
+        if self._transform_mode_active():
+            self.drawing.sync_transform()
+        self.set_result(f"Flattened {count} layer(s) into one.")
+
     def merge_layers(self):
         indices = self.layer_panel.selected_indices(len(self.layers))
         if len(indices) < 2:

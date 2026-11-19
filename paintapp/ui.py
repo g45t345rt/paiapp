@@ -1783,6 +1783,10 @@ def build_menus(app, parent):
         label="Fit Canvas to Layers", command=app.fit_canvas_to_layers,
         enabled=has_canvas,
     )
+    canvas_menu.add_command(
+        label="Flatten Canvas", command=app.flatten_canvas,
+        enabled=lambda: bool(app.layers),
+    )
     canvas_menu.add_separator()
     canvas_menu.add_command(
         label="Slice Guides to Canvases", command=app.slice_guides_to_canvases,

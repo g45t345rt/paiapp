@@ -13,7 +13,7 @@ Built with Python and Tkinter.
 ## Features
 
 **Canvas and layers**
-- Layered canvas with groups, layer masks, blend modes, link layers, move-to-canvas/group, and rasterize
+- Layered canvas with groups, layer masks, blend modes, link layers, move-to-canvas/group, rasterize, and flatten canvas
 - Project-wide assets with search, filters, sorting, groups, tags and favorites, plus a gallery and a full undo/redo history panel
 - Grid, off-canvas opacity, customizable sidebar panels, and keyboard shortcuts
 

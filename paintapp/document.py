@@ -2529,6 +2529,29 @@ class Canvas:
         """Flatten visible layers into one transparent RGBA image."""
         return self._flatten(self.layers, (0, 0, self.width, self.height))
 
+    def flatten(self, name="Flattened"):
+        """Merge the visible canvas into one transparent layer and return it.
+
+        The composite honours groups, clipping, masks, filters, blend modes and
+        link sources, and is clipped to the canvas. Hidden layers and groups
+        are dropped, as are the groups themselves, so the stack becomes the one
+        returned layer at the canvas origin with no offset, mask, filters or
+        editable objects. The layer owns the flattened pixels outright (it is
+        not shared with a history snapshot).
+        """
+        image = self.composite_transparent()
+        previous = self.layers
+        layer = Layer(name, self.size)
+        layer.set_image(image)
+        self.layers = [layer]
+        self.groups = []
+        for old in previous:
+            old.group = None
+        self.active = 0
+        self._drop_region_cache()
+        self._exploded_key = None
+        return layer
+
     def content_signature(self):
         """A cheap key for every input that changes the flattened canvas."""
         return (
