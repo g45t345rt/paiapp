@@ -9531,7 +9531,12 @@ class PaintApp:
         up_active, up_cancellable = panel_state(("upscale",))
         # A job is cancellable whether it is running or still waiting in line,
         # so the Cancel button follows "is there anything of this kind active".
-        self.gen.set_busy(gen_active, cancellable=gen_cancellable)
+        # The Generate panel also needs to tell a real run from a preload so the
+        # weighted prompt's slider release replaces the run, not the load.
+        generating = any(job.active and job.kind == "generate" for job in jobs)
+        self.gen.set_busy(
+            gen_active, cancellable=gen_cancellable, generating=generating
+        )
         self.bg.set_busy(bg_active, cancellable=bg_cancellable)
         self.upscale.set_busy(up_active, cancellable=up_cancellable)
 

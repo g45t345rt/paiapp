@@ -1,7 +1,8 @@
-﻿"""The image generation panel."""
+"""The image generation panel."""
 
 import os
 import random
+import re
 import tkinter as tk
 from tkinter import font as tkfont, ttk
 
@@ -21,6 +22,18 @@ def _lora_name(path):
     """The file stem of a LoRA path, or ``""`` when it is unset."""
     return os.path.splitext(os.path.basename(path))[0] if path else ""
 
+
+def _escape_prompt_segment(text):
+    """Escape parentheses so a weighted row's text stays literal in a prompt."""
+    return text.replace("(", "\\(").replace(")", "\\)")
+
+
+# A classic prompt segment already written as ``(text:weight)``; moving to the
+# weighted mode pulls that weight onto the row's slider instead of leaving the
+# whole thing as literal text.
+_WEIGHTED_SEGMENT = re.compile(r"^\((.*):([0-9]*\.?[0-9]+)\)$", re.S)
+
+
 # The Generate panel's two orthogonal init choices. ``Source`` is what a run
 # edits from (``Off`` is plain text-to-image); ``Region`` narrows which pixels
 # may change and only applies once a source is chosen.
@@ -29,6 +42,41 @@ SOURCE_CANVAS = "Canvas"
 SOURCE_LAYER = "Selected Layer"
 SOURCE_ASSET = "Selected Asset"
 SOURCE_CHOICES = (SOURCE_OFF, SOURCE_CANVAS, SOURCE_LAYER, SOURCE_ASSET)
+
+# How the positive and negative prompts are written. ``Default`` is the
+# free-text box (the ``(text:weight)`` syntax still works there); ``Keywords``
+# is the fast mode, where every segment has its own box and weight slider.
+PROMPT_MODE_DEFAULT = "Default"
+PROMPT_MODE_KEYWORDS = "Keywords"
+PROMPT_MODE_CHOICES = (PROMPT_MODE_DEFAULT, PROMPT_MODE_KEYWORDS)
+# Names stored by earlier builds, kept so existing projects still open in the
+# right mode.
+PROMPT_MODE_ALIASES = {
+    "Classic": PROMPT_MODE_DEFAULT,
+    "Weighted": PROMPT_MODE_KEYWORDS,
+}
+
+
+def _prompt_mode_value(value):
+    """Map a stored prompt-mode name onto the current choices."""
+    if value in PROMPT_MODE_CHOICES:
+        return value
+    return PROMPT_MODE_ALIASES.get(value, PROMPT_MODE_DEFAULT)
+# How long a slider must rest after release before the fast mode regenerates,
+# so a quick keyboard nudge or a double tap only starts one run.
+FAST_REGENERATE_DELAY = 250
+WEIGHT_MIN = 0.0
+WEIGHT_MAX = 10.0
+WEIGHT_STEP = 0.05
+# The weighted row list grows with its rows but stops at this height and then
+# scrolls, so a long list does not push the rest of the Generate panel away.
+WEIGHTED_LIST_MAX_HEIGHT = 200
+# The negative prompt auto-grows up to this many lines, then scrolls.
+NEGATIVE_PROMPT_MAX_LINES = 8
+# The weighted negative list is usually shorter; cap it lower than the positive
+# list so both fit in the sidebar together.
+WEIGHTED_NEGATIVE_MAX_HEIGHT = 140
+
 REGION_WHOLE = "Whole image"
 REGION_SELECTION = "Selection"
 REGION_MASK = "Painted mask"
@@ -97,24 +145,109 @@ SCHEDULER_PARAM_DEFAULTS = {
 }
 
 
+class ScrollArea(tk.Frame):
+    """A vertically scrollable frame that grows only up to ``max_height``.
+
+    The inner frame sits on a canvas sized to its own request height, capped at
+    ``max_height``; past that the bar appears and the content scrolls. Used for
+    the weighted prompt rows so a long list cannot push the panel's other
+    fields off screen.
+    """
+
+    def __init__(self, parent, max_height):
+        super().__init__(parent)
+        self.max_height = int(max_height)
+        self._height = 0
+        self.canvas = tk.Canvas(self, highlightthickness=0, bd=0, height=1)
+        theme.register(self.canvas, bg="panel_bg")
+        self.scrollbar = AutoScrollbar(self, command=self.canvas.yview)
+        self.canvas.configure(yscrollcommand=self.scrollbar.set)
+        self.scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        self.canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        self.inner = tk.Frame(self.canvas)
+        theme.register(self.inner, bg="panel_bg")
+        self._window = self.canvas.create_window(
+            (0, 0), window=self.inner, anchor="nw"
+        )
+        self.inner.bind("<Configure>", self._on_inner_configure)
+        self.canvas.bind("<Configure>", self._on_canvas_configure)
+        self._bind_wheel(self.canvas)
+        self._bind_wheel(self.inner)
+
+    def _on_inner_configure(self, _event=None):
+        """Size the canvas to the rows, clamped to ``max_height``."""
+        # Tk keeps a canvas window frame's old requested height after its last
+        # child is destroyed, which would leave an empty-list gap; measure zero
+        # explicitly when there are no rows.
+        content = self.inner.winfo_reqheight() if self.inner.pack_slaves() else 0
+        target = max(1, min(self.max_height, content))
+        if target != self._height:
+            self._height = target
+            self.canvas.configure(height=target)
+        # Constrain the canvas window to the measured rows too: the inner frame
+        # otherwise keeps its old requested size after the last row is gone and
+        # the empty list still occupies a row's height.
+        self.canvas.itemconfigure(self._window, height=max(1, content))
+        width = max(1, self.canvas.winfo_width())
+        self.canvas.configure(scrollregion=(0, 0, width, max(1, content)))
+        self._refresh_scrollbar()
+
+    def _refresh_scrollbar(self):
+        """Re-evaluate the bar after the content shrinks as well as grows."""
+        try:
+            first, last = self.canvas.yview()
+        except tk.TclError:
+            return
+        self.scrollbar.set(first, last)
+
+    def _on_canvas_configure(self, event):
+        self.canvas.itemconfigure(self._window, width=event.width)
+
+    def _bind_wheel(self, widget):
+        """Let the wheel scroll the list even over a row's entry or slider."""
+        widget.bind("<MouseWheel>", self._on_wheel)
+        for child in widget.winfo_children():
+            self._bind_wheel(child)
+
+    def _on_wheel(self, event):
+        self.canvas.yview_scroll(int(-event.delta / 120) or 0, "units")
+        return "break"
+
+    def see_bottom(self):
+        """Re-measure and scroll to the newest row after a short idle pass."""
+        self.refresh()
+        self.canvas.yview_moveto(1.0)
+
+    def refresh(self):
+        """Re-measure after rows are removed, when the inner frame shrinks."""
+        self.update_idletasks()
+        self._on_inner_configure()
+
+
 class PromptBox(tk.Frame):
     """A prompt ``tk.Text`` with a scrollbar and a drag-to-grow bottom grip.
 
     The grip changes the box's line height so long prompts can be seen without
     leaving the panel. Dragging reuses the theme's splitter colors, matching the
-    sidebar resize handle.
+    sidebar resize handle. With ``auto_grow`` the box instead follows its text
+    up to ``max_lines`` and then scrolls; ``min_lines`` is its resting height.
     """
 
     MIN_LINES = 2
     MAX_LINES = 30
 
-    def __init__(self, parent):
+    def __init__(self, parent, auto_grow=False, min_lines=None, max_lines=None):
         super().__init__(parent)
         self._drag = None
+        self._auto_grow = bool(auto_grow)
+        self._min_lines = int(min_lines or self.MIN_LINES)
+        self._max_lines = int(max_lines or self.MAX_LINES)
+        self._fit_after = None
 
         top = tk.Frame(self)
         top.pack(fill=tk.X)
         self.text = tk.Text(top, width=22, height=3, wrap=tk.WORD, undo=True)
+        self.text.prompt_box = self
         scrollbar = AutoScrollbar(top, command=self.text.yview)
         self.text.configure(yscrollcommand=scrollbar.set)
         scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
@@ -136,7 +269,34 @@ class PromptBox(tk.Frame):
         self._grip = grip
         self._ridge = ridge
 
+        if self._auto_grow:
+            self.text.bind("<<Modified>>", self._on_modified, add="+")
+            self.text.bind("<Configure>", self._on_configure, add="+")
+            self.schedule_fit()
+
     # --------------------------------------------------------------- resizing
+    def schedule_fit(self):
+        """Fit the height to the text once the pending edits settle."""
+        if not self._auto_grow or self._fit_after is not None:
+            return
+        self._fit_after = self.after_idle(self._fit_height)
+
+    def _fit_height(self):
+        self._fit_after = None
+        try:
+            lines = int(self.text.count("1.0", "end-1c", "displaylines")[0])
+        except (tk.TclError, TypeError, IndexError):
+            return
+        lines = max(self._min_lines, min(self._max_lines, lines or 1))
+        if lines != int(self.text.cget("height")):
+            self.text.configure(height=lines)
+
+    def _on_modified(self, _event=None):
+        self.schedule_fit()
+
+    def _on_configure(self, _event=None):
+        self.schedule_fit()
+
     def _linespace(self):
         """Pixel height of one text line, so a drag converts to whole lines."""
         try:
@@ -166,7 +326,7 @@ class PromptBox(tk.Frame):
         start_y, start_lines = self._drag
         step = (event.y_root - start_y) / self._linespace()
         lines = start_lines + int(round(step))
-        lines = max(self.MIN_LINES, min(self.MAX_LINES, lines))
+        lines = max(self._min_lines, min(self._max_lines, lines))
         if lines != int(self.text.cget("height")):
             self.text.configure(height=lines)
         return "break"
@@ -221,6 +381,19 @@ class GenerationPanel(tk.Frame):
         # Set while the whole panel is written from a stored per-canvas/layer
         # setting, so those writes are not echoed back into that storage.
         self._loading = False
+        # The weighted prompt's rows (one text box and weight slider each) and
+        # the pending fast-mode regeneration timer. Positive and negative prompts
+        # each have their own row list.
+        self._weighted_rows = []
+        self._weighted_negative_rows = []
+        # The classic text the weighted rows were last compiled from/to, so a
+        # switch back and forth keeps whichever side the user last edited.
+        self._prompt_snapshot = None
+        self._negative_snapshot = None
+        self._regenerate_after = None
+        # True while the queue holds a generate job for this panel, so a fast
+        # regeneration can replace it instead of piling a second run behind it.
+        self._has_generation_job = False
         # Why the last get_config() call returned None, for the caller to show.
         self.config_error = ""
         # The recipe names shown for the selected model, split into the ones the
@@ -273,16 +446,96 @@ class GenerationPanel(tk.Frame):
         self.lora_list = tk.Frame(self)
         self.lora_list.pack(fill=tk.X)
 
-        tk.Label(self, text="Positive prompt:", anchor="w").pack(fill=tk.X, pady=(4, 0))
-        self.positive_prompt_text = self._prompt_text(self)
+        mode_row = tk.Frame(self)
+        mode_row.pack(fill=tk.X, pady=(4, 0))
+        tk.Label(mode_row, text="Prompt mode:").pack(side=tk.LEFT)
+        self.prompt_mode_var = tk.StringVar(value=PROMPT_MODE_DEFAULT)
+        self.prompt_mode_menu = ttk.Combobox(
+            mode_row, textvariable=self.prompt_mode_var,
+            values=list(PROMPT_MODE_CHOICES), state="readonly", width=12,
+        )
+        self.prompt_mode_menu.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        self.prompt_mode_var.trace_add("write", self._on_prompt_mode_change)
+        self.auto_generate_var = tk.BooleanVar(value=False)
+        self.auto_generate_check = tk.Checkbutton(
+            self, text="Auto-generate on slider release",
+            variable=self.auto_generate_var, anchor="w",
+        )
 
+        # Both prompt editors share one slot so switching modes does not move
+        # the rest of the panel; only the active one is packed.
+        self.prompt_area = tk.Frame(self)
+        self.prompt_area.pack(fill=tk.X)
+
+        self.classic_prompt_frame = tk.Frame(self.prompt_area)
+        self.classic_prompt_frame.pack(fill=tk.X)
+        tk.Label(
+            self.classic_prompt_frame, text="Positive prompt:", anchor="w"
+        ).pack(fill=tk.X, pady=(4, 0))
+        self.positive_prompt_text = self._prompt_text(self.classic_prompt_frame)
         self.positive_prompt_text.bind("<<Modified>>", self._on_positive_modified)
 
-        tk.Label(self, text="Negative prompt:", anchor="w").pack(fill=tk.X, pady=(4, 0))
+        # Fast mode: one row per prompt segment. The compiled prompt is their
+        # texts joined by commas with ``(text:weight)`` for weights other than 1.
+        self.weighted_prompt_frame = tk.Frame(self.prompt_area)
+        weighted_header = tk.Frame(self.weighted_prompt_frame)
+        weighted_header.pack(fill=tk.X, pady=(4, 0))
+        tk.Label(weighted_header, text="Positive prompt:", anchor="w").pack(side=tk.LEFT)
+        weighted_hint = tk.Label(
+            weighted_header, text="weight 0 disables a row", anchor="e",
+        )
+        theme.register(weighted_hint, fg="muted")
+        weighted_hint.pack(side=tk.RIGHT)
+        self.weighted_list = ScrollArea(
+            self.weighted_prompt_frame, WEIGHTED_LIST_MAX_HEIGHT
+        )
+        self.weighted_list.pack(fill=tk.X)
+        self.weighted_rows_frame = self.weighted_list.inner
+        self.add_weighted_btn = tk.Button(
+            self.weighted_prompt_frame, text="+ Add prompt",
+            command=self._add_weighted_row,
+        )
+        self.add_weighted_btn.pack(fill=tk.X, pady=(2, 0))
+
+        # Negative prompt: the classic box in Classic mode, weighted rows in the
+        # fast mode, so both prompts can be tuned with sliders there.
+        self.negative_area = tk.Frame(self)
+        self.negative_area.pack(fill=tk.X)
+
+        self.classic_negative_frame = tk.Frame(self.negative_area)
+        self.classic_negative_frame.pack(fill=tk.X)
+        tk.Label(
+            self.classic_negative_frame, text="Negative prompt:", anchor="w"
+        ).pack(fill=tk.X, pady=(4, 0))
         self.negative_var = tk.StringVar(value="")
-        self.negative_text = self._prompt_text(self)
+        self.negative_text = self._prompt_text(
+            self.classic_negative_frame, auto_grow=True, min_lines=3,
+            max_lines=NEGATIVE_PROMPT_MAX_LINES,
+        )
         self.negative_text.bind("<<Modified>>", self._on_negative_modified)
         self.negative_var.trace_add("write", self._on_negative_var)
+
+        self.weighted_negative_frame = tk.Frame(self.negative_area)
+        negative_header = tk.Frame(self.weighted_negative_frame)
+        negative_header.pack(fill=tk.X, pady=(4, 0))
+        tk.Label(
+            negative_header, text="Negative prompt:", anchor="w"
+        ).pack(side=tk.LEFT)
+        negative_hint = tk.Label(
+            negative_header, text="weight 0 disables a row", anchor="e",
+        )
+        theme.register(negative_hint, fg="muted")
+        negative_hint.pack(side=tk.RIGHT)
+        self.negative_list = ScrollArea(
+            self.weighted_negative_frame, WEIGHTED_NEGATIVE_MAX_HEIGHT
+        )
+        self.negative_list.pack(fill=tk.X)
+        self.weighted_negative_rows_frame = self.negative_list.inner
+        self.add_weighted_negative_btn = tk.Button(
+            self.weighted_negative_frame, text="+ Add negative prompt",
+            command=self._add_weighted_negative_row,
+        )
+        self.add_weighted_negative_btn.pack(fill=tk.X, pady=(2, 0))
 
         recipe_row = tk.Frame(self)
         recipe_row.pack(fill=tk.X, pady=(4, 0))
@@ -328,6 +581,10 @@ class GenerationPanel(tk.Frame):
             theme.register(controls, bg=bg)
             return controls
 
+        # Steps keeps its spinbox in both prompt modes; Seed, CFG and Denoise
+        # swap to sliders in the weighted fast mode. Each pair is one row.
+        self._fast_controls = []
+
         self.steps_var = tk.IntVar(value=10)
         self.steps_spin = tk.Spinbox(
             row(0, "Steps:"), from_=1, to=50, width=4, textvariable=self.steps_var
@@ -336,10 +593,15 @@ class GenerationPanel(tk.Frame):
 
         seed_field = row(1, "Seed:")
         self.seed_var = tk.IntVar(value=0)
-        tk.Spinbox(
+        self.seed_spin = tk.Spinbox(
             seed_field, from_=0, to=2**31 - 1, width=9, textvariable=self.seed_var
-        ).pack(side=tk.LEFT, padx=(0, 4))
-        tk.Button(seed_field, text="Random", command=self._random_seed).pack(side=tk.LEFT)
+        )
+        self.seed_spin.pack(side=tk.LEFT, padx=(0, 4))
+        self.seed_random_btn = tk.Button(
+            seed_field, text="Random", command=self._random_seed
+        )
+        self.seed_random_btn.pack(side=tk.LEFT)
+        self.seed_var.trace_add("write", self._on_seed_input_change)
 
         size_field = row(2, "Size:")
         self.size = SizeInput(
@@ -368,18 +630,32 @@ class GenerationPanel(tk.Frame):
         self._update_size_ratio()
 
         self.cfg_var = tk.DoubleVar(value=1.0)
+        cfg_field = row(3, "CFG:")
+        self.cfg_classic = tk.Frame(cfg_field)
+        self.cfg_classic.pack(side=tk.LEFT)
         self.cfg_spin = tk.Spinbox(
-            row(3, "CFG:"), from_=0.0, to=10.0, increment=0.1, width=5,
+            self.cfg_classic, from_=0.0, to=10.0, increment=0.1, width=5,
             textvariable=self.cfg_var,
         )
         self.cfg_spin.pack(side=tk.LEFT)
+        self.fast_cfg_scale = self._fast_scale(
+            cfg_field, self.cfg_var, 0.0, 10.0, 0.1, digits=3
+        )
+        self._fast_controls.append((self.cfg_classic, self.fast_cfg_scale))
 
         self.denoise_var = tk.DoubleVar(value=1.0)
+        denoise_field = row(4, "Denoise:")
+        self.denoise_classic = tk.Frame(denoise_field)
+        self.denoise_classic.pack(side=tk.LEFT)
         self.denoise_spin = tk.Spinbox(
-            row(4, "Denoise:"), from_=0.0, to=1.0, increment=0.05, width=5,
+            self.denoise_classic, from_=0.0, to=1.0, increment=0.05, width=5,
             textvariable=self.denoise_var,
         )
         self.denoise_spin.pack(side=tk.LEFT)
+        self.fast_denoise_scale = self._fast_scale(
+            denoise_field, self.denoise_var, 0.0, 1.0, 0.05, digits=3
+        )
+        self._fast_controls.append((self.denoise_classic, self.fast_denoise_scale))
 
         self.sampler_var = tk.StringVar(value="euler")
         self.sampler_combo = ttk.Combobox(
@@ -700,18 +976,343 @@ class GenerationPanel(tk.Frame):
             state=tk.NORMAL if self.model_choices else tk.DISABLED
         )
 
-    def _prompt_text(self, parent):
+    def _prompt_text(self, parent, auto_grow=False, min_lines=None, max_lines=None):
         """A multiline prompt box that grows by dragging its bottom grip.
 
         Returns the inner ``tk.Text`` so callers treat it as a plain text box.
+        ``auto_grow`` makes the box follow its content up to ``max_lines``.
         """
-        box = PromptBox(parent)
+        box = PromptBox(
+            parent, auto_grow=auto_grow, min_lines=min_lines, max_lines=max_lines
+        )
         box.pack(fill=tk.X, pady=(2, 0))
         return box.text
 
+    # -------------------------------------------------------- weighted prompt
+    def _fast_scale(self, parent, var, from_, to, resolution, digits=None,
+                    length=130):
+        """A horizontal slider for the Keywords fast mode's rows."""
+        scale = tk.Scale(
+            parent, from_=from_, to=to, resolution=resolution,
+            orient=tk.HORIZONTAL, variable=var, showvalue=True, length=length,
+        )
+        if digits is not None:
+            scale.configure(digits=digits)
+        self._bind_fast_release(scale)
+        return scale
+
+    def _bind_fast_release(self, scale):
+        """Regenerate when the scale is released or a keyboard nudge ends."""
+        scale.bind("<ButtonRelease-1>", self._on_fast_slider_release)
+        scale.bind("<KeyRelease>", self._on_fast_slider_release)
+
+    def _on_fast_slider_release(self, _event=None):
+        self._on_fast_slider()
+
+    def _on_seed_input_change(self, *_):
+        """Auto-generate for a hand-edited seed box in Keywords mode."""
+        if self._applying or self._loading:
+            return
+        if self.prompt_mode() != PROMPT_MODE_KEYWORDS:
+            return
+        if not self.auto_generate_var.get():
+            return
+        self._schedule_fast_regenerate()
+
+    def prompt_mode(self):
+        """``Default`` or ``Keywords`` (the fast keyword list)."""
+        return _prompt_mode_value(self.prompt_mode_var.get())
+
+    def _on_prompt_mode_change(self, *_):
+        """Swap the prompt editors and carry the text across the two modes."""
+        mode = self.prompt_mode()
+        if not self._loading:
+            if mode == PROMPT_MODE_KEYWORDS:
+                self._sync_keywords_from_text(
+                    self.positive_prompt(), self._weighted_rows,
+                    self.weighted_list, self._add_weighted_row,
+                    "_prompt_snapshot",
+                )
+                self._sync_keywords_from_text(
+                    self.negative_var.get(), self._weighted_negative_rows,
+                    self.negative_list, self._add_weighted_negative_row,
+                    "_negative_snapshot",
+                )
+            else:
+                if self._weighted_rows:
+                    text = self.weighted_prompt()
+                    self.set_prompt(text)
+                    self._prompt_snapshot = text
+                if self._weighted_negative_rows or self._negative_snapshot is not None:
+                    text = self.weighted_negative_prompt()
+                    self.negative_var.set(text)
+                    self._negative_snapshot = text
+        self._apply_prompt_mode_ui(mode)
+        if not self._loading:
+            self._report_weighted_prompt()
+
+    def _apply_prompt_mode_ui(self, mode):
+        """Show the classic editors or the weighted rows, not both."""
+        weighted = mode == PROMPT_MODE_KEYWORDS
+        if weighted:
+            self.classic_prompt_frame.pack_forget()
+            self.weighted_prompt_frame.pack(fill=tk.X)
+            self.classic_negative_frame.pack_forget()
+            self.weighted_negative_frame.pack(fill=tk.X)
+            if not self._weighted_rows:
+                self._add_weighted_row()
+            self.weighted_list.refresh()
+            self.negative_list.refresh()
+        else:
+            self.weighted_prompt_frame.pack_forget()
+            self.classic_prompt_frame.pack(fill=tk.X)
+            self.weighted_negative_frame.pack_forget()
+            self.classic_negative_frame.pack(fill=tk.X)
+        if weighted:
+            self.auto_generate_check.pack(fill=tk.X, before=self.prompt_area)
+        else:
+            self.auto_generate_check.pack_forget()
+        for classic, scale in self._fast_controls:
+            if weighted:
+                classic.pack_forget()
+                scale.pack(side=tk.LEFT)
+            else:
+                scale.pack_forget()
+                classic.pack(side=tk.LEFT)
+
+    def _sync_keywords_from_text(self, text, rows, area, add, snapshot):
+        """Refresh the row list when the classic text changed between switches.
+
+        Rows are the source of truth while Keywords is active; switching to
+        Default writes their compiled text back. If that text was edited in
+        Default before switching again, the rows are rebuilt from it so the two
+        modes cannot diverge.
+        """
+        if rows and getattr(self, snapshot) == text:
+            return
+        self._clear_weighted_rows(rows)
+        area.refresh()
+        for part in (text or "").split(","):
+            part = part.strip()
+            if not part:
+                continue
+            match = _WEIGHTED_SEGMENT.match(part)
+            if match:
+                add(match.group(1), float(match.group(2)))
+            else:
+                add(part)
+        setattr(self, snapshot, text)
+
+    def _add_weighted_row(self, text="", weight=1.0):
+        """Append one positive prompt row."""
+        return self._add_weighted_row_to(
+            self._weighted_rows, self.weighted_list,
+            self._on_weighted_text_change, text, weight,
+        )
+
+    def _add_weighted_negative_row(self, text="", weight=1.0):
+        """Append one negative prompt row."""
+        return self._add_weighted_row_to(
+            self._weighted_negative_rows, self.negative_list,
+            self._on_weighted_settings_change, text, weight,
+        )
+
+    def _add_weighted_row_to(self, rows, area, on_change, text="", weight=1.0):
+        """Append one prompt box with its weight slider to ``rows``/``area``."""
+        row = tk.Frame(area.inner)
+        row.pack(fill=tk.X, pady=(2, 0))
+        text_var = tk.StringVar(value=text)
+        entry = tk.Entry(row, textvariable=text_var)
+        entry.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        try:
+            weight = float(weight)
+        except (TypeError, ValueError):
+            weight = 1.0
+        weight_var = tk.DoubleVar(value=min(WEIGHT_MAX, max(WEIGHT_MIN, weight)))
+        scale = tk.Scale(
+            row, from_=WEIGHT_MIN, to=WEIGHT_MAX, resolution=WEIGHT_STEP,
+            orient=tk.HORIZONTAL, variable=weight_var, showvalue=True,
+            length=95, digits=3,
+        )
+        scale.pack(side=tk.LEFT, padx=(4, 0))
+        self._bind_fast_release(scale)
+        data = {
+            "frame": row, "text_var": text_var, "weight_var": weight_var,
+            "entry": entry, "scale": scale, "rows": rows, "area": area,
+        }
+        remove = tk.Button(
+            row, text="\u2715", width=2,
+            command=lambda r=data: self._remove_weighted_row(r),
+        )
+        remove.pack(side=tk.LEFT, padx=(2, 0))
+        data["remove_btn"] = remove
+        rows.append(data)
+        text_var.trace_add("write", lambda *_: on_change())
+        entry.bind("<Return>", lambda _e: self._fast_regenerate())
+        theme.restyle(row)
+        area._bind_wheel(row)
+        area.see_bottom()
+        return data
+
+    def _remove_weighted_row(self, data):
+        """Drop one weighted row; the list may end up empty."""
+        rows = data.get("rows", self._weighted_rows)
+        area = data.get("area", self.weighted_list)
+        if data not in rows:
+            return
+        rows.remove(data)
+        data["frame"].destroy()
+        area.refresh()
+        self._on_settings_change()
+        self._report_weighted_prompt()
+
+    @staticmethod
+    def _clear_weighted_rows(rows):
+        for data in rows:
+            data["frame"].destroy()
+        rows.clear()
+
+    def _set_weighted_rows(self, rows):
+        """Replace the positive rows with stored ``{text, weight}`` entries."""
+        self._clear_weighted_rows(self._weighted_rows)
+        for item in rows or []:
+            if isinstance(item, dict):
+                self._add_weighted_row(
+                    str(item.get("text", "")), item.get("weight", 1.0)
+                )
+        self.weighted_list.refresh()
+
+    def _set_weighted_negative_rows(self, rows):
+        """Replace the negative rows with stored ``{text, weight}`` entries."""
+        self._clear_weighted_rows(self._weighted_negative_rows)
+        for item in rows or []:
+            if isinstance(item, dict):
+                self._add_weighted_negative_row(
+                    str(item.get("text", "")), item.get("weight", 1.0)
+                )
+        self.negative_list.refresh()
+
+    def _on_weighted_text_change(self, *_):
+        if self._loading or self._applying:
+            return
+        self._on_settings_change()
+        self._report_weighted_prompt()
+
+    def _on_weighted_settings_change(self, *_):
+        if self._loading or self._applying:
+            return
+        self._on_settings_change()
+
+    def _report_weighted_prompt(self, *_):
+        """Keep the layer's stored prompt in step with the weighted list."""
+        if self._loading or self._applying:
+            return
+        if self.prompt_mode() != PROMPT_MODE_KEYWORDS:
+            return
+        if self._on_positive_prompt is not None:
+            self._on_positive_prompt(self.weighted_prompt())
+
+    @staticmethod
+    def _compile_weighted_rows(rows):
+        """Compile rows to ``happy, (smile:1.5), ...``, dropping weight 0.
+
+        A row at weight 0 is disabled: it is left out of the compiled prompt
+        entirely, so the slider can switch a segment off without deleting it.
+        """
+        parts = []
+        for data in rows:
+            text = data["text_var"].get().strip()
+            if not text:
+                continue
+            try:
+                weight = float(data["weight_var"].get())
+            except (tk.TclError, ValueError):
+                weight = 1.0
+            if weight <= 0:
+                continue
+            text = _escape_prompt_segment(text)
+            if abs(weight - 1.0) < 1e-9:
+                parts.append(text)
+            else:
+                parts.append(f"({text}:{weight:g})")
+        return ", ".join(parts)
+
+    def weighted_prompt(self):
+        """The positive weighted rows compiled to prompt syntax."""
+        return self._compile_weighted_rows(self._weighted_rows)
+
+    def weighted_negative_prompt(self):
+        """The negative weighted rows compiled to prompt syntax."""
+        return self._compile_weighted_rows(self._weighted_negative_rows)
+
+    def negative_prompt(self):
+        """The run's negative prompt: the compiled fast list or the classic box."""
+        if self.prompt_mode() == PROMPT_MODE_KEYWORDS:
+            return self.weighted_negative_prompt()
+        return self.negative_var.get()
+
+    @staticmethod
+    def _weighted_row_values(rows):
+        values = []
+        for data in rows:
+            text = data["text_var"].get().strip()
+            if not text:
+                continue
+            try:
+                weight = float(data["weight_var"].get())
+            except (tk.TclError, ValueError):
+                weight = 1.0
+            values.append({"text": text, "weight": weight})
+        return values
+
+    def weighted_rows(self):
+        """The positive rows as ``[{"text": ..., "weight": ...}, ...]``."""
+        return self._weighted_row_values(self._weighted_rows)
+
+    def weighted_negative_rows(self):
+        """The negative rows as ``[{"text": ..., "weight": ...}, ...]``."""
+        return self._weighted_row_values(self._weighted_negative_rows)
+
+    # ------------------------------------------------------ fast regeneration
+    def _on_fast_slider(self, _value=None):
+        """A slider moved: regenerate once it comes to rest (i.e. on release)."""
+        if self._applying or self._loading:
+            return
+        if self.prompt_mode() != PROMPT_MODE_KEYWORDS:
+            return
+        if not self.auto_generate_var.get():
+            return
+        self._schedule_fast_regenerate()
+
+    def _schedule_fast_regenerate(self):
+        if self._regenerate_after is not None:
+            try:
+                self.after_cancel(self._regenerate_after)
+            except tk.TclError:
+                pass
+        self._regenerate_after = self.after(
+            FAST_REGENERATE_DELAY, self._fast_regenerate
+        )
+
+    def _fast_regenerate(self):
+        """Run the current weighted prompt, replacing an in-flight run."""
+        self._regenerate_after = None
+        if self._loading or self._applying:
+            return
+        if self.prompt_mode() != PROMPT_MODE_KEYWORDS:
+            return
+        if not self.prompt():
+            return
+        self._on_settings_change()
+        if self._has_generation_job:
+            self._on_cancel()
+        self._on_generate()
+
     # ------------------------------------------------------------------ public
     def prompt(self):
-        """The run's positive prompt, taken from the Positive prompt box."""
+        """The run's positive prompt: the compiled fast list or the classic box."""
+        if self.prompt_mode() == PROMPT_MODE_KEYWORDS:
+            return self.weighted_prompt()
         return self.positive_prompt()
 
     def positive_prompt(self):
@@ -731,6 +1332,9 @@ class GenerationPanel(tk.Frame):
         # user should be able to Ctrl+Z back into, so drop it from the box's own
         # undo stack; Ctrl+Z then only steps through what was typed here.
         widget.edit_reset()
+        box = getattr(widget, "prompt_box", None)
+        if box is not None:
+            box.schedule_fit()
 
     def set_size(self, width, height):
         """Set the generation width/height (defaults to the active canvas size)."""
@@ -752,6 +1356,10 @@ class GenerationPanel(tk.Frame):
                 return None
             return {
                 "model": self.model_var.get(),
+                "prompt_mode": self.prompt_mode_var.get(),
+                "weighted_prompt": self.weighted_rows(),
+                "weighted_negative": self.weighted_negative_rows(),
+                "auto_generate": bool(self.auto_generate_var.get()),
                 "negative": self.negative_var.get(),
                 "steps": int(self.steps_var.get()),
                 "seed": int(self.seed_var.get()),
@@ -791,6 +1399,20 @@ class GenerationPanel(tk.Frame):
             if model and model in self.model_choices:
                 self.model_var.set(model)
             self._set_preset_fields(values)
+            if "prompt_mode" in values or "weighted_prompt" in values:
+                mode = _prompt_mode_value(
+                    values.get("prompt_mode", PROMPT_MODE_DEFAULT)
+                )
+                self.prompt_mode_var.set(mode)
+                if "weighted_prompt" in values:
+                    self._set_weighted_rows(values.get("weighted_prompt"))
+                if "weighted_negative" in values:
+                    self._set_weighted_negative_rows(values.get("weighted_negative"))
+                if "auto_generate" in values:
+                    self.auto_generate_var.set(bool(values["auto_generate"]))
+                self._prompt_snapshot = None
+                self._negative_snapshot = None
+                self._apply_prompt_mode_ui(mode)
             if "seed" in values:
                 self.seed_var.set(int(values["seed"]))
             if "negative" in values:
@@ -831,7 +1453,8 @@ class GenerationPanel(tk.Frame):
         if values is None:
             return None
         values = dict(values)
-        values["positive_prompt"] = self.positive_prompt()
+        values["positive_prompt"] = self.prompt()
+        values["negative"] = self.negative_prompt()
         return values
 
     def apply_asset_settings(self, values):
@@ -863,6 +1486,13 @@ class GenerationPanel(tk.Frame):
         try:
             self._apply_model_preset(choice[0], choice[4], choice[1])
             self.seed_var.set(0)
+            self.prompt_mode_var.set(PROMPT_MODE_DEFAULT)
+            self.auto_generate_var.set(False)
+            self._set_weighted_rows([])
+            self._set_weighted_negative_rows([])
+            self._prompt_snapshot = None
+            self._negative_snapshot = None
+            self._apply_prompt_mode_ui(PROMPT_MODE_DEFAULT)
             self.negative_var.set("")
             self.feather_var.set(0.0)
             self.crop_region_var.set(False)
@@ -880,7 +1510,8 @@ class GenerationPanel(tk.Frame):
     def _watch_settings_fields(self):
         """Report the whole panel to ``on_settings`` as fields change."""
         for var in (
-            self.model_var, self.negative_var, self.steps_var, self.seed_var,
+            self.model_var, self.prompt_mode_var, self.auto_generate_var,
+            self.negative_var, self.steps_var, self.seed_var,
             self.cfg_var, self.denoise_var, self.sampler_var, self.scheduler_var,
             *self._sched_param_vars.values(),
             self.size.width_var, self.size.height_var, self.feather_var,
@@ -1168,7 +1799,7 @@ class GenerationPanel(tk.Frame):
                 "height": int(height),
                 "steps": self._number(self.steps_var, "Steps", int),
                 "seed": self._number(self.seed_var, "Seed", int),
-                "negative": self.negative_var.get(),
+                "negative": self.negative_prompt(),
                 "cfg": self._number(self.cfg_var, "CFG", float),
                 "denoise": self._number(self.denoise_var, "Denoise", float),
                 "sampler": self.sampler_var.get(),
@@ -1246,17 +1877,22 @@ class GenerationPanel(tk.Frame):
         self.preload_hint.config(text=text or PRELOAD_IDLE)
         theme.register(self.preload_hint, fg=token)
 
-    def set_busy(self, busy, cancellable=False):
+    def set_busy(self, busy, cancellable=False, generating=None):
         """Reflect the job queue state for this panel.
 
         Generate stays enabled while a job runs: pressing it again queues
         another job behind the current one. Cancel lights up only while this
         panel has a queued or running job to stop, and Stop & Keep only while a
         generation is running (it stops the sampler and keeps the image so far).
+        ``generating`` distinguishes a real generate job from a preload, so a
+        fast-mode slider release only replaces a run, never cancels a load.
         """
         state = tk.NORMAL if (busy and cancellable) else tk.DISABLED
         self.cancel_btn.config(state=state)
         self.keep_btn.config(state=state)
+        # Remember whether a generate job is live so a fast-mode slider release
+        # can replace it rather than queue a second run behind it.
+        self._has_generation_job = bool(busy if generating is None else generating)
 
     # ------------------------------------------------------------------ events
     def _random_seed(self):
@@ -1287,6 +1923,9 @@ class GenerationPanel(tk.Frame):
         widget.delete("1.0", "end")
         widget.insert("1.0", text)
         widget.edit_modified(False)
+        box = getattr(widget, "prompt_box", None)
+        if box is not None:
+            box.schedule_fit()
 
     def _set_canvas_size(self):
         if self._get_canvas_size is None:
@@ -1609,6 +2248,12 @@ class GenerationPanel(tk.Frame):
         """Flush a still-pending preset save when the panel is torn down."""
         if event.widget is not self:
             return
+        if self._regenerate_after is not None:
+            try:
+                self.after_cancel(self._regenerate_after)
+            except tk.TclError:
+                pass
+            self._regenerate_after = None
         if self._preset_save_after is not None:
             try:
                 self.after_cancel(self._preset_save_after)
@@ -1619,3 +2264,4 @@ class GenerationPanel(tk.Frame):
             key, values = self._preset_pending
             self._preset_pending = None
             engine_paths.save_model_preset(key, values)
+

@@ -394,12 +394,30 @@ class AutoScrollbar(ArrowScrollbar):
         self._managed = True
         self._shown = True
         self._pack_args = args
-        self._pack_kwargs = kwargs
+        self._pack_kwargs = dict(kwargs)
         self._sync()
 
     def set(self, first, last):
         super().set(first, last)
         self._sync()
+
+    def _next_sibling(self):
+        """The widget packed after this bar, so the bar can refill its slot.
+
+        A forgotten widget that is packed again lands at the end of the pack
+        order. Next to an expanding sibling (a text box or canvas) that leaves
+        it zero width, so the bar would reappear but stay invisible.
+        """
+        try:
+            slaves = self.master.tk.splitlist(
+                self.master.tk.call("pack", "slaves", self.master._w)
+            )
+        except tk.TclError:
+            return None
+        for index, slave in enumerate(slaves):
+            if slave == self._w and index + 1 < len(slaves):
+                return slaves[index + 1]
+        return None
 
     def _sync(self):
         if not self._managed:
@@ -408,7 +426,48 @@ class AutoScrollbar(ArrowScrollbar):
         if overflow == self._shown:
             return
         if overflow:
-            super().pack(*self._pack_args, **self._pack_kwargs)
+            kwargs = dict(self._pack_kwargs)
+            anchor = self._anchor()
+            if anchor:
+                kwargs["before"] = anchor
+            super().pack(*self._pack_args, **kwargs)
         else:
+            self._next = self._next_sibling()
             super().pack_forget()
         self._shown = overflow
+
+    def _anchor(self):
+        """The widget the bar must precede to get its width back.
+
+        The remembered next sibling is preferred. When the bar hid before its
+        expanding partner was packed there is none, so fall back to the first
+        expanding sibling: packing the bar before it reserves the bar's strip,
+        while packing it after would leave the bar with no width.
+        """
+        sibling = getattr(self, "_next", None)
+        if sibling and self._alive_sibling(sibling):
+            return sibling
+        try:
+            slaves = self.master.tk.splitlist(
+                self.master.tk.call("pack", "slaves", self.master._w)
+            )
+        except tk.TclError:
+            return None
+        for slave in slaves:
+            if slave == self._w:
+                continue
+            try:
+                if int(self.nametowidget(slave).pack_info().get("expand", 0)):
+                    return slave
+            except (tk.TclError, KeyError):
+                continue
+        return None
+
+    def _alive_sibling(self, path):
+        try:
+            slaves = self.master.tk.splitlist(
+                self.master.tk.call("pack", "slaves", self.master._w)
+            )
+        except tk.TclError:
+            return False
+        return path in slaves
