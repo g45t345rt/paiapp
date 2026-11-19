@@ -4,6 +4,7 @@ import datetime
 import io
 import os
 import queue
+import re
 import time
 import tkinter as tk
 from tkinter import filedialog
@@ -3823,16 +3824,43 @@ class PaintApp:
         self.render()
         self.set_result(f"Rasterized poses on '{layer.name}'.")
 
+    @staticmethod
+    def _numbered_copy_name(name, taken=()):
+        """A layer copy name numbered apart from the copies already present.
+
+        Legacy names ending in `` copy`` drop that suffix, so duplicating
+        ``Layer copy copy`` yields ``Layer copy 1`` instead of stacking another
+        suffix, and duplicating ``Layer copy 1`` yields ``Layer copy 2``.
+        """
+        stem = (name or "").strip()
+        legacy = re.compile(r"\s+copy(?:\s+\d+)?$", re.IGNORECASE)
+        while True:
+            trimmed = legacy.sub("", stem).rstrip()
+            if not trimmed or trimmed == stem:
+                break
+            stem = trimmed
+        stem = stem or "Layer"
+        existing = {(item or "").strip() for item in taken}
+        number = 1
+        candidate = f"{stem} copy {number}"
+        while candidate in existing:
+            number += 1
+            candidate = f"{stem} copy {number}"
+        return candidate
+
     def duplicate_layer(self):
         multi = self._multi_layer_selection()
         if multi is not None:
             self._push_undo("Duplicate layers")
             # Insert from the top down so lower indices stay valid; each copy
             # lands just above its source.
+            taken = {layer.name for layer in self.layers}
             copies = []
             for index in sorted(multi, reverse=True):
                 source = self.layers[index]
-                duplicate = source.copy(name=f"{source.name} copy")
+                duplicate = source.copy(
+                    name=self._numbered_copy_name(source.name, taken))
+                taken.add(duplicate.name)
                 self.layers.insert(index + 1, duplicate)
                 copies.append(duplicate)
             selected = sorted(self.layers.index(c) for c in copies)
@@ -3848,7 +3876,9 @@ class PaintApp:
             return
         source = self.layers[index]
         self._push_undo("Duplicate layer")
-        duplicate = source.copy(name=f"{source.name} copy")
+        taken = [layer.name for layer in self.layers]
+        duplicate = source.copy(
+            name=self._numbered_copy_name(source.name, taken))
         self.layers.insert(index + 1, duplicate)
         self.active = index + 1
         self._refresh_layer_list()
@@ -4773,7 +4803,13 @@ class PaintApp:
         # order so the copies stack the same way as their sources.
         base = target.active + 1 if target.layers else 0
         base = max(0, min(base, len(target.layers)))
-        copies = [layer.copy(name=f"{layer.name} copy") for layer in layers]
+        taken = {layer.name for layer in target.layers}
+        copies = []
+        for layer in layers:
+            duplicate = layer.copy(
+                name=self._numbered_copy_name(layer.name, taken))
+            taken.add(duplicate.name)
+            copies.append(duplicate)
 
         def _undo_copy():
             for layer in reversed(copies):
@@ -5239,10 +5275,14 @@ class PaintApp:
         self._push_undo("Duplicate group")
         name = f"{group.name} copy"
         if members:
-            copies = [
-                self.layers[index].copy(name=f"{self.layers[index].name} copy")
-                for index in members
-            ]
+            taken = {layer.name for layer in self.layers}
+            copies = []
+            for index in members:
+                layer = self.layers[index]
+                duplicate = layer.copy(
+                    name=self._numbered_copy_name(layer.name, taken))
+                taken.add(duplicate.name)
+                copies.append(duplicate)
             insert_at = members[-1] + 1
             self.layers[insert_at:insert_at] = copies
             duplicate = self.current.new_group(name, copies)
@@ -7189,10 +7229,13 @@ class PaintApp:
         base = canvas.active + 1 if canvas.layers else 0
         base = max(0, min(base, len(canvas.layers)))
         self._push_undo("Paste layers")
-        copies = [
-            template.copy(name=f"{template.name} copy")
-            for template in self._layer_clipboard
-        ]
+        taken = {layer.name for layer in canvas.layers}
+        copies = []
+        for template in self._layer_clipboard:
+            duplicate = template.copy(
+                name=self._numbered_copy_name(template.name, taken))
+            taken.add(duplicate.name)
+            copies.append(duplicate)
         for offset, layer in enumerate(copies):
             # insert_layer keeps the group only when it belongs to this canvas,
             # so a same-canvas paste stays grouped while a cross-canvas paste
