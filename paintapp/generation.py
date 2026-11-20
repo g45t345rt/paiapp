@@ -28,6 +28,31 @@ def _escape_prompt_segment(text):
     return text.replace("(", "\\(").replace(")", "\\)")
 
 
+def _unescape_prompt_segment(text):
+    """Undo the prompt escaping when a segment moves into a keyword row.
+
+    The classic box stores literal parentheses escaped as ``\\(`` and ``\\)``.
+    The rows hold the raw text (and escape it again when compiled), so leaving
+    the backslashes in place made every Default/Keywords switch add another
+    backslash.
+    """
+    out = []
+    escaped = False
+    for char in text:
+        if escaped:
+            if char not in "()\\":
+                out.append("\\")
+            out.append(char)
+            escaped = False
+        elif char == "\\":
+            escaped = True
+        else:
+            out.append(char)
+    if escaped:
+        out.append("\\")
+    return "".join(out)
+
+
 # A classic prompt segment already written as ``(text:weight)``; moving to the
 # weighted mode pulls that weight onto the row's slider instead of leaving the
 # whole thing as literal text.
@@ -1092,33 +1117,39 @@ class GenerationPanel(tk.Frame):
                 and self._compile_weighted_rows(rows) == (text or "").strip()):
             return
         self._clear_weighted_rows(rows)
-        area.refresh()
         for part in (text or "").split(","):
             part = part.strip()
             if not part:
                 continue
             match = _WEIGHTED_SEGMENT.match(part)
             if match:
-                add(match.group(1), float(match.group(2)))
+                add(_unescape_prompt_segment(match.group(1)),
+                    float(match.group(2)), scroll=False)
             else:
-                add(part)
+                add(_unescape_prompt_segment(part), scroll=False)
+        # Build the whole list first, then measure and scroll once. Calling
+        # ``see_bottom`` per row made a layer/canvas switch reflow the list (and
+        # flicker its scrollbar) once for every keyword.
+        area.refresh()
+        area.canvas.yview_moveto(1.0)
         setattr(self, snapshot, text)
 
-    def _add_weighted_row(self, text="", weight=1.0):
+    def _add_weighted_row(self, text="", weight=1.0, scroll=True):
         """Append one positive prompt row."""
         return self._add_weighted_row_to(
             self._weighted_rows, self.weighted_list,
-            self._on_weighted_text_change, text, weight,
+            self._on_weighted_text_change, text, weight, scroll,
         )
 
-    def _add_weighted_negative_row(self, text="", weight=1.0):
+    def _add_weighted_negative_row(self, text="", weight=1.0, scroll=True):
         """Append one negative prompt row."""
         return self._add_weighted_row_to(
             self._weighted_negative_rows, self.negative_list,
-            self._on_weighted_settings_change, text, weight,
+            self._on_weighted_settings_change, text, weight, scroll,
         )
 
-    def _add_weighted_row_to(self, rows, area, on_change, text="", weight=1.0):
+    def _add_weighted_row_to(self, rows, area, on_change, text="", weight=1.0,
+                             scroll=True):
         """Append one prompt box with its weight slider to ``rows``/``area``."""
         row = tk.Frame(area.inner)
         row.pack(fill=tk.X, pady=(2, 0))
@@ -1152,7 +1183,8 @@ class GenerationPanel(tk.Frame):
         entry.bind("<Return>", lambda _e: self._fast_regenerate())
         theme.restyle(row)
         area._bind_wheel(row)
-        area.see_bottom()
+        if scroll:
+            area.see_bottom()
         return data
 
     def _remove_weighted_row(self, data):
@@ -1173,23 +1205,51 @@ class GenerationPanel(tk.Frame):
             data["frame"].destroy()
         rows.clear()
 
+    @staticmethod
+    def _stored_weighted_rows(rows):
+        """Normalise stored ``{text, weight}`` entries for comparison."""
+        values = []
+        for item in rows or []:
+            if not isinstance(item, dict):
+                continue
+            text = str(item.get("text", "")).strip()
+            if not text:
+                continue
+            try:
+                weight = float(item.get("weight", 1.0))
+            except (TypeError, ValueError):
+                weight = 1.0
+            values.append({"text": text, "weight": weight})
+        return values
+
     def _set_weighted_rows(self, rows):
         """Replace the positive rows with stored ``{text, weight}`` entries."""
+        # A canvas/layer switch often reloads settings that are already shown.
+        # Rebuilding identical rows destroys and recreates every widget, which
+        # makes the list flicker and its scrollbar jump, so keep them instead.
+        if self._stored_weighted_rows(rows) == self._weighted_row_values(
+                self._weighted_rows):
+            return
         self._clear_weighted_rows(self._weighted_rows)
         for item in rows or []:
             if isinstance(item, dict):
                 self._add_weighted_row(
-                    str(item.get("text", "")), item.get("weight", 1.0)
+                    str(item.get("text", "")), item.get("weight", 1.0),
+                    scroll=False,
                 )
         self.weighted_list.refresh()
 
     def _set_weighted_negative_rows(self, rows):
         """Replace the negative rows with stored ``{text, weight}`` entries."""
+        if self._stored_weighted_rows(rows) == self._weighted_row_values(
+                self._weighted_negative_rows):
+            return
         self._clear_weighted_rows(self._weighted_negative_rows)
         for item in rows or []:
             if isinstance(item, dict):
                 self._add_weighted_negative_row(
-                    str(item.get("text", "")), item.get("weight", 1.0)
+                    str(item.get("text", "")), item.get("weight", 1.0),
+                    scroll=False,
                 )
         self.negative_list.refresh()
 
@@ -1437,7 +1497,13 @@ class GenerationPanel(tk.Frame):
                     self._set_weighted_negative_rows(values.get("weighted_negative"))
                 if "auto_generate" in values:
                     self.auto_generate_var.set(bool(values["auto_generate"]))
-                self._prompt_snapshot = None
+                # Seed the snapshot from the rows we just loaded so a following
+                # ``load_prompt`` with the same text keeps them instead of
+                # rebuilding every row on each layer/canvas switch.
+                if mode == PROMPT_MODE_KEYWORDS:
+                    self._prompt_snapshot = self.weighted_prompt()
+                else:
+                    self._prompt_snapshot = None
                 self._negative_snapshot = None
                 self._apply_prompt_mode_ui(mode)
             if "seed" in values:

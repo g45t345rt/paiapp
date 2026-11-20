@@ -161,6 +161,98 @@ def test_layer_switch_refreshes_keywords():
         root.destroy()
 
 
+def test_switching_modes_does_not_accumulate_escapes():
+    """Escaped parentheses must survive repeated Default/Keywords switches."""
+    try:
+        root, panel = _build_panel()
+    except Exception as exc:
+        SKIPPED.append(f"escape round-trip test skipped: {exc}")
+        return
+    try:
+        from paintapp.generation import PROMPT_MODE_DEFAULT, PROMPT_MODE_KEYWORDS
+
+        original = r"(red \(hat\):2), smile"
+        panel.set_prompt(original)
+        for index in range(3):
+            panel.prompt_mode_var.set(PROMPT_MODE_KEYWORDS)
+            root.update()
+            check(f"weighted row is unescaped {index}",
+                  [row["text"] for row in panel.weighted_rows()],
+                  ["red (hat)", "smile"])
+            panel.prompt_mode_var.set(PROMPT_MODE_DEFAULT)
+            root.update()
+            check(f"switch back does not add backslashes {index}",
+                  panel.positive_prompt(), original)
+
+        plain = r"red \(hat\)"
+        panel.set_prompt(plain)
+        for index in range(3):
+            panel.prompt_mode_var.set(PROMPT_MODE_KEYWORDS)
+            root.update()
+            check(f"plain row is unescaped {index}",
+                  [row["text"] for row in panel.weighted_rows()],
+                  ["red (hat)"])
+            panel.prompt_mode_var.set(PROMPT_MODE_DEFAULT)
+            root.update()
+            check(f"plain switch back stays stable {index}",
+                  panel.positive_prompt(), plain)
+    finally:
+        root.destroy()
+
+
+def test_unchanged_settings_do_not_rebuild_rows():
+    """Re-loading the same canvas/layer settings keeps the row widgets."""
+    try:
+        root, panel = _build_panel()
+    except Exception as exc:
+        SKIPPED.append(f"unchanged settings test skipped: {exc}")
+        return
+    try:
+        from paintapp.generation import PROMPT_MODE_KEYWORDS
+
+        stored = {
+            "prompt_mode": PROMPT_MODE_KEYWORDS,
+            "weighted_prompt": [
+                {"text": "cat", "weight": 1.0},
+                {"text": "fur", "weight": 2.0},
+                {"text": "hidden", "weight": 0.0},
+            ],
+            "weighted_negative": [{"text": "blurry", "weight": 1.0}],
+        }
+        panel.set_settings(stored)
+        root.update()
+        frames = [row["frame"] for row in panel._weighted_rows]
+        negative_frames = [row["frame"] for row in panel._weighted_negative_rows]
+        check("first load shows rows", len(frames), 3)
+
+        panel.set_settings(stored)
+        root.update()
+        check("same settings keep positive rows", [
+            row["frame"] for row in panel._weighted_rows], frames)
+        check("same settings keep negative rows", [
+            row["frame"] for row in panel._weighted_negative_rows],
+              negative_frames)
+
+        panel.load_prompt(panel.weighted_prompt())
+        root.update()
+        check("same prompt keeps rows", [
+            row["frame"] for row in panel._weighted_rows], frames)
+
+        changed = dict(stored)
+        changed["weighted_prompt"] = [
+            {"text": "dog", "weight": 1.0},
+            {"text": "tail", "weight": 1.0},
+        ]
+        panel.set_settings(changed)
+        root.update()
+        check("changed settings replace rows", [
+            row["text"] for row in panel.weighted_rows()], ["dog", "tail"])
+        check("changed settings rebuild widgets",
+              [row["frame"] for row in panel._weighted_rows] != frames, True)
+    finally:
+        root.destroy()
+
+
 def test_negative_keyword_prompt():
     try:
         root, panel = _build_panel()
@@ -402,6 +494,8 @@ def test_seed_input_auto_generates():
 def main():
     test_keyword_prompt()
     test_layer_switch_refreshes_keywords()
+    test_switching_modes_does_not_accumulate_escapes()
+    test_unchanged_settings_do_not_rebuild_rows()
     test_negative_keyword_prompt()
     test_modes_stay_in_sync()
     test_existing_weights_survive_the_switch()
