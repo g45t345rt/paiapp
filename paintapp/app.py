@@ -3674,9 +3674,9 @@ class PaintApp:
         if not hasattr(self, "gen"):
             return
         if self.current is None:
-            self.gen.set_prompt("")
+            self.gen.load_prompt("")
             return
-        self.gen.set_prompt(
+        self.gen.load_prompt(
             getattr(self.active_layer(), "positive_prompt", "")
         )
 
@@ -3698,12 +3698,21 @@ class PaintApp:
             return
         layer = self.active_layer()
         stored = None
+        layer_stored = False
         if layer is not None and getattr(layer, "gen_settings", None):
             stored = layer.gen_settings
+            layer_stored = True
         elif getattr(self.current, "gen_settings", None):
             stored = self.current.gen_settings
         if stored:
             self.gen.set_settings(stored)
+            # The canvas is only a fallback for a layer with no settings of its
+            # own, and the positive prompt always belongs to the layer. Do not
+            # let the canvas's last Keywords rows replace the selected layer's
+            # prompt (which would then be reported back onto it).
+            if layer is not None and (
+                    not layer_stored or "weighted_prompt" not in stored):
+                self.gen.load_prompt(getattr(layer, "positive_prompt", ""))
         else:
             self.gen.reset_to_model_defaults()
             self._sync_gen_size()

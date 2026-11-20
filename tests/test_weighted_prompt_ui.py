@@ -111,6 +111,56 @@ def test_keyword_prompt():
         root.destroy()
 
 
+def test_layer_switch_refreshes_keywords():
+    """A layer/canvas switch must not push the previous layer's rows back."""
+    try:
+        root, panel = _build_panel()
+    except Exception as exc:
+        SKIPPED.append(f"layer switch test skipped: {exc}")
+        return
+    try:
+        from paintapp.generation import PROMPT_MODE_DEFAULT, PROMPT_MODE_KEYWORDS
+
+        panel.load_prompt("cat, fur")
+        panel.prompt_mode_var.set(PROMPT_MODE_KEYWORDS)
+        root.update()
+        panel._weighted_rows[0]["weight_var"].set(2.0)
+        check("layer A keywords", panel.prompt(), "(cat:2), fur")
+
+        # Selecting layer B runs the app's prompt sync while Keywords is active.
+        panel.load_prompt("dog")
+        root.update()
+        check("switch updates rows", [row["text"] for row in
+                                      panel.weighted_rows()], ["dog"])
+
+        panel.prompt_mode_var.set(PROMPT_MODE_DEFAULT)
+        root.update()
+        check("switch keeps layer B prompt", panel.positive_prompt(), "dog")
+
+        # Switching in Default mode also refreshes the rows, even though the
+        # snapshot already holds the new text.
+        panel.load_prompt("bird")
+        panel.prompt_mode_var.set(PROMPT_MODE_KEYWORDS)
+        root.update()
+        check("default switch rebuilds rows", [row["text"] for row in
+                                               panel.weighted_rows()], ["bird"])
+        panel.prompt_mode_var.set(PROMPT_MODE_DEFAULT)
+        root.update()
+        check("default switch keeps prompt", panel.positive_prompt(), "bird")
+
+        # Equal compiled prompts keep their exact rows, including disabled ones.
+        panel.prompt_mode_var.set(PROMPT_MODE_KEYWORDS)
+        root.update()
+        panel._add_weighted_row("hidden", 0.0)
+        check("disabled row omitted", panel.prompt(), "bird")
+        panel.load_prompt("bird")
+        root.update()
+        check("same prompt keeps disabled row",
+              [row["text"] for row in panel.weighted_rows()], ["bird", "hidden"])
+    finally:
+        root.destroy()
+
+
 def test_negative_keyword_prompt():
     try:
         root, panel = _build_panel()
@@ -351,6 +401,7 @@ def test_seed_input_auto_generates():
 
 def main():
     test_keyword_prompt()
+    test_layer_switch_refreshes_keywords()
     test_negative_keyword_prompt()
     test_modes_stay_in_sync()
     test_existing_weights_survive_the_switch()

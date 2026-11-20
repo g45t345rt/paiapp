@@ -1088,7 +1088,8 @@ class GenerationPanel(tk.Frame):
         Default before switching again, the rows are rebuilt from it so the two
         modes cannot diverge.
         """
-        if rows and getattr(self, snapshot) == text:
+        if (rows and getattr(self, snapshot) == text
+                and self._compile_weighted_rows(rows) == (text or "").strip()):
             return
         self._clear_weighted_rows(rows)
         area.refresh()
@@ -1322,6 +1323,32 @@ class GenerationPanel(tk.Frame):
         """Load the active layer's positive prompt without echoing a change."""
         self._set_prompt_text(self.positive_prompt_text, text or "")
 
+    def load_prompt(self, text):
+        """Show a layer's positive prompt in whichever mode is active.
+
+        Layer and canvas switches restore the classic box only through
+        :meth:`set_prompt`; while Keywords is active the rows are the source of
+        truth, so they must be rebuilt too. Otherwise switching back to Default
+        would compile the previous layer's rows into the box (and report them
+        back onto the newly selected layer), losing that layer's own prompt.
+        Rows that already compile to the same prompt are kept, preserving exact
+        weights and weight-0 disabled rows.
+        """
+        text = text or ""
+        self.set_prompt(text)
+        if self.prompt_mode() != PROMPT_MODE_KEYWORDS:
+            self._prompt_snapshot = text
+            return
+        was_loading = self._loading
+        self._loading = True
+        try:
+            self._sync_keywords_from_text(
+                text, self._weighted_rows, self.weighted_list,
+                self._add_weighted_row, "_prompt_snapshot",
+            )
+        finally:
+            self._loading = was_loading
+
     def _set_prompt_text(self, widget, text):
         if widget.get("1.0", "end-1c") == text:
             return
@@ -1469,7 +1496,9 @@ class GenerationPanel(tk.Frame):
             return
         self.set_settings(values)
         if "positive_prompt" in values:
-            self.set_prompt(values.get("positive_prompt", self.positive_prompt()))
+            self.load_prompt(
+                values.get("positive_prompt", self.positive_prompt())
+            )
 
     def reset_to_model_defaults(self):
         """Reset the panel to the selected model's defaults.
