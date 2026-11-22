@@ -1414,7 +1414,9 @@ class PaintApp:
             return
         source = self.canvases[index]
         self.canvas_counter += 1
-        duplicate = source.copy(name=f"{source.name} copy")
+        taken = [canvas.name for canvas in self.canvases]
+        duplicate = source.copy(
+            name=self._numbered_copy_name(source.name, taken, fallback="Canvas"))
         insert_at = index + 1
         self.canvases.insert(insert_at, duplicate)
         self.area.add(duplicate)
@@ -3834,12 +3836,13 @@ class PaintApp:
         self.set_result(f"Rasterized poses on '{layer.name}'.")
 
     @staticmethod
-    def _numbered_copy_name(name, taken=()):
-        """A layer copy name numbered apart from the copies already present.
+    def _numbered_copy_name(name, taken=(), fallback="Layer"):
+        """A copy name numbered apart from the copies already present.
 
         Legacy names ending in `` copy`` drop that suffix, so duplicating
         ``Layer copy copy`` yields ``Layer copy 1`` instead of stacking another
         suffix, and duplicating ``Layer copy 1`` yields ``Layer copy 2``.
+        ``fallback`` names unnamed items, e.g. ``Canvas`` for canvas copies.
         """
         stem = (name or "").strip()
         legacy = re.compile(r"\s+copy(?:\s+\d+)?$", re.IGNORECASE)
@@ -3848,7 +3851,7 @@ class PaintApp:
             if not trimmed or trimmed == stem:
                 break
             stem = trimmed
-        stem = stem or "Layer"
+        stem = stem or fallback
         existing = {(item or "").strip() for item in taken}
         number = 1
         candidate = f"{stem} copy {number}"
