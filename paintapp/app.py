@@ -6650,19 +6650,7 @@ class PaintApp:
                 self.render()
         tools = self.tools
         if enabled:
-            tools.eyedropper = tools.eraser = False
-            tools.fill_tool = False
-            tools.select_tool = False
-            tools.path_tool = False
-            tools.vector_tool = False
-            tools.liquify_tool = False
-            tools.warp_tool = False
-            tools.puppet_tool = False
-            tools.paste_tool = False
-            tools.arrow_tool = False
-            tools.move_tool = tools.drag_tool = tools.transform_tool = False
-            tools.text_tool = False
-            tools.brush_tool = False
+            tools.activate_only("mask")
         if enabled:
             tools.inpaint_mask_edit = False
             if hasattr(self, "gen"):
@@ -6702,24 +6690,12 @@ class PaintApp:
         enabled = bool(enabled) and self.current is not None
         tools = self.tools
         if enabled:
-            tools.eyedropper = tools.eraser = False
-            tools.fill_tool = False
-            tools.select_tool = False
-            tools.path_tool = False
-            tools.vector_tool = False
-            tools.liquify_tool = False
-            tools.warp_tool = False
-            tools.puppet_tool = False
-            tools.paste_tool = False
-            tools.arrow_tool = False
-            tools.move_tool = tools.drag_tool = tools.transform_tool = False
-            tools.text_tool = False
-            tools.brush_tool = False
-            tools.mask_edit = False
+            entering = not tools.inpaint_mask_edit
+            tools.activate_only("inpaint_mask")
             self.current.inpaint_mask_surface()
             # Inpaint semantics are reversed from a layer mask (255 = regenerate),
             # so paint the marked value by default and restore it on exit.
-            if not tools.inpaint_mask_edit:
+            if entering:
                 self._mask_value_before_inpaint = tools.mask_value
                 tools.mask_value = 255
         tools.inpaint_mask_edit = enabled

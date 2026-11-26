@@ -749,6 +749,18 @@ class ToolsPanel(tk.Frame):
     def _any_tool_active(self):
         return any(getattr(self, flag) for flag in self.TOOL_FLAGS.values())
 
+    def activate_only(self, key):
+        """Make ``key`` the sole active tool, without syncing or callbacks.
+
+        Mask editing and inpaint-mask painting set their own extra state and
+        call :meth:`_sync_buttons` themselves, so they clear every other tool
+        here instead of re-entering :meth:`select`. Iterating the full flag
+        table keeps a newly added tool from surviving the switch.
+        """
+        keep = self.TOOL_FLAGS[key]
+        for flag in self.TOOL_FLAGS.values():
+            setattr(self, flag, flag == keep)
+
     def select(self, key):
         """Make ``key`` the active tool; deactivating a tool selects brush."""
         if key == "mask":
