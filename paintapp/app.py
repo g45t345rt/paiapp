@@ -4544,6 +4544,10 @@ class PaintApp:
         that group; dropping it on a root layer takes it out of any group it was
         in, so a layer can be dragged into and out of a group directly. A
         dragged group moves with all of its members, so they stay adjacent.
+
+        The Layers panel keeps a multi-row selection alive while it drags one
+        of its rows, so when several layers are selected this moves every
+        selected layer block together (see :meth:`_reorder_selected_layers`).
         """
         doc = self.current
         if doc is None or not doc.layers:
@@ -4552,6 +4556,10 @@ class PaintApp:
             self._reorder_group_block(source[1], target, above)
             return
         if source[0] != "layer":
+            return
+        multi = self._multi_layer_selection()
+        if multi is not None and source[1] in multi:
+            self._reorder_selected_layers(target, above)
             return
         layers = doc.layers
         source_index = source[1]
@@ -4598,6 +4606,101 @@ class PaintApp:
         self._refresh_layer_list()
         self.render()
         self.set_result(f"Moved '{layer.name}' in the layer stack.")
+
+    def _reorder_selected_layers(self, target, above):
+        """Move every selected layer block beside the ``target`` block.
+
+        The Layers panel keeps a multi-row selection alive while a drag starts
+        from one of its rows (see :meth:`LayerPanel._on_press`), so the drop
+        carries the whole selection. Group runs move as units, matching the
+        up/down moves (see :meth:`_move_blocks`), and bare layers join the
+        target's group or leave their own exactly as a single dragged layer
+        would. Blocks keep their relative order, and a drop on a selected block
+        is a no-op because the rows are already moving.
+        """
+        doc = self.current
+        layers = doc.layers
+        indices = set(self._multi_layer_selection() or ())
+        groups = set(self.layer_panel.selected_groups())
+        blocks = self._layer_blocks()
+        chosen = [
+            (block_group is not None and block_group in groups)
+            or any(index in indices for index in block_indices)
+            for block_group, block_indices in blocks
+        ]
+
+        def _slot_of(entries, row):
+            if row[0] == "group":
+                return next(
+                    (slot for slot, (block_group, _i) in enumerate(entries)
+                     if block_group is row[1]), None,
+                )
+            if row[0] == "layer":
+                return next(
+                    (slot for slot, (_group, block_indices) in enumerate(entries)
+                     if row[1] in block_indices), None,
+                )
+            return None
+
+        target_slot = _slot_of(blocks, target)
+        if target_slot is not None and chosen[target_slot]:
+            return
+        if target[0] == "group":
+            target_group = target[1]
+        elif target[0] == "layer" and 0 <= target[1] < len(layers):
+            target_group = getattr(layers[target[1]], "group", None)
+        else:
+            return
+        moved = [block for block, flag in zip(blocks, chosen) if flag]
+        if not moved:
+            return
+        remaining = [block for block, flag in zip(blocks, chosen) if not flag]
+        insert_at = _slot_of(remaining, target)
+        if insert_at is None:
+            if target_group is None:
+                return
+            # An empty group has no members to sit next to, so the moved layers
+            # land at the top of the stack, where the empty header shows.
+            insert_at = len(remaining)
+        elif above:
+            insert_at += 1
+        # Bare layers take the target's group (or leave theirs for a root
+        # target); a dragged group keeps its own members.
+        assignments = []
+        for block_group, block_indices in moved:
+            if block_group is None:
+                assignments.extend(
+                    (index, target_group) for index in block_indices
+                )
+        ordered = []
+        for _block_group, block_indices in remaining[:insert_at]:
+            ordered.extend(layers[index] for index in block_indices)
+        for _block_group, block_indices in moved:
+            ordered.extend(layers[index] for index in block_indices)
+        for _block_group, block_indices in remaining[insert_at:]:
+            ordered.extend(layers[index] for index in block_indices)
+        changed = ordered != layers or any(
+            layers[index].group is not group for index, group in assignments
+        )
+        if not changed:
+            return
+        selected_layers = [layers[index] for index in sorted(indices)]
+        active_layer = layers[self.active]
+        self._push_undo("Reorder layers")
+        for index, group in assignments:
+            layers[index].group = group
+        doc.layers = ordered
+        doc.normalize_groups()
+        self._clear_row_selections()
+        if active_layer in doc.layers:
+            self.active = doc.layers.index(active_layer)
+        new_selected = sorted(
+            doc.layers.index(layer) for layer in selected_layers
+            if layer in doc.layers
+        )
+        self._refresh_layer_list(new_selected or None)
+        self.render()
+        self.set_result(f"Moved {len(indices)} layers in the layer stack.")
 
     def _reorder_group_block(self, group, target, above):
         """Move the block of layers in ``group`` beside the ``target`` block.

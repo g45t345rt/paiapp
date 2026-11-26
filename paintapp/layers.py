@@ -95,6 +95,14 @@ INDENT = 16
 # wobbles a little still just selects.
 DRAG_SLOP = 6
 
+# Reorder drags that reach the list's top or bottom edge scroll it a few pixels
+# at this interval, so a layer can be dropped onto rows that are currently out of
+# view. The margin is how close to the edge the pointer must be for the
+# scrolling to start.
+AUTOSCROLL_EDGE = 24
+AUTOSCROLL_STEP = 20
+AUTOSCROLL_INTERVAL = 50
+
 # Longest edge of the reorder drag ghost, in pixels: a little larger than a row's
 # thumbnail so the carried layer reads as something held, not as a second row.
 GHOST = 44
@@ -270,7 +278,14 @@ class LayerPanel(tk.Frame):
     coordinator can apply the move. ``source`` and ``target`` are row
     descriptors (``("layer", index)`` or ``("group", group)``), so dropping a
     layer on a group's header or between its members adds it to that group, and
-    a dragged group moves with all of its members.
+    a dragged group moves with all of its members. Pressing a layer row that is
+    already part of a multi-layer selection and dragging it carries the whole
+    selection, so several layers can be reordered in one gesture; the
+    coordinator reads the panel's selection to apply that move. Resting the drag
+    near the list's top or bottom edge scrolls the list, so rows outside the
+    visible range can still be reached. While the list holds keyboard focus, F2
+    renames the current row, Ctrl+A selects every listed layer, and
+    Ctrl+Up/Ctrl+Down move the selected row through the stack.
 
     Previewing a layer costs a full-resolution downscale (milliseconds per
     megapixel), so each row's preview is cached against the layer's pixel
@@ -459,11 +474,18 @@ class LayerPanel(tk.Frame):
         self._selected_group_filter = None
         self._mask_layer = None
         # Reorder-drag state: the press that may become a drag, the row being
-        # dragged once it has, its ghost window and the insertion marker.
+        # dragged once it has, every row the drag carries (the pressed row plus
+        # any other selected rows), its ghost window and the insertion marker.
         self._press = None
         self._drag_row = None
+        self._drag_rows = None
         self._ghost = None
         self._drop_line = None
+        # Auto-scroll state: the pending ``after`` job, its direction (-1 up,
+        # 1 down) and the pointer position its ticks re-read for the drop.
+        self._autoscroll_job = None
+        self._autoscroll_dir = 0
+        self._autoscroll_pos = None
         self._build()
         self.bind("<Destroy>", self._on_destroy)
         theme.subscribe(self._on_theme)
@@ -491,6 +513,14 @@ class LayerPanel(tk.Frame):
         self.canvas.bind("<Button-1>", self._on_canvas_press)
         self.canvas.bind("<Up>", lambda _e: self._on_arrow(-1))
         self.canvas.bind("<Down>", lambda _e: self._on_arrow(1))
+        # List-scoped editing keys, mirroring the Assets panel: F2 renames the
+        # current row, Ctrl+A selects every layer row, and Ctrl+Up/Ctrl+Down
+        # move the selected row through the stack. They live on the canvas, so
+        # a focused text field keeps Ctrl+A and the arrows for itself.
+        self.canvas.bind("<F2>", self._on_rename_key)
+        self.canvas.bind("<Control-a>", self._on_select_all)
+        self.canvas.bind("<Control-Up>", lambda _e: self._on_move_key(1))
+        self.canvas.bind("<Control-Down>", lambda _e: self._on_move_key(-1))
         self.inner = tk.Frame(self.canvas, bg=theme.color("listbox_bg"))
         self._window = self.canvas.create_window(
             (0, 0), window=self.inner, anchor="nw"
@@ -652,6 +682,8 @@ class LayerPanel(tk.Frame):
         # press/ghost/marker state rather than leave it dangling.
         self._press = None
         self._drag_row = None
+        self._drag_rows = None
+        self._stop_autoscroll()
         self._end_ghost()
         self._drop_line = None
         self._layers = layers
@@ -1782,7 +1814,9 @@ class LayerPanel(tk.Frame):
         Used when the active layer is changed from outside the panel (for
         example by clicking a tile in the exploded view), so the list's
         selection follows the active layer without a full rebuild and without
-        re-firing the select callback that would bounce back to the caller.
+        re-firing the select callback that would bounce back to the caller. The
+        row is scrolled into view, so a viewport click also brings its entry
+        into the visible part of the list.
         """
         row = None
         for candidate, entry in enumerate(self._rows):
@@ -1802,6 +1836,10 @@ class LayerPanel(tk.Frame):
         self._selected_group_filter = None
         self._apply_selection_colors()
         self._sync_button_state()
+        # Bring the row on screen too: the selection can come from a click in
+        # the viewport (the Arrow tool or an exploded-view tile), where the
+        # layer list may be scrolled away from the layer the user just picked.
+        self.reveal_row(row)
 
     def step_layer(self, delta):
         """The layer index ``delta`` visible rows from the selected layer.
@@ -2067,6 +2105,45 @@ class LayerPanel(tk.Frame):
                 break
         return "break"
 
+    def _on_move_key(self, delta):
+        """Move the selected row through the stack with Ctrl+Up/Ctrl+Down.
+
+        Ctrl+Up moves toward the top of the stack, matching the Move up button,
+        and Ctrl+Down toward the bottom. The same handler as the buttons runs,
+        so filters, text, paths, vectors and groups keep their established
+        ordering rules, and a multi-layer selection moves as one block set.
+        """
+        self._handle_move(delta)
+        return "break"
+
+    def _on_select_all(self, _event=None):
+        """Select every layer row currently listed (Ctrl+A).
+
+        Mirrors the Assets panel's list-scoped select-all. Only layer rows are
+        selected, so the multi-layer actions (delete, duplicate, merge, move,
+        drag) see a clean layer set instead of filter, text or group rows. The
+        active layer stays the primary row when it is listed; otherwise the
+        topmost selected layer becomes primary.
+        """
+        rows = [
+            row for row, entry in enumerate(self._rows)
+            if entry[0] == "layer"
+        ]
+        if not rows:
+            return "break"
+        target = next(
+            (row for row in rows if self._rows[row][1] == self._active),
+            rows[0],
+        )
+        self._anchor = target
+        self._select_rows(rows, target)
+        return "break"
+
+    def _on_rename_key(self, _event=None):
+        """Rename the current row with F2, as the Assets panel does."""
+        self._handle_rename()
+        return "break"
+
     # ------------------------------------------------------------------ events
     def _row_for(self, event):
         """The current row index of the widget that raised ``event``.
@@ -2098,19 +2175,27 @@ class LayerPanel(tk.Frame):
             self._fit_row_label(event, row)
 
     def _on_press(self, event, row):
-        """A click on a row: plain selects it, Ctrl toggles, Shift extends."""
+        """A click on a row: plain selects it, Ctrl toggles, Shift extends.
+
+        A plain press on a row that is already part of a multi-row selection
+        keeps the selection so a following drag can carry it; if no drag
+        follows, the release collapses the selection to that row.
+        """
         if not (0 <= row < len(self._rows)):
             return
         # The click also hands the list keyboard focus so the arrow keys walk it
         # (see :meth:`_on_arrow`).
         self.focus_list()
+        self._stop_autoscroll()
         # Remember the press so a following drag on the row can become a reorder
         # (see :meth:`_on_motion`); cleared by the drag, a double click or a
         # right click so neither starts one.
         self._press = {
             "row": row, "x_root": event.x_root, "y_root": event.y_root,
+            "collapse": False,
         }
         self._drag_row = None
+        self._drag_rows = None
         ctrl = bool(event.state & 0x0004)
         shift = bool(event.state & 0x0001)
         if ctrl:
@@ -2129,6 +2214,16 @@ class LayerPanel(tk.Frame):
         if shift and self._anchor is not None:
             low, high = sorted((self._anchor, row))
             self._select_rows(range(low, high + 1), row)
+            return
+        # Pressing a row that is already part of a multi-row selection keeps the
+        # whole selection so a following drag can carry every selected row; a
+        # click without a drag collapses back to that one row on release. This
+        # mirrors the Assets panel, where the same press rule makes a multi-asset
+        # drag possible.
+        if row in self._selected and len(self._selected) > 1:
+            self._press["collapse"] = True
+            self._anchor = row
+            self._dispatch(row)
             return
         self._anchor = row
         self._select_rows([row], row)
@@ -2226,6 +2321,7 @@ class LayerPanel(tk.Frame):
         # A double click is not a drag; forget the press that started it.
         self._press = None
         self._drag_row = None
+        self._drag_rows = None
         self._anchor = row
         self._select_rows([row], row)
         entry = self._rows[row]
@@ -2317,6 +2413,9 @@ class LayerPanel(tk.Frame):
                 # app, which would re-enter this method through a canvas sync.
                 self._apply_selection_colors()
                 self._sync_button_state()
+                # A vector object picked in the viewport should bring its row
+                # into view, like a layer picked there (see :meth:`select_layer`).
+                self.reveal_row(row)
                 return True
         return False
 
@@ -3078,6 +3177,7 @@ class LayerPanel(tk.Frame):
         """Right-click: target the row under the pointer, then list actions."""
         self._press = None
         self._drag_row = None
+        self._drag_rows = None
         if 0 <= row < len(self._rows):
             if row not in self._selected:
                 self._anchor = row
@@ -3088,16 +3188,42 @@ class LayerPanel(tk.Frame):
         return "break"
 
     # ----------------------------------------------------------- reorder drag
+    def _reorder_sources(self, row):
+        """The rows a drag that starts on ``row`` carries.
+
+        A press on a layer row inside a multi-layer selection drags the whole
+        selection, so several layers (plus any selected group headers) can be
+        reordered in one gesture. The press must be on a layer row and at least
+        two layers must be selected, matching the coordinator's multi-layer
+        reorder path; every other press carries just its own row.
+        """
+        entry = self._rows[row]
+        if entry[0] == "layer" and row in self._selected:
+            layer_rows = [
+                candidate for candidate in self._selected
+                if 0 <= candidate < len(self._rows)
+                and self._rows[candidate][0] == "layer"
+            ]
+            if len(layer_rows) > 1:
+                return [
+                    candidate for candidate in sorted(self._selected)
+                    if 0 <= candidate < len(self._rows)
+                    and self._rows[candidate][0] in ("layer", "group")
+                ]
+        return [row]
+
     def _on_motion(self, event):
         """Turn a press into a reorder drag once the pointer has moved, then drag.
 
         A press that never moves stays a plain click; only a layer row or a
         group header can be dragged (a filter, text or group-filter row clears
         the press), and the ghost is only shown once the pointer has passed
-        :data:`DRAG_SLOP`.
+        :data:`DRAG_SLOP`. A press on a selected layer row carries the whole
+        layer selection (see :meth:`_reorder_sources`).
         """
         press = self._press
         if press is None:
+            self._stop_autoscroll()
             return
         if self._drag_row is None:
             dx = event.x_root - press["x_root"]
@@ -3107,30 +3233,58 @@ class LayerPanel(tk.Frame):
             row = press["row"]
             if not (0 <= row < len(self._rows)) \
                     or self._rows[row][0] not in ("layer", "group"):
+                # Only layer and group rows can be reordered. A drag attempt on
+                # any other row still counts as a plain click on it, so finish
+                # the collapse a click on a multi-selected row would have done.
+                if press.get("collapse"):
+                    self._select_rows([row], row)
                 self._press = None
+                self._stop_autoscroll()
                 return
-            if not self._begin_ghost(row, event.x_root, event.y_root):
+            sources = self._reorder_sources(row)
+            if not self._begin_ghost(
+                    row, event.x_root, event.y_root, count=len(sources)):
                 self._press = None
+                self._stop_autoscroll()
                 return
             self._drag_row = row
+            self._drag_rows = sources
         self._move_ghost(event.x_root, event.y_root)
         self._show_drop(event.x_root, event.y_root)
+        self._update_autoscroll(event.x_root, event.y_root)
 
     def _on_release(self, event):
-        """Finish a reorder drag: drop the ghost and offer the move to the app."""
+        """Finish a reorder drag: drop the ghost and offer the move to the app.
+
+        A press that never became a drag is still just a click; if it landed on
+        a row that was already part of a multi-row selection, the selection
+        collapses to that one row here rather than on press, so the press could
+        have started a multi-row drag.
+        """
         press = self._press
         drag_row = self._drag_row
+        drag_rows = self._drag_rows
         self._press = None
         self._drag_row = None
+        self._drag_rows = None
+        self._stop_autoscroll()
         self._end_ghost()
         self._clear_drop_line()
-        if drag_row is None or press is None or self._on_reorder is None:
+        if press is None:
+            return
+        if drag_row is None:
+            if press.get("collapse"):
+                self._select_rows([press["row"]], press["row"])
+            return
+        if self._on_reorder is None:
             return
         drop = self._drop_at(event.x_root, event.y_root)
         if drop is None:
             return
         source = self._rows[press["row"]]
-        target, above, _row = drop
+        target, above, row = drop
+        if row in (drag_rows or [drag_row]):
+            return
         if source != target:
             self._on_reorder(source, target, above)
 
@@ -3140,8 +3294,7 @@ class LayerPanel(tk.Frame):
             self._clear_drop_line()
             return
         drop = self._drop_at(x_root, y_root)
-        source = self._rows[self._drag_row]
-        if drop is None or drop[0] == source:
+        if drop is None or drop[2] in (self._drag_rows or [self._drag_row]):
             self._clear_drop_line()
             return
         _target, above, row = drop
@@ -3153,6 +3306,86 @@ class LayerPanel(tk.Frame):
             self._clear_drop_line()
             return
         self._show_drop_line(top if above else top + height)
+
+    # ------------------------------------------------------- drag auto-scroll
+    def _update_autoscroll(self, x_root, y_root):
+        """Start, keep or stop edge auto-scrolling for a reorder drag.
+
+        While a row is dragged, resting near the top or bottom edge of the list
+        scrolls it so rows outside the visible range become drop targets. The
+        timer only runs while the pointer stays in the margin and the list has
+        room to move in that direction; moving back to the middle or out of the
+        column stops it.
+        """
+        self._autoscroll_pos = (x_root, y_root)
+        if self._drag_row is None:
+            self._stop_autoscroll()
+            return
+        try:
+            left = self.canvas.winfo_rootx()
+            top = self.canvas.winfo_rooty()
+            right = left + self.canvas.winfo_width()
+            bottom = top + self.canvas.winfo_height()
+            first, last = self.canvas.yview()
+        except tk.TclError:
+            self._stop_autoscroll()
+            return
+        direction = 0
+        if left <= x_root <= right:
+            if y_root < top + AUTOSCROLL_EDGE:
+                direction = -1
+            elif y_root > bottom - AUTOSCROLL_EDGE:
+                direction = 1
+        if direction < 0 and first <= 0.0:
+            direction = 0
+        elif direction > 0 and last >= 1.0:
+            direction = 0
+        if direction == 0:
+            self._stop_autoscroll()
+            return
+        if (self._autoscroll_job is not None
+                and direction == self._autoscroll_dir):
+            return
+        self._stop_autoscroll()
+        self._autoscroll_dir = direction
+        self._autoscroll_job = self.after(
+            AUTOSCROLL_INTERVAL, self._autoscroll_tick)
+
+    def _autoscroll_tick(self):
+        """Scroll a step and keep the drop marker under the pointer."""
+        self._autoscroll_job = None
+        direction = self._autoscroll_dir
+        pos = self._autoscroll_pos
+        if self._drag_row is None or direction == 0 or pos is None:
+            self._stop_autoscroll()
+            return
+        try:
+            first = self.canvas.yview()[0]
+            content = self.inner.winfo_height() or len(self._rows) * ROW_PITCH
+            step = AUTOSCROLL_STEP / max(1, content)
+            self.canvas.yview_moveto(first + direction * step)
+            self.canvas.update_idletasks()
+            moved = self.canvas.yview()[0] != first
+        except tk.TclError:
+            self._stop_autoscroll()
+            return
+        if not moved:
+            self._stop_autoscroll()
+            return
+        self._show_drop(*pos)
+        self._autoscroll_job = self.after(
+            AUTOSCROLL_INTERVAL, self._autoscroll_tick)
+
+    def _stop_autoscroll(self):
+        """Cancel a pending auto-scroll tick and clear its direction."""
+        job = self._autoscroll_job
+        self._autoscroll_job = None
+        self._autoscroll_dir = 0
+        if job is not None:
+            try:
+                self.after_cancel(job)
+            except tk.TclError:
+                pass
 
     def _drop_at(self, x_root, y_root):
         """The ``(target, above, row)`` a reorder drop at the pointer would use.
@@ -3256,7 +3489,7 @@ class LayerPanel(tk.Frame):
         except tk.TclError:
             return False
 
-    def _begin_ghost(self, row, x_root, y_root):
+    def _begin_ghost(self, row, x_root, y_root, count=1):
         """Show a washed-out snapshot of the dragged row following the cursor.
 
         Tkinter cannot give an individual widget an alpha, so (as the Assets
@@ -3264,7 +3497,9 @@ class LayerPanel(tk.Frame):
         as a stand-in for opacity. It lives in a borderless top-level window so
         the OS moves it atomically without smearing the rows beneath it. A group
         header is represented by its topmost member's thumbnail, or by its label
-        when the group has no members yet. Returns ``True`` when it is shown.
+        when the group has no members yet. When ``count`` is greater than one, a
+        small badge shows how many rows the drag is carrying. Returns ``True``
+        when it is shown.
         """
         self._end_ghost()
         entry = self._rows[row]
@@ -3274,6 +3509,7 @@ class LayerPanel(tk.Frame):
         else:
             layer = self._layer_at(entry[1])
             label = layer.name if layer is not None else "Layer"
+        badge = None
         try:
             if layer is not None:
                 composited = getattr(layer, "composited_image", None)
@@ -3294,10 +3530,18 @@ class LayerPanel(tk.Frame):
                     highlightbackground=theme.color("float_border"),
                 )
                 overlay.pack()
+                if count > 1:
+                    badge = tk.Label(
+                        window, text=str(count), bd=0, padx=3,
+                        bg=theme.color("accent"), fg=theme.color("sel_fg"),
+                    )
+                    badge.place(relx=1.0, rely=1.0, anchor="se", x=2, y=2)
                 width, height = washed.width, washed.height
             else:
                 # A group with no members has no pixels to show, so carry its
                 # header text instead of an image.
+                if count > 1:
+                    label = f"{label} +{count - 1}"
                 window = self._ghost_window()
                 overlay = tk.Label(
                     window, text=label, bd=0, padx=6, pady=3,
@@ -3313,7 +3557,7 @@ class LayerPanel(tk.Frame):
         except (tk.TclError, ValueError):
             return False
         self._ghost = {
-            "widget": window, "photo": photo,
+            "widget": window, "photo": photo, "badge": badge,
             "width": width, "height": height,
         }
         self._move_ghost(x_root, y_root)
@@ -3513,6 +3757,7 @@ class LayerPanel(tk.Frame):
         """
         if event.widget is self:
             self._cancel_preview_job()
+            self._stop_autoscroll()
             self._end_ghost()
             self._clear_drop_line()
 
