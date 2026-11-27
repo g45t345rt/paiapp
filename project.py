@@ -17,6 +17,8 @@ load into the one project-wide asset list. Version 20 adds asset groups, tags,
 favorites and a project-wide asset group counter; older files load with every
 asset ungrouped and untagged. Version 21 adds stable canvas ids and canvas
 links; older files load with one assigned per canvas and no canvas links.
+Version 22 adds path dash styles and the keyword prompt mode with weighted
+rows; older files load with solid paths and the default prompt editor.
 
 The functions take the running :class:`paint.PaintApp` so the caller can keep
 all of its state (canvases, palette, generation panel) in one place.
@@ -45,7 +47,7 @@ from paintapp import filters, gradient, path, poses, textrender, vector
 from paintapp.document import AssetLibrary, Canvas, Group, normalize_blend
 
 FORMAT = "pai"
-VERSION = 21
+VERSION = 22
 MANIFEST = "project.json"
 
 # Maps manifest keys to the tkinter variables that hold the generate panel.
