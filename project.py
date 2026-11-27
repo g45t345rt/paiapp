@@ -673,7 +673,7 @@ def _verify_archive(path, members, verify_checksums=True):
             raise OSError(f"archive manifest is not valid JSON: {exc}") from exc
 
 
-_BACKUPS = 1
+_BACKUPS = 2
 
 
 def _backup_project(path):
